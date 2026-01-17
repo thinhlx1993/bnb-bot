@@ -1,3 +1,26 @@
 data/
 docs/
 results/
+
+# Configuration and secrets
+config.py
+*.env
+.env
+
+# Private keys (RSA authentication)
+*.pem
+*-prv-key.pem
+*-pub-key.pem
+test-prv-key.pem
+test-pub-key.pem
+
+# Logs
+*.log
+live_trading.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python

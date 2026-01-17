@@ -22,14 +22,26 @@ import pandas as pd
 import numpy as np
 import vectorbt as vbt
 import matplotlib.pyplot as plt
+import logging
 from meta.data_processor import DataProcessor
 from meta.data_processors._base import DataSource
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('backtest.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Configuration
-START_DATE = "2026-01-01" # YYYY-MM-DD
+START_DATE = "2025-01-01" # YYYY-MM-DD
 END_DATE = "2026-01-15" # YYYY-MM-DD
 TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
-TICKER_LIST = ["BTCUSDT", "ETHUSDT"]  # You can add more cryptocurrencies
+TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # You can add more cryptocurrencies
 
 # MACD Parameters
 MACD_FAST = 12
@@ -55,21 +67,21 @@ BULLISH_EMA_FAST = 9                # Fast EMA for bullish confirmation
 BULLISH_EMA_SLOW = 21               # Slow EMA for bullish confirmation
 
 # Portfolio Parameters
-INITIAL_BALANCE = 1000.0  # Starting balance in USD ($)
+INITIAL_BALANCE = 100.0  # Starting balance in USD ($)
 
 # Risk Management Parameters
-ENABLE_RISK_MANAGEMENT = False  # Master switch: Enable/disable all risk management features
+ENABLE_RISK_MANAGEMENT = True  # Master switch: Enable/disable all risk management features
 USE_STOP_LOSS = True           # Enable stop-loss orders (requires ENABLE_RISK_MANAGEMENT = True)
 STOP_LOSS_PCT = -0.1          # Stop loss at -10% (exit if loss reaches 10%)
-USE_TAKE_PROFIT = True         # Enable take-profit orders (requires ENABLE_RISK_MANAGEMENT = True)
+USE_TAKE_PROFIT = False         # Enable take-profit orders (requires ENABLE_RISK_MANAGEMENT = True)
 TAKE_PROFIT_PCT = 0.3         # Take profit at +30% (exit if gain reaches 30%)
-USE_MAX_HOLDING = True         # Enable maximum holding period (requires ENABLE_RISK_MANAGEMENT = True)
+USE_MAX_HOLDING = False         # Enable maximum holding period (requires ENABLE_RISK_MANAGEMENT = True)
 MAX_HOLDING_PERIODS = 720         # Maximum periods to hold (e.g., 720 periods = 5 days for 15m interval)
 
 
 def fetch_binance_data(ticker_list, start_date, end_date, time_interval):
     """Fetch data from Binance using FinRL-Meta datasource."""
-    print(f"Fetching data from Binance for {ticker_list}...")
+    logger.info(f"Fetching data from Binance for {ticker_list}...")
     
     dp = DataProcessor(
         data_source=DataSource.binance,
@@ -388,18 +400,18 @@ def apply_risk_management(entries, exits, price):
         for pos_idx in reversed(positions_to_remove):
             positions.pop(pos_idx)
     
-    # Print risk management summary
+    # Log risk management summary
     original_exits = exits.sum()
     new_exits = exits_with_rm.sum()
     total_rm_exits = new_exits - original_exits
     if total_rm_exits > 0:
-        print(f"  Risk management exits added: {total_rm_exits}")
+        logger.info(f"  Risk management exits added: {total_rm_exits}")
         if USE_STOP_LOSS:
-            print(f"    - Stop-loss: {STOP_LOSS_PCT:.1%}")
+            logger.info(f"    - Stop-loss: {STOP_LOSS_PCT:.1%}")
         if USE_TAKE_PROFIT:
-            print(f"    - Take-profit: {TAKE_PROFIT_PCT:.1%}")
+            logger.info(f"    - Take-profit: {TAKE_PROFIT_PCT:.1%}")
         if USE_MAX_HOLDING:
-            print(f"    - Max holding: {MAX_HOLDING_PERIODS} periods")
+            logger.info(f"    - Max holding: {MAX_HOLDING_PERIODS} periods")
     
     return exits_with_rm
 
@@ -463,36 +475,36 @@ def create_vectorbt_signals(df, all_strategies, price):
         entries = entries & price_above_ema
         filtered_count = original_entries - entries.sum()
         if filtered_count > 0:
-            print(f"  EMA{MA99_PERIOD} filter: {filtered_count} buy signals filtered (price below EMA)")
+            logger.info(f"  EMA{MA99_PERIOD} filter: {filtered_count} buy signals filtered (price below EMA)")
     
-    # Print strategy breakdown
-    print(f"\n  Strategy Signal Breakdown:")
+    # Log strategy breakdown
+    logger.info(f"  Strategy Signal Breakdown:")
     for strategy_name, counts in strategy_counts.items():
-        print(f"    {strategy_name}: {counts['entries']} buys, {counts['exits']} sells")
+        logger.info(f"    {strategy_name}: {counts['entries']} buys, {counts['exits']} sells")
     
     # Apply risk management exit conditions (if enabled)
     if ENABLE_RISK_MANAGEMENT:
-        print(f"  Risk Management: ENABLED")
+        logger.info(f"  Risk Management: ENABLED")
         exits = apply_risk_management(entries, exits, price)
     else:
-        print(f"  Risk Management: DISABLED")
+        logger.info(f"  Risk Management: DISABLED")
     
-    # Debug: Print combined signal counts
+    # Log combined signal counts
     num_entries = entries.sum()
     num_exits = exits.sum()
-    print(f"\n  Combined Signals:")
-    print(f"    Total Buy Signals: {num_entries}")
-    print(f"    Total Sell Signals: {num_exits}")
+    logger.info(f"  Combined Signals:")
+    logger.info(f"    Total Buy Signals: {num_entries}")
+    logger.info(f"    Total Sell Signals: {num_exits}")
     
     if num_entries == 0:
-        print(f"  ⚠️  WARNING: No buy signals generated! Check strategy configurations.")
+        logger.warning(f"  ⚠️  WARNING: No buy signals generated! Check strategy configurations.")
     if num_exits == 0:
-        print(f"  ⚠️  WARNING: No sell signals generated! Check strategy configurations.")
+        logger.warning(f"  ⚠️  WARNING: No sell signals generated! Check strategy configurations.")
     
     # Calculate expected fee impact
     if num_entries > 0:
         estimated_fees = (num_entries + num_exits) * 0.001  # 0.1% per trade
-        print(f"  Estimated trading fees: {estimated_fees:.2%} (0.1% per trade)")
+        logger.info(f"  Estimated trading fees: {estimated_fees:.2%} (0.1% per trade)")
     
     return entries, exits
 
@@ -521,7 +533,7 @@ def convert_interval_to_freq(interval):
 
 def backtest_strategy(price, entries, exits, ticker_name):
     """Backtest the strategy using vectorbt."""
-    print(f"\nBacktesting {ticker_name}...")
+    logger.info(f"Backtesting {ticker_name}...")
     
     # Convert interval to proper pandas frequency
     freq = convert_interval_to_freq(TIME_INTERVAL)
@@ -576,17 +588,17 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
     - Even if individual trades have small returns (0.01%), they compound over multiple trades
     - Example: 8 trades averaging 0.32% each can result in ~2.54% total return
     """
-    print(f"\n{'='*60}")
-    print(f"Results for {ticker_name}")
-    print(f"{'='*60}")
+    logger.info(f"{'='*60}")
+    logger.info(f"Results for {ticker_name}")
+    logger.info(f"{'='*60}")
     
     # Signal statistics
     if entries is not None and exits is not None:
         num_entries = entries.sum()
         num_exits = exits.sum()
-        print(f"\nSignal Statistics:")
-        print(f"  Buy Signals Generated: {num_entries}")
-        print(f"  Sell Signals Generated: {num_exits}")
+        logger.info(f"Signal Statistics:")
+        logger.info(f"  Buy Signals Generated: {num_entries}")
+        logger.info(f"  Sell Signals Generated: {num_exits}")
     
     # Basic statistics
     total_return = portfolio.total_return()
@@ -597,25 +609,25 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
     initial_value = equity.iloc[0] if len(equity) > 0 else 1.0
     final_value = equity.iloc[-1] if len(equity) > 0 else 1.0
     
-    print(f"\nPerformance Metrics:")
-    print(f"{'='*60}")
-    print(f"PORTFOLIO VALUE:")
-    print(f"  Starting Value: ${initial_value:,.2f}")
-    print(f"  Ending Value: ${final_value:,.2f}")
-    print(f"  Total Return: {total_return:.2%} ({(final_value - initial_value) / initial_value * 100:.2f}%)")
-    print(f"  Net Profit: ${final_value - initial_value:,.2f}")
-    print(f"\nRISK METRICS:")
-    print(f"  Sharpe Ratio: {portfolio.sharpe_ratio():.2f}")
+    logger.info(f"Performance Metrics:")
+    logger.info(f"{'='*60}")
+    logger.info(f"PORTFOLIO VALUE:")
+    logger.info(f"  Starting Value: ${initial_value:,.2f}")
+    logger.info(f"  Ending Value: ${final_value:,.2f}")
+    logger.info(f"\n  Total Return: {total_return:.2%} ({(final_value - initial_value) / initial_value * 100:.2f}%)")
+    logger.info(f"  Net Profit: ${final_value - initial_value:,.2f}")
+    logger.info(f"RISK METRICS:")
+    logger.info(f"  Sharpe Ratio: {portfolio.sharpe_ratio():.2f}")
     
     # Max Drawdown - vectorbt returns negative value, we'll show as positive for clarity
     max_dd = portfolio.max_drawdown()
     max_dd_pct = abs(max_dd)  # Convert to positive for display
-    print(f"  Max Drawdown: {max_dd_pct:.2%} (largest peak-to-trough decline)")
-    print(f"  Sortino Ratio: {portfolio.sortino_ratio():.2f}")
-    print(f"  Calmar Ratio: {portfolio.calmar_ratio():.2f}")
-    print(f"\nTRADE STATISTICS:")
-    print(f"  Total Trades: {num_trades}")
-    print(f"  Win Rate: {portfolio.trades.win_rate():.2%}")
+    logger.info(f"  Max Drawdown: {max_dd_pct:.2%} (largest peak-to-trough decline)")
+    logger.info(f"  Sortino Ratio: {portfolio.sortino_ratio():.2f}")
+    logger.info(f"  Calmar Ratio: {portfolio.calmar_ratio():.2f}")
+    logger.info(f"TRADE STATISTICS:")
+    logger.info(f"  Total Trades: {num_trades}")
+    logger.info(f"  Win Rate: {portfolio.trades.win_rate():.2%}")
     
     # Trade analysis
     if num_trades > 0:
@@ -639,44 +651,44 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
                         duration_col = col
                         break
                 
-                print(f"\nINDIVIDUAL TRADE ANALYSIS:")
-                print(f"  (Note: Individual trade returns are relative to entry price,")
-                print(f"   not portfolio value. Small per-trade returns can compound to larger total returns.)")
+                logger.info(f"INDIVIDUAL TRADE ANALYSIS:")
+                logger.info(f"  (Note: Individual trade returns are relative to entry price,")
+                logger.info(f"   not portfolio value. Small per-trade returns can compound to larger total returns.)")
                 
                 if return_col:
                     avg_return = trades[return_col].mean()
                     best_trade = trades[return_col].max()
                     worst_trade = trades[return_col].min()
-                    print(f"  Average Return per Trade: {avg_return:.4f}%")
-                    print(f"  Best Trade: {best_trade:.4f}%")
-                    print(f"  Worst Trade: {worst_trade:.4f}%")
+                    logger.info(f"  Average Return per Trade: {avg_return:.4f}%")
+                    logger.info(f"  Best Trade: {best_trade:.4f}%")
+                    logger.info(f"  Worst Trade: {worst_trade:.4f}%")
                 
                 # Show PnL information
                 if 'PnL' in available_cols:
                     total_pnl = trades['PnL'].sum()
                     avg_pnl = trades['PnL'].mean()
-                    print(f"  Total PnL (all trades): ${total_pnl:.2f}")
-                    print(f"  Average PnL per Trade: ${avg_pnl:.2f}")
+                    logger.info(f"  Total PnL (all trades): ${total_pnl:.2f}")
+                    logger.info(f"  Average PnL per Trade: ${avg_pnl:.2f}")
                 
                 # Show entry/exit prices if available
                 if 'Entry Price' in available_cols and 'Exit Price' in available_cols:
-                    print(f"\n  Price Movement:")
-                    print(f"    Average Entry Price: ${trades['Entry Price'].mean():.2f}")
-                    print(f"    Average Exit Price: ${trades['Exit Price'].mean():.2f}")
+                    logger.info(f"  Price Movement:")
+                    logger.info(f"    Average Entry Price: ${trades['Entry Price'].mean():.2f}")
+                    logger.info(f"    Average Exit Price: ${trades['Exit Price'].mean():.2f}")
                     avg_price_change = ((trades['Exit Price'].mean() - trades['Entry Price'].mean()) / trades['Entry Price'].mean()) * 100
-                    print(f"    Average Price Change: {avg_price_change:.2f}%")
+                    logger.info(f"    Average Price Change: {avg_price_change:.2f}%")
                 
                 if duration_col:
                     avg_duration = trades[duration_col].mean()
-                    print(f"  Average Trade Duration: {avg_duration}")
+                    logger.info(f"  Average Trade Duration: {avg_duration}")
                 
                 # Explain the compounding effect
                 if num_trades > 1:
-                    print(f"\n  COMPOUNDING EFFECT:")
-                    print(f"    With {num_trades} trades, even small per-trade returns compound.")
-                    print(f"    Example: 8 trades of ~0.32% each ≈ 2.54% total (with compounding)")
+                    logger.info(f"  COMPOUNDING EFFECT:")
+                    logger.info(f"    With {num_trades} trades, even small per-trade returns compound.")
+                    logger.info(f"    Example: 8 trades of ~0.32% each ≈ 2.54% total (with compounding)")
         except Exception as e:
-            print(f"\nTrade Analysis: Could not retrieve detailed trade info ({e})")
+            logger.warning(f"Trade Analysis: Could not retrieve detailed trade info ({e})")
     
     # Calculate annualized return manually for accuracy
     if start_date and end_date:
@@ -685,17 +697,17 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
         time_diff = pd.to_datetime(end_date) - pd.to_datetime(start_date)
         days = time_diff.total_seconds() / (24 * 3600)
         
-        print(f"\nANNUALIZED METRICS:")
+        logger.info(f"ANNUALIZED METRICS:")
         if days < 30:
-            print(f"  Annualized Return: {annualized_return:.2%} (extrapolated from {days:.1f} days - may be misleading)")
-            print(f"  ⚠️  Note: Annualizing short periods assumes same performance for full year")
+            logger.info(f"  Annualized Return: {annualized_return:.2%} (extrapolated from {days:.1f} days - may be misleading)")
+            logger.warning(f"  ⚠️  Note: Annualizing short periods assumes same performance for full year")
         else:
-            print(f"  Annualized Return: {annualized_return:.2%}")
+            logger.info(f"  Annualized Return: {annualized_return:.2%}")
     else:
         # Fallback to portfolio's calculation
         annualized_return = portfolio.annualized_return()
-        print(f"\nANNUALIZED METRICS:")
-        print(f"  Annualized Return: {annualized_return:.2%}")
+        logger.info(f"ANNUALIZED METRICS:")
+        logger.info(f"  Annualized Return: {annualized_return:.2%}")
     
     # Store max_drawdown as positive value for consistency
     max_dd = abs(portfolio.max_drawdown())
@@ -762,17 +774,17 @@ def save_trade_history(portfolio, ticker, strategy_dir):
         trades = portfolio.trades.records_readable
         
         if len(trades) == 0:
-            print(f"  No trades to save for {ticker}")
+            logger.info(f"  No trades to save for {ticker}")
             return None
         
         # Save to CSV in strategy folder
         csv_path = strategy_dir / f"{ticker}_trade_history.csv"
         trades.to_csv(csv_path, index=False)
-        print(f"  Trade history saved: {csv_path} ({len(trades)} trades)")
+        logger.info(f"  Trade history saved: {csv_path} ({len(trades)} trades)")
         
         return csv_path
     except Exception as e:
-        print(f"  Warning: Could not save trade history: {e}")
+        logger.warning(f"  Warning: Could not save trade history: {e}")
         return None
 
 
@@ -791,11 +803,11 @@ def save_account_balance(portfolio, ticker, strategy_dir):
         # Save to CSV in strategy folder
         csv_path = strategy_dir / f"{ticker}_account_balance.csv"
         balance_df.to_csv(csv_path, index=False)
-        print(f"  Account balance saved: {csv_path} ({len(balance_df)} records)")
+        logger.info(f"  Account balance saved: {csv_path} ({len(balance_df)} records)")
         
         return csv_path
     except Exception as e:
-        print(f"  Warning: Could not save account balance: {e}")
+        logger.warning(f"  Warning: Could not save account balance: {e}")
         return None
 
 
@@ -833,7 +845,7 @@ def plot_strategy_comparison(strategy_equity_curves, ticker, output_dir):
     comparison_path = comparison_dir / f"{ticker}_strategy_comparison.png"
     fig.savefig(comparison_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"  Strategy comparison plot saved: {comparison_path}")
+    logger.info(f"  Strategy comparison plot saved: {comparison_path}")
 
 
 def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
@@ -846,14 +858,14 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
         ticker_name: Ticker name (e.g., 'BTCUSDT')
         output_dir: Directory to save plots (strategy-specific folder)
     """
-    print(f"\nGenerating plots for {ticker_name}...")
+    logger.info(f"Generating plots for {ticker_name}...")
     
     # Create portfolio plots - use default plots which work across vectorbt versions
     try:
         # Try to plot with default settings
         fig = portfolio.plot(figsize=(16, 12))
     except Exception as e:
-        print(f"Warning: Could not create portfolio plot: {e}")
+        logger.warning(f"Warning: Could not create portfolio plot: {e}")
         fig = None
     
     # Plot account balance
@@ -970,18 +982,18 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
     fig2.savefig(output_dir / f"{ticker_name}_signals.png", dpi=150, bbox_inches='tight')
     plt.close(fig2)
     
-    print(f"Plots saved to {output_dir}/")
+    logger.info(f"Plots saved to {output_dir}/")
     
     return fig, fig2, fig_balance
 
 
 def main():
     """Main execution function."""
-    print("="*60)
-    print("Multi-Strategy Trading System using VectorBT")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("Multi-Strategy Trading System using VectorBT")
+    logger.info("="*60)
     
-    # Print enabled strategies
+    # Log enabled strategies
     enabled_strategies = []
     if ENABLE_MACD_TREND_REVERSAL:
         enabled_strategies.append("1. MACD Trend Reversals")
@@ -990,35 +1002,35 @@ def main():
     if ENABLE_BULLISH_CONFIRMATION:
         enabled_strategies.append("3. Bullish Trend Confirmation")
     
-    print(f"\nEnabled Strategies:")
+    logger.info(f"Enabled Strategies:")
     for strategy in enabled_strategies:
-        print(f"  ✓ {strategy}")
+        logger.info(f"  ✓ {strategy}")
     if not enabled_strategies:
-        print("  ⚠️  No strategies enabled! Please enable at least one strategy.")
+        logger.warning("  ⚠️  No strategies enabled! Please enable at least one strategy.")
         return
     
     # Fetch data
     df = fetch_binance_data(TICKER_LIST, START_DATE, END_DATE, TIME_INTERVAL)
     
     if df.empty:
-        print("Error: No data fetched. Please check your ticker list and date range.")
+        logger.error("Error: No data fetched. Please check your ticker list and date range.")
         return
     
-    print(f"\nData shape: {df.shape}")
-    print(f"Date range: {df['time'].min()} to {df['time'].max()}")
+    logger.info(f"Data shape: {df.shape}")
+    logger.info(f"Date range: {df['time'].min()} to {df['time'].max()}")
     
     # Process each ticker
     all_strategy_results = {}  # Store results for each strategy separately
     
     for ticker in TICKER_LIST:
-        print(f"\n{'='*60}")
-        print(f"Processing {ticker}")
-        print(f"{'='*60}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Processing {ticker}")
+        logger.info(f"{'='*60}")
         
         ticker_df = df[df['tic'] == ticker].copy()
         
         if ticker_df.empty:
-            print(f"\nWarning: No data for {ticker}, skipping...")
+            logger.warning(f"Warning: No data for {ticker}, skipping...")
             continue
         
         # Set time as index
@@ -1036,7 +1048,7 @@ def main():
         # Strategy 1: MACD Trend Reversals
         if ENABLE_MACD_TREND_REVERSAL:
             strategy_name = "MACD_Trend_Reversal"
-            print(f"\n[Strategy 1] {strategy_name}")
+            logger.info(f"[Strategy 1] {strategy_name}")
             
             # Create strategy-specific folder
             strategy_dir = base_output_dir / strategy_name
@@ -1088,7 +1100,7 @@ def main():
         # Strategy 2: RSI Trend Reversals
         if ENABLE_RSI_TREND_REVERSAL:
             strategy_name = "RSI_Trend_Reversal"
-            print(f"\n[Strategy 2] {strategy_name}")
+            logger.info(f"[Strategy 2] {strategy_name}")
             
             # Create strategy-specific folder
             strategy_dir = base_output_dir / strategy_name
@@ -1136,7 +1148,7 @@ def main():
         # Strategy 3: Bullish Trend Confirmation
         if ENABLE_BULLISH_CONFIRMATION:
             strategy_name = "Bullish_Trend_Confirmation"
-            print(f"\n[Strategy 3] {strategy_name}")
+            logger.info(f"[Strategy 3] {strategy_name}")
             
             # Create strategy-specific folder
             strategy_dir = base_output_dir / strategy_name
@@ -1187,7 +1199,7 @@ def main():
         
         # Also create combined strategy (if multiple enabled)
         if len([s for s in [ENABLE_MACD_TREND_REVERSAL, ENABLE_RSI_TREND_REVERSAL, ENABLE_BULLISH_CONFIRMATION] if s]) > 1:
-            print(f"\n[Combined Strategy] Running all strategies together...")
+            logger.info(f"[Combined Strategy] Running all strategies together...")
             
             # Create combined strategy folder
             combined_strategy_dir = base_output_dir / "Combined"
@@ -1230,27 +1242,27 @@ def main():
             plot_strategy_comparison(strategy_equity_curves, ticker, base_output_dir)
     
     # Summary
-    print(f"\n{'='*60}")
-    print("SUMMARY - All Strategies")
-    print(f"{'='*60}")
+    logger.info(f"{'='*60}")
+    logger.info("SUMMARY - All Strategies")
+    logger.info(f"{'='*60}")
     
     if all_strategy_results:
         summary_df = pd.DataFrame(all_strategy_results).T
-        print("\n", summary_df.to_string())
+        logger.info("\n" + summary_df.to_string())
         
         # Save summary
         output_dir = Path("results")
         output_dir.mkdir(exist_ok=True)
         summary_df.to_csv(output_dir / "strategy_summary.csv")
-        print(f"\nSummary saved to {output_dir}/strategy_summary.csv")
-        print(f"\nResults organized by strategy in:")
-        print(f"  {output_dir}/MACD_Trend_Reversal/")
-        print(f"  {output_dir}/RSI_Trend_Reversal/")
-        print(f"  {output_dir}/Bullish_Trend_Confirmation/")
-        print(f"  {output_dir}/Combined/")
-        print(f"  {output_dir}/strategy_comparison/")
+        logger.info(f"Summary saved to {output_dir}/strategy_summary.csv")
+        logger.info(f"Results organized by strategy in:")
+        logger.info(f"  {output_dir}/MACD_Trend_Reversal/")
+        logger.info(f"  {output_dir}/RSI_Trend_Reversal/")
+        logger.info(f"  {output_dir}/Bullish_Trend_Confirmation/")
+        logger.info(f"  {output_dir}/Combined/")
+        logger.info(f"  {output_dir}/strategy_comparison/")
     else:
-        print("No strategy results to summarize.")
+        logger.warning("No strategy results to summarize.")
 
 
 if __name__ == "__main__":
