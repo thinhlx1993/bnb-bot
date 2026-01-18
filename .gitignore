@@ -24,3 +24,9 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+models/
+results/
+data/
+docs/
+venv/
+.vscode/

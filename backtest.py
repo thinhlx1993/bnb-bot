@@ -38,10 +38,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-START_DATE = "2025-01-01" # YYYY-MM-DD
+START_DATE = "2023-01-01" # YYYY-MM-DD
 END_DATE = "2026-01-15" # YYYY-MM-DD
 TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
-TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # You can add more cryptocurrencies
+TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # You can add more cryptocurrencies
 
 # MACD Parameters
 MACD_FAST = 12
@@ -811,6 +811,210 @@ def save_account_balance(portfolio, ticker, strategy_dir):
         return None
 
 
+def extract_training_features(portfolio, ticker_df, price, all_strategies, ticker_name, strategy_name, lookback_periods=30):
+    """
+    Extract features at entry points and label trades for machine learning training.
+    
+    Args:
+        portfolio: VectorBT portfolio object
+        ticker_df: DataFrame with OHLCV data
+        price: Price series
+        all_strategies: Dictionary with strategy signals
+        ticker_name: Ticker symbol
+        strategy_name: Strategy name
+        lookback_periods: Number of periods to look back for feature extraction (default: 30)
+    
+    Returns:
+        training_df: DataFrame with features and labels
+    """
+    try:
+        trades = portfolio.trades.records_readable
+        
+        if len(trades) == 0:
+            logger.info(f"  No trades to extract features for {ticker_name}")
+            return None
+        
+        # Get trade information
+        training_data = []
+        
+        # Always calculate MACD and RSI indicators (required for training features)
+        # This ensures we always have these features regardless of which strategy is being used
+        indicators = {}
+        
+        # MACD indicators - always calculate
+        macd, signal, histogram = calculate_macd(ticker_df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+        indicators['macd'] = macd
+        indicators['macd_signal'] = signal
+        indicators['macd_histogram'] = histogram
+        
+        # RSI indicator - always calculate
+        rsi = calculate_rsi(price, RSI_PERIOD)
+        indicators['rsi'] = rsi
+        
+        # Process each trade
+        for idx, trade in trades.iterrows():
+            try:
+                # Get entry and exit information
+                entry_idx = None
+                exit_idx = None
+                entry_price = None
+                exit_price = None
+                
+                # Try to get entry/exit prices directly
+                if 'Entry Price' in trade.index:
+                    entry_price = float(trade['Entry Price'])
+                if 'Exit Price' in trade.index:
+                    exit_price = float(trade['Exit Price'])
+                
+                # Try to find entry/exit timestamps or indices
+                if 'Entry Timestamp' in trade.index:
+                    entry_time = pd.to_datetime(trade['Entry Timestamp'])
+                    try:
+                        entry_idx = ticker_df.index.get_loc(entry_time)
+                    except KeyError:
+                        # Find nearest timestamp
+                        entry_idx = ticker_df.index.get_indexer([entry_time], method='nearest')[0]
+                elif 'Entry Index' in trade.index:
+                    entry_idx = int(trade['Entry Index'])
+                
+                if 'Exit Timestamp' in trade.index:
+                    exit_time = pd.to_datetime(trade['Exit Timestamp'])
+                    try:
+                        exit_idx = ticker_df.index.get_loc(exit_time)
+                    except KeyError:
+                        exit_idx = ticker_df.index.get_indexer([exit_time], method='nearest')[0]
+                elif 'Exit Index' in trade.index:
+                    exit_idx = int(trade['Exit Index'])
+                
+                # Fallback: use entry/exit price to find closest match
+                if entry_idx is None and entry_price is not None:
+                    price_diff = (ticker_df['close'] - entry_price).abs()
+                    entry_idx = price_diff.idxmin()
+                    entry_idx = ticker_df.index.get_loc(entry_idx)
+                
+                if exit_idx is None and exit_price is not None:
+                    price_diff = (ticker_df['close'] - exit_price).abs()
+                    exit_idx = price_diff.idxmin()
+                    exit_idx = ticker_df.index.get_loc(exit_idx)
+                
+                if entry_idx is None:
+                    logger.warning(f"  Could not find entry index for trade {idx}, skipping...")
+                    continue
+                
+                if exit_idx is None:
+                    logger.warning(f"  Could not find exit index for trade {idx}, skipping...")
+                    continue
+                
+                # Ensure we have enough data for lookback
+                if entry_idx < lookback_periods:
+                    continue
+                
+                # Get actual prices if not already set
+                if entry_price is None:
+                    entry_price = float(ticker_df['close'].iloc[entry_idx])
+                if exit_price is None:
+                    exit_price = float(ticker_df['close'].iloc[exit_idx])
+                
+                # Extract features at entry point (with lookback window)
+                # Only MACD and RSI features are kept
+                feature_dict = {}
+                
+                lookback_start = max(0, entry_idx - lookback_periods)
+                
+                # MACD features - always available
+                macd_window = indicators['macd'].iloc[lookback_start:entry_idx+1]
+                feature_dict['macd'] = float(indicators['macd'].iloc[entry_idx])
+                feature_dict['macd_mean'] = float(macd_window.mean())
+                feature_dict['macd_std'] = float(macd_window.std()) if len(macd_window) > 1 else 0.0
+                if entry_idx > 0:
+                    feature_dict['macd_trend'] = 1 if indicators['macd'].iloc[entry_idx] > indicators['macd'].iloc[entry_idx-1] else 0
+                else:
+                    feature_dict['macd_trend'] = 0
+                
+                signal_window = indicators['macd_signal'].iloc[lookback_start:entry_idx+1]
+                feature_dict['macd_signal'] = float(indicators['macd_signal'].iloc[entry_idx])
+                feature_dict['macd_signal_mean'] = float(signal_window.mean())
+                feature_dict['macd_cross'] = 1 if indicators['macd'].iloc[entry_idx] > indicators['macd_signal'].iloc[entry_idx] else 0
+                
+                histogram_window = indicators['macd_histogram'].iloc[lookback_start:entry_idx+1]
+                feature_dict['macd_histogram'] = float(indicators['macd_histogram'].iloc[entry_idx])
+                feature_dict['macd_histogram_mean'] = float(histogram_window.mean())
+                if entry_idx > 0:
+                    feature_dict['macd_histogram_trend'] = 1 if indicators['macd_histogram'].iloc[entry_idx] > indicators['macd_histogram'].iloc[entry_idx-1] else 0
+                else:
+                    feature_dict['macd_histogram_trend'] = 0
+                
+                # RSI features - always available
+                rsi_window = indicators['rsi'].iloc[lookback_start:entry_idx+1]
+                feature_dict['rsi'] = float(indicators['rsi'].iloc[entry_idx])
+                feature_dict['rsi_mean'] = float(rsi_window.mean())
+                feature_dict['rsi_std'] = float(rsi_window.std()) if len(rsi_window) > 1 else 0.0
+                feature_dict['rsi_oversold'] = 1 if indicators['rsi'].iloc[entry_idx] < RSI_OVERSOLD else 0
+                feature_dict['rsi_overbought'] = 1 if indicators['rsi'].iloc[entry_idx] > RSI_OVERBOUGHT else 0
+                
+                # Calculate label: 1 if profit, -1 if loss
+                # Account for fees (0.1% each way = 0.2% total)
+                net_return = ((exit_price - entry_price) / entry_price) - 0.002
+                label = 1 if net_return > 0 else -1
+                
+                # Add label (keep this for training)
+                feature_dict['label'] = label
+                
+                # Note: We don't include entry_price, exit_price, entry_timestamp, exit_timestamp
+                # as these are not features for prediction, only used to calculate the label
+                
+                training_data.append(feature_dict)
+                
+            except Exception as e:
+                logger.warning(f"  Error processing trade {idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        if len(training_data) == 0:
+            logger.warning(f"  No valid training data extracted for {ticker_name}")
+            return None
+        
+        # Create DataFrame
+        training_df = pd.DataFrame(training_data)
+        
+        logger.info(f"  Extracted {len(training_df)} training samples for {ticker_name}")
+        if 'label' in training_df.columns:
+            profit_count = (training_df['label'] == 1).sum()
+            loss_count = (training_df['label'] == -1).sum()
+            logger.info(f"  Positive labels (profit=1): {profit_count} ({profit_count/len(training_df)*100:.1f}%)")
+            logger.info(f"  Negative labels (loss=-1): {loss_count} ({loss_count/len(training_df)*100:.1f}%)")
+        
+        return training_df
+        
+    except Exception as e:
+        logger.error(f"Error extracting training features: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def save_training_dataset(training_df, ticker, strategy_name, output_dir):
+    """Save training dataset to CSV file."""
+    if training_df is None or len(training_df) == 0:
+        return None
+    
+    try:
+        # Create training data folder
+        training_dir = output_dir / "training_data"
+        training_dir.mkdir(exist_ok=True)
+        
+        # Save to CSV
+        csv_path = training_dir / f"{ticker}_{strategy_name}_training_data.csv"
+        training_df.to_csv(csv_path, index=False)
+        logger.info(f"  Training dataset saved: {csv_path} ({len(training_df)} samples)")
+        
+        return csv_path
+    except Exception as e:
+        logger.error(f"Error saving training dataset: {e}")
+        return None
+
+
 def plot_strategy_comparison(strategy_equity_curves, ticker, output_dir):
     """Create comparison plot showing all strategies' equity curves together."""
     fig, ax = plt.subplots(figsize=(16, 8))
@@ -1096,6 +1300,15 @@ def main():
             signals_dict['signal'] = signal
             signals_dict['histogram'] = histogram
             plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
+            
+            # Extract training features for MACD strategy
+            all_strategies_for_training = {'macd': macd_signals}
+            training_df = extract_training_features(
+                portfolio, ticker_df, price, all_strategies_for_training, 
+                ticker, strategy_name, lookback_periods=30
+            )
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
         
         # Strategy 2: RSI Trend Reversals
         if ENABLE_RSI_TREND_REVERSAL:
@@ -1144,6 +1357,15 @@ def main():
                 'bearish_reversal': rsi_signals['bearish_reversal']
             }
             plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
+            
+            # Extract training features for RSI strategy
+            all_strategies_for_training = {'rsi': rsi_signals}
+            training_df = extract_training_features(
+                portfolio, ticker_df, price, all_strategies_for_training, 
+                ticker, strategy_name, lookback_periods=30
+            )
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
         
         # Strategy 3: Bullish Trend Confirmation
         if ENABLE_BULLISH_CONFIRMATION:
@@ -1192,6 +1414,15 @@ def main():
                 'bearish_reversal': bullish_signals['bearish_reversal']
             }
             plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
+            
+            # Extract training features for Bullish Trend Confirmation strategy
+            all_strategies_for_training = {'bullish_confirmation': bullish_signals}
+            training_df = extract_training_features(
+                portfolio, ticker_df, price, all_strategies_for_training, 
+                ticker, strategy_name, lookback_periods=30
+            )
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
         
         # Create comparison plot for all strategies
         if len(strategy_equity_curves) > 1:
@@ -1240,6 +1471,14 @@ def main():
             strategy_equity_curves['Combined'] = portfolio.value()
             plot_results(portfolio, ticker_df, signals_dict, ticker, combined_strategy_dir)
             plot_strategy_comparison(strategy_equity_curves, ticker, base_output_dir)
+            
+            # Extract training features for combined strategy
+            training_df = extract_training_features(
+                portfolio, ticker_df, price, all_strategies, 
+                ticker, "Combined", lookback_periods=30
+            )
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, "Combined", base_output_dir)
     
     # Summary
     logger.info(f"{'='*60}")
@@ -1261,6 +1500,7 @@ def main():
         logger.info(f"  {output_dir}/Bullish_Trend_Confirmation/")
         logger.info(f"  {output_dir}/Combined/")
         logger.info(f"  {output_dir}/strategy_comparison/")
+        logger.info(f"  {output_dir}/training_data/")
     else:
         logger.warning("No strategy results to summarize.")
 
