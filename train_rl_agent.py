@@ -20,10 +20,13 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     EvalCallback,
-    CallbackList
+    CallbackList,
+    BaseCallback
 )
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
+import torch
+import torch.nn as nn
 
 # Custom environment
 from rl_risk_env import RiskManagementEnv
@@ -47,9 +50,9 @@ TENSORBOARD_LOG_DIR = MODEL_SAVE_DIR / "tensorboard_logs"
 TENSORBOARD_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 500000  # Total training steps
-LEARNING_RATE = 3e-4
-BATCH_SIZE = 64
+TOTAL_TIMESTEPS = 1e10  # Total training steps (use early stopping)
+LEARNING_RATE = 1e-3  # Learning rate (can be adjusted for complex architecture)
+BATCH_SIZE = 128  # Increased batch size for more stable training with complex network
 N_STEPS = 2048  # Steps per update
 N_EPOCHS = 10  # Optimization epochs per update
 GAMMA = 0.99  # Discount factor
@@ -57,12 +60,161 @@ GAE_LAMBDA = 0.95  # GAE lambda
 ENT_COEF = 0.01  # Entropy coefficient (exploration)
 VF_COEF = 0.5  # Value function coefficient
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
+
+# Model architecture configuration
+POLICY_LAYERS = [512, 512, 256, 256, 128]  # Policy network hidden layers
+VALUE_LAYERS = [512, 512, 256, 256, 128]   # Value network hidden layers
+ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
 
+# Early stopping configuration
+ENABLE_EARLY_STOPPING = True  # Enable early stopping
+EARLY_STOPPING_PATIENCE = 5  # Number of evaluations without improvement before stopping
+EARLY_STOPPING_MIN_DELTA = 0.1  # Minimum change to qualify as improvement
+EARLY_STOPPING_MONITOR = 'mean_reward'  # Metric to monitor: 'mean_reward', 'mean_ep_length', or 'loss'
+EARLY_STOPPING_MODE = 'max'  # 'max' for reward/ep_length (higher is better), 'min' for loss (lower is better)
+
 # Training/Validation split
 TRAIN_SPLIT = 0.8  # 80% training, 20% validation
+
+
+class EarlyStoppingCallback(BaseCallback):
+    """
+    Custom early stopping callback that monitors validation loss/metrics.
+    Stops training if the monitored metric doesn't improve for a specified number of evaluations.
+    """
+    
+    def __init__(
+        self,
+        eval_callback: EvalCallback,
+        patience: int = EARLY_STOPPING_PATIENCE,
+        min_delta: float = EARLY_STOPPING_MIN_DELTA,
+        monitor: str = EARLY_STOPPING_MONITOR,
+        mode: str = EARLY_STOPPING_MODE,
+        verbose: int = 1
+    ):
+        """
+        Initialize early stopping callback.
+        
+        Args:
+            eval_callback: EvalCallback instance to monitor
+            patience: Number of evaluations without improvement before stopping
+            min_delta: Minimum change to qualify as improvement
+            monitor: Metric to monitor ('mean_reward', 'mean_ep_length', or 'loss')
+            mode: 'max' for reward/ep_length, 'min' for loss
+            verbose: Verbosity level
+        """
+        super().__init__(verbose=verbose)
+        self.eval_callback = eval_callback
+        self.patience = patience
+        self.min_delta = min_delta
+        self.monitor = monitor
+        self.mode = mode
+        
+        # Track best value and patience counter
+        self.best_value = float('-inf') if mode == 'max' else float('inf')
+        self.patience_counter = 0
+        self.wait = 0
+        self.stopped_epoch = 0
+        self.last_eval_step = -1
+        self.last_mean_reward = None
+        
+        logger.info(f"Early stopping callback initialized:")
+        logger.info(f"  Monitor: {monitor}")
+        logger.info(f"  Mode: {mode}")
+        logger.info(f"  Patience: {patience} evaluations")
+        logger.info(f"  Min delta: {min_delta}")
+    
+    def _on_step(self) -> bool:
+        """
+        Called at each step. Check if early stopping should be triggered.
+        
+        Returns:
+            True if training should continue, False if should stop
+        """
+        # Only check after evaluation has occurred
+        # Check if a new evaluation has happened by comparing current mean_reward with last
+        if not hasattr(self.eval_callback, 'last_mean_reward'):
+            return True
+        
+        current_mean_reward = self.eval_callback.last_mean_reward
+        
+        # Check if this is a new evaluation (mean_reward changed)
+        if self.last_mean_reward is not None and current_mean_reward == self.last_mean_reward:
+            return True  # No new evaluation yet
+        
+        # New evaluation detected
+        self.last_mean_reward = current_mean_reward
+        
+        # Get current metric value from evaluation callback
+        if self.monitor == 'mean_reward':
+            if not hasattr(self.eval_callback, 'last_mean_reward'):
+                return True
+            current_value = self.eval_callback.last_mean_reward
+            if np.isnan(current_value):
+                return True  # Skip if NaN
+        
+        elif self.monitor == 'mean_ep_length':
+            if not hasattr(self.eval_callback, 'last_mean_ep_length'):
+                return True
+            current_value = self.eval_callback.last_mean_ep_length
+            if np.isnan(current_value):
+                return True  # Skip if NaN
+        
+        elif self.monitor == 'loss':
+            # For loss, we'll use negative mean reward as proxy
+            # (lower reward = higher loss, so we minimize negative reward)
+            if not hasattr(self.eval_callback, 'last_mean_reward'):
+                return True
+            current_value = -self.eval_callback.last_mean_reward
+            if np.isnan(current_value):
+                return True  # Skip if NaN
+            # Use min mode for loss
+            effective_mode = 'min'
+        else:
+            logger.warning(f"Unknown monitor metric: {self.monitor}, using mean_reward")
+            if not hasattr(self.eval_callback, 'last_mean_reward'):
+                return True
+            current_value = self.eval_callback.last_mean_reward
+            if np.isnan(current_value):
+                return True
+            effective_mode = self.mode
+        
+        # Use effective mode for loss, otherwise use configured mode
+        if self.monitor == 'loss':
+            check_mode = effective_mode
+        else:
+            check_mode = self.mode
+        
+        # Check for improvement
+        if check_mode == 'max':
+            improved = current_value > self.best_value + self.min_delta
+        else:  # mode == 'min'
+            improved = current_value < self.best_value - self.min_delta
+        
+        if improved:
+            self.best_value = current_value
+            self.wait = 0
+            if self.verbose >= 1:
+                logger.info(f"Early stopping: {self.monitor} improved to {current_value:.4f} (best: {self.best_value:.4f})")
+        else:
+            self.wait += 1
+            if self.verbose >= 1:
+                logger.info(f"Early stopping: {self.monitor} did not improve. Wait: {self.wait}/{self.patience} (current: {current_value:.4f}, best: {self.best_value:.4f})")
+        
+        # Check if patience exceeded
+        if self.wait >= self.patience:
+            self.stopped_epoch = self.num_timesteps
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Early stopping triggered at {self.num_timesteps} timesteps!")
+            logger.info(f"  Best {self.monitor}: {self.best_value:.4f}")
+            logger.info(f"  Stopped after {self.patience} evaluations without improvement")
+            logger.info(f"{'='*60}\n")
+            return False  # Stop training
+        
+        return True  # Continue training
 
 
 def load_episodes(data_dir: Path) -> List[Dict]:
@@ -240,11 +392,37 @@ def train_ppo_agent(
         vec_env_cls=DummyVecEnv
     )
     
-    # Create PPO model
-    logger.info("Creating PPO model...")
+    # Create PPO model with more complex architecture
+    logger.info("Creating PPO model with complex architecture...")
+    
+    # Map activation function string to PyTorch activation
+    activation_map = {
+        'tanh': torch.nn.Tanh,
+        'relu': torch.nn.ReLU,
+        'elu': torch.nn.ELU,
+        'leaky_relu': torch.nn.LeakyReLU
+    }
+    activation_fn = activation_map.get(ACTIVATION_FN.lower(), torch.nn.Tanh)
+    
     policy_kwargs = dict(
-        net_arch=[dict(pi=[256, 256], vf=[256, 256])]  # Two hidden layers, 256 units each
+        # Deeper and wider network architecture
+        # Separate networks for policy (pi) and value function (vf)
+        # Policy network: Multiple hidden layers with decreasing width (bottleneck design)
+        # Value network: Multiple hidden layers with decreasing width
+        net_arch=[
+            dict(pi=POLICY_LAYERS,  # Policy network layers
+                 vf=VALUE_LAYERS)   # Value network layers
+        ],
+        # Use activation function
+        activation_fn=activation_fn
     )
+    
+    # Determine device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.info("Using CPU (consider using GPU for faster training with complex architecture)")
     
     model = PPO(
         "MlpPolicy",
@@ -261,11 +439,18 @@ def train_ppo_agent(
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(tensorboard_log_dir),
         verbose=1,
-        device='cpu'  # Use 'cuda' if GPU available
+        device=device
     )
     
     logger.info(f"Model architecture:")
-    logger.info(f"  Policy network: {policy_kwargs['net_arch']}")
+    logger.info(f"  Policy network: {POLICY_LAYERS} ({len(POLICY_LAYERS)} hidden layers)")
+    logger.info(f"  Value network: {VALUE_LAYERS} ({len(VALUE_LAYERS)} hidden layers)")
+    logger.info(f"  Activation function: {ACTIVATION_FN}")
+    # Estimate parameters: sum of layer sizes squared
+    pi_params = sum(POLICY_LAYERS[i] * POLICY_LAYERS[i+1] for i in range(len(POLICY_LAYERS)-1))
+    vf_params = sum(VALUE_LAYERS[i] * VALUE_LAYERS[i+1] for i in range(len(VALUE_LAYERS)-1))
+    total_params = (pi_params + vf_params) + sum(POLICY_LAYERS) + sum(VALUE_LAYERS)  # Approximate
+    logger.info(f"  Estimated parameters: ~{total_params // 1000}K")
     logger.info(f"  Learning rate: {LEARNING_RATE}")
     logger.info(f"  Batch size: {BATCH_SIZE}")
     logger.info(f"  Steps per update: {N_STEPS}")
@@ -292,9 +477,29 @@ def train_ppo_agent(
         eval_freq=EVAL_FREQ,
         n_eval_episodes=EVAL_EPISODES,
         deterministic=True,
-        render=False
+        render=False,
+        verbose=1
     )
     callbacks.append(eval_callback)
+    
+    # Early stopping callback
+    if ENABLE_EARLY_STOPPING:
+        early_stopping_callback = EarlyStoppingCallback(
+            eval_callback=eval_callback,
+            patience=EARLY_STOPPING_PATIENCE,
+            min_delta=EARLY_STOPPING_MIN_DELTA,
+            monitor=EARLY_STOPPING_MONITOR,
+            mode=EARLY_STOPPING_MODE,
+            verbose=1
+        )
+        callbacks.append(early_stopping_callback)
+        logger.info(f"Early stopping enabled:")
+        logger.info(f"  Monitor: {EARLY_STOPPING_MONITOR}")
+        logger.info(f"  Mode: {EARLY_STOPPING_MODE}")
+        logger.info(f"  Patience: {EARLY_STOPPING_PATIENCE} evaluations")
+        logger.info(f"  Min delta: {EARLY_STOPPING_MIN_DELTA}")
+    else:
+        logger.info("Early stopping disabled")
     
     callback_list = CallbackList(callbacks)
     

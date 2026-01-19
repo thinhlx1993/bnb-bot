@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Dict, Any
 import logging
+from tqdm import tqdm
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -201,24 +202,28 @@ class RLRiskManager:
         rl_exit_count = 0
         rl_hold_count = 0
         
-        # Process each time step
-        for i in range(len(price)):
+        # Process each time step with progress bar
+        pbar = tqdm(range(len(price)), desc="Processing periods", unit="period")
+        for i in pbar:
             # Check for new entries
             if entries.iloc[i]:
                 # New position opened
                 entry_price = price.iloc[i]
                 current_balance = balance.iloc[i]
                 
-                # Create environment for this position
+                # Create environment for this position with large enough window
                 try:
+                    # Create environment with window extending well into the future
+                    exit_idx_guess = min(i + self.max_steps * 2, len(price) - 1)
                     env = self._create_env_for_position(
                         price,
                         balance,
                         i,
                         entry_price,
-                        i
+                        i,
+                        exit_idx_guess=exit_idx_guess
                     )
-                    env.reset()
+                    obs, _ = env.reset()
                     
                     # Track position
                     self.positions.append({
@@ -227,7 +232,8 @@ class RLRiskManager:
                         'current_idx': i,
                         'env': env,
                         'peak_balance': current_balance,
-                        'closed': False
+                        'closed': False,
+                        'env_steps': 0  # Track how many steps env has taken
                     })
                     logger.debug(f"  New position opened at step {i}, price ${entry_price:.2f}")
                 except Exception as e:
@@ -253,31 +259,26 @@ class RLRiskManager:
                 
                 # Get observation from environment
                 try:
-                    # Recreate environment at current state
-                    # We need to recreate because we can't directly set state
-                    env = self._create_env_for_position(
-                        price,
-                        balance,
-                        entry_idx,
-                        entry_price,
-                        current_idx,
-                        exit_idx_guess=min(current_idx + self.max_steps, len(price) - 1)
-                    )
-                    obs, _ = env.reset()
+                    # Calculate steps since entry (relative to episode start in env)
+                    steps_since_entry = current_idx - entry_idx
                     
-                    # Step environment to current position
-                    steps_needed = current_idx - entry_idx
-                    for step in range(min(steps_needed, self.max_steps)):
-                        if step < steps_needed:
-                            obs, _, terminated, truncated, _ = env.step(0)  # Hold action
-                            if terminated or truncated:
-                                break
-                    
-                    # Get current observation
-                    obs = env._get_observation()
-                    
-                    # Update position environment
-                    position['env'] = env
+                    # Step environment forward once (incremental - only one step per period)
+                    # At entry (steps_since_entry=0), we already have observation from reset
+                    # At subsequent periods, we step forward to get the next observation
+                    if steps_since_entry > 0 and position['env_steps'] < steps_since_entry:
+                        # Step forward once (not replay all history)
+                        obs, _, terminated, truncated, _ = env.step(0)  # Hold action to advance
+                        position['env_steps'] += 1
+                        
+                        if terminated or truncated:
+                            # Position should be closed
+                            exits_with_rl.iloc[i] = True
+                            position['closed'] = True
+                            rl_exit_count += 1
+                            continue
+                    else:
+                        # Get current observation (either at entry or already at correct step)
+                        obs = env._get_observation()
                     
                     # Query RL agent for action
                     action, _ = self.model.predict(obs, deterministic=self.deterministic)
@@ -298,6 +299,16 @@ class RLRiskManager:
             
             # Clean up closed positions
             self.positions = [p for p in self.positions if not p['closed']]
+            
+            # Update progress bar with current stats
+            open_positions = len([p for p in self.positions if not p['closed']])
+            pbar.set_postfix({
+                'open_pos': open_positions,
+                'exits': rl_exit_count,
+                'holds': rl_hold_count
+            })
+        
+        pbar.close()
         
         # Log summary
         original_exits = exits.sum()

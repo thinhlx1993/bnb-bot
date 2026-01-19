@@ -614,7 +614,7 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
     logger.info(f"PORTFOLIO VALUE:")
     logger.info(f"  Starting Value: ${initial_value:,.2f}")
     logger.info(f"  Ending Value: ${final_value:,.2f}")
-    logger.info(f"\n  Total Return: {total_return:.2%} ({(final_value - initial_value) / initial_value * 100:.2f}%)")
+    logger.info(f"  Total Return: {total_return:.2%} ({(final_value - initial_value) / initial_value * 100:.2f}%)")
     logger.info(f"  Net Profit: ${final_value - initial_value:,.2f}")
     logger.info(f"RISK METRICS:")
     logger.info(f"  Sharpe Ratio: {portfolio.sharpe_ratio():.2f}")

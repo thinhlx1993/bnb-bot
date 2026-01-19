@@ -14,3 +14,4 @@ imbalanced-learn>=0.11.0
 stable-baselines3>=2.0.0
 gymnasium>=0.28.0
 tensorboard>=2.13.0
+tqdm>=4.65.0

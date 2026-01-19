@@ -219,59 +219,114 @@ class RiskManagementEnv(gym.Env):
         """
         Calculate reward based on action and current state.
         
-        Balanced reward function:
-        - Positive rewards for profitable exits
-        - Negative rewards for loss exits
+        Adjusted reward function to encourage holding profitable positions longer:
+        - Large positive rewards for profitable exits (scaled by return and holding time)
+        - Moderate negative rewards for loss exits
         - Penalty for large drawdowns
-        - Small penalty for holding too long
+        - Reward for holding profitable positions (incentivize patience)
+        - Penalty for closing too early on profitable positions
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         price_change_pct = (current_price - self.entry_price) / self.entry_price
+        periods_held = self.current_idx + 1
         
         # Net return accounting for fees (if closing)
         if action in [1, 2] or done:
             position_return = price_change_pct - 2 * self.fee_rate
+            is_closing = True
         else:
             # Unrealized P&L while holding
             position_return = price_change_pct - self.fee_rate  # Only entry fee so far
+            is_closing = False
         
         # Reward components
-        return_weight = 100.0  # Scale returns
-        drawdown_weight = 50.0  # Penalty for drawdown
-        time_weight = 0.1  # Small penalty for holding
+        return_weight = 200.0  # Increased scale for returns (encourages profit)
+        drawdown_weight = 100.0  # Penalty for drawdown
+        time_reward_weight = 2.0  # Reward for holding profitable positions longer
         
-        # Base reward from position return
+        # Base reward from position return (scaled by return magnitude)
         reward = position_return * return_weight
         
-        # Drawdown penalty
+        # Drawdown penalty (increases with severity)
         reward -= self.max_drawdown * drawdown_weight
         
-        # Time penalty (encourage timely decisions)
-        reward -= self.current_idx * time_weight
+        # Time-based rewards/penalties
+        if is_closing:
+            # Closing action: reward/penalty based on return and holding time
+            if position_return > 0:
+                # Profitable exit: reward increases with holding time (up to a point)
+                # Encourage holding profitable positions but not too long
+                if periods_held < 10:
+                    # Penalty for closing too early on profitable position
+                    early_close_penalty = (10 - periods_held) * 5.0
+                    reward -= early_close_penalty
+                elif periods_held > 50:
+                    # Small penalty for holding too long (encourage taking profits)
+                    reward -= (periods_held - 50) * 0.5
+                else:
+                    # Bonus for holding in the sweet spot
+                    hold_bonus = periods_held * 0.5
+                    reward += hold_bonus
+            else:
+                # Losing exit: small reward for cutting losses early
+                if periods_held < 5:
+                    reward += 2.0  # Small bonus for cutting losses quickly
+                else:
+                    # Penalty for holding losses too long
+                    reward -= (periods_held - 5) * 0.3
+        else:
+            # Holding action: reward for holding profitable positions
+            if position_return > 0:
+                # Reward increases with unrealized profit and time held (up to a point)
+                if periods_held < 50:
+                    # Positive reward for holding profitable position
+                    hold_reward = position_return * time_reward_weight * min(periods_held, 20)
+                    reward += hold_reward
+                else:
+                    # Small penalty if holding too long without closing
+                    reward -= 0.1
+            elif position_return < -0.05:  # Loss > 5%
+                # Small penalty for holding losing positions
+                reward -= abs(position_return) * 50.0
         
-        # Action-specific rewards
+        # Action-specific rewards (reduced to encourage patience)
         if action == 1:  # Close (take profit)
-            if position_return > 0:
-                # Bonus for taking profit
-                reward += 10.0
+            if position_return > 0.02:  # Profit > 2%
+                # Bonus for taking good profit
+                profit_bonus = min(position_return * 50.0, 30.0)  # Cap at 30
+                reward += profit_bonus
+            elif position_return > 0:
+                # Small profit: less bonus
+                reward += position_return * 20.0
             else:
                 # Penalty for closing profitable position as loss
-                reward -= 20.0
+                reward -= 30.0
         elif action == 2:  # Close (stop loss)
-            if position_return < 0:
-                # Bonus for cutting losses early
-                reward += 5.0
+            if position_return < -0.05:  # Loss > 5%
+                # Bonus for cutting large losses early
+                reward += 10.0
+            elif position_return < 0:
+                # Small loss: neutral reward
+                reward += position_return * 10.0
             else:
-                # Penalty for closing profitable position as loss
-                reward -= 20.0
+                # Penalty for closing profitable position as stop loss
+                reward -= 30.0
         
-        # Terminal reward adjustment
+        # Terminal reward adjustment (only on actual exit)
         if done:
-            # Final reward based on actual outcome
-            if position_return > 0:
-                reward += 20.0  # Bonus for profitable trade
+            # Final reward based on actual outcome (more weight on final result)
+            if position_return > 0.02:  # Good profit
+                final_bonus = position_return * 100.0
+                reward += final_bonus
+            elif position_return > 0:
+                final_bonus = position_return * 50.0
+                reward += final_bonus
+            elif position_return < -0.1:  # Large loss
+                final_penalty = position_return * 150.0
+                reward += final_penalty
             else:
-                reward -= 10.0  # Penalty for losing trade
+                final_penalty = position_return * 100.0
+                reward += final_penalty
         
         return float(reward)
     
