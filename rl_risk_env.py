@@ -104,9 +104,13 @@ class RiskManagementEnv(gym.Env):
         self.peak_balance = initial_balance
         self.max_drawdown = 0.0
         
-        # Statistics
+        # Statistics for portfolio-level metrics
         self.total_reward = 0.0
         self.episode_return = 0.0
+        self.returns_history = []  # Track returns for Sharpe-like calculation
+        self.wins = 0  # Track wins for win rate
+        self.total_trades = 0  # Track total trades
+        self.entry_balance = initial_balance  # Track balance at entry
         
     def _get_observation(self) -> np.ndarray:
         """
@@ -217,14 +221,16 @@ class RiskManagementEnv(gym.Env):
     
     def _calculate_reward(self, action: int, done: bool) -> float:
         """
-        Calculate reward based on action and current state.
+        Calculate reward optimized for portfolio-level metrics:
+        - Maximize: return, sharpe_ratio, win_rate, annualized_return
+        - Minimize: drawdown
         
-        Adjusted reward function to encourage holding profitable positions longer:
-        - Large positive rewards for profitable exits (scaled by return and holding time)
-        - Moderate negative rewards for loss exits
-        - Penalty for large drawdowns
-        - Reward for holding profitable positions (incentivize patience)
-        - Penalty for closing too early on profitable positions
+        Reward components:
+        1. Return maximization: Direct reward proportional to position return
+        2. Sharpe ratio (risk-adjusted return): Reward consistent returns, penalize volatility
+        3. Win rate: Higher reward for profitable exits
+        4. Annualized return: Reward higher returns per time period
+        5. Drawdown minimization: Penalty for drawdowns
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         price_change_pct = (current_price - self.entry_price) / self.entry_price
@@ -239,94 +245,126 @@ class RiskManagementEnv(gym.Env):
             position_return = price_change_pct - self.fee_rate  # Only entry fee so far
             is_closing = False
         
-        # Reward components
-        return_weight = 200.0  # Increased scale for returns (encourages profit)
-        drawdown_weight = 100.0  # Penalty for drawdown
-        time_reward_weight = 2.0  # Reward for holding profitable positions longer
-        
-        # Base reward from position return (scaled by return magnitude)
+        # ========== 1. RETURN MAXIMIZATION ==========
+        # Direct reward proportional to return (maximize total return)
+        return_weight = 15.0
         reward = position_return * return_weight
         
-        # Drawdown penalty (increases with severity)
+        # ========== 2. SHARPE RATIO (Risk-Adjusted Return) ==========
+        # Sharpe ratio = (Return - Risk-free) / StdDev
+        # We encourage consistent returns (low variance) and penalize volatility
+        # Track price return volatility during the position
+        if periods_held > 5:
+            # Calculate rolling return volatility
+            recent_returns = []
+            for i in range(max(0, self.current_idx - 4), self.current_idx + 1):
+                if i > 0:
+                    prev_price = float(self.price_window.iloc[i-1])
+                    curr_price = float(self.price_window.iloc[i])
+                    ret = (curr_price - prev_price) / prev_price
+                    recent_returns.append(ret)
+            
+            if len(recent_returns) > 1:
+                returns_std = np.std(recent_returns)
+                # Penalize high volatility (lower Sharpe)
+                if returns_std > 0.02:  # High volatility threshold
+                    volatility_penalty = (returns_std - 0.02) * 10.0
+                    reward -= volatility_penalty
+                # Reward consistent positive returns (high Sharpe)
+                if position_return > 0 and returns_std < 0.01:
+                    consistency_bonus = 2.0
+                    reward += consistency_bonus
+        
+        # ========== 3. WIN RATE MAXIMIZATION ==========
+        # Higher reward for profitable exits (encourages more wins)
+        if is_closing:
+            if position_return > 0:
+                # Win: Higher reward for profitable exits
+                win_bonus = 5.0 + position_return * 10.0  # Base win bonus + scaled by return
+                reward += win_bonus
+                self.wins += 1
+            else:
+                # Loss: Smaller penalty (we want to minimize losses but not over-penalize)
+                loss_penalty = abs(position_return) * 5.0
+                reward -= loss_penalty
+            self.total_trades += 1
+            # Store return for tracking (used in future episodes if multi-trade)
+            self.returns_history.append(position_return)
+        
+        # ========== 4. ANNUALIZED RETURN MAXIMIZATION ==========
+        # Annualized return = (1 + return)^(periods_per_year / periods_held) - 1
+        # We want higher returns per time period
+        if is_closing and periods_held > 0:
+            # Approximate annualized return (assuming ~252 trading periods per year)
+            periods_per_year = 252.0
+            if position_return > -1.0:  # Avoid log of negative
+                annualized_return = (1 + position_return) ** (periods_per_year / periods_held) - 1
+                # Reward higher annualized returns
+                annualized_bonus = annualized_return * 2.0
+                reward += annualized_bonus
+            # Penalty for holding too long with small returns (inefficient time usage)
+            if periods_held > 20 and abs(position_return) < 0.01:
+                inefficiency_penalty = (periods_held - 20) * 0.1
+                reward -= inefficiency_penalty
+        
+        # ========== 5. DRAWDOWN MINIMIZATION ==========
+        # Penalty for drawdowns (minimize max drawdown)
+        drawdown_weight = 10.0
         reward -= self.max_drawdown * drawdown_weight
         
-        # Time-based rewards/penalties
+        # ========== TIME-BASED OPTIMIZATION ==========
+        # Balance between holding for profits vs. efficient time usage
         if is_closing:
-            # Closing action: reward/penalty based on return and holding time
-            if position_return > 0:
-                # Profitable exit: reward increases with holding time (up to a point)
-                # Encourage holding profitable positions but not too long
-                if periods_held < 10:
-                    # Penalty for closing too early on profitable position
-                    early_close_penalty = (10 - periods_held) * 5.0
-                    reward -= early_close_penalty
-                elif periods_held > 50:
-                    # Small penalty for holding too long (encourage taking profits)
-                    reward -= (periods_held - 50) * 0.5
-                else:
-                    # Bonus for holding in the sweet spot
-                    hold_bonus = periods_held * 0.5
-                    reward += hold_bonus
-            else:
-                # Losing exit: small reward for cutting losses early
-                if periods_held < 5:
-                    reward += 2.0  # Small bonus for cutting losses quickly
-                else:
-                    # Penalty for holding losses too long
-                    reward -= (periods_held - 5) * 0.3
+            # Prevent immediate closure bug
+            if periods_held < 3:
+                early_close_penalty = (3 - periods_held) * 2.0
+                reward -= early_close_penalty
         else:
-            # Holding action: reward for holding profitable positions
-            if position_return > 0:
-                # Reward increases with unrealized profit and time held (up to a point)
-                if periods_held < 50:
-                    # Positive reward for holding profitable position
-                    hold_reward = position_return * time_reward_weight * min(periods_held, 20)
-                    reward += hold_reward
-                else:
-                    # Small penalty if holding too long without closing
-                    reward -= 0.1
-            elif position_return < -0.05:  # Loss > 5%
-                # Small penalty for holding losing positions
-                reward -= abs(position_return) * 50.0
+            # Holding action: encourage holding profitable positions, penalize holding losses
+            if periods_held < 3:
+                # Prevent immediate closure
+                reward += 0.3
+            elif position_return > 0.01:  # Profitable position
+                # Reward holding profitable positions (but not too long)
+                if periods_held < 30:
+                    reward += 0.1
+            elif position_return < -0.05:  # Large loss
+                # Penalty for holding large losses too long
+                if periods_held > 10:
+                    reward -= abs(position_return) * 3.0
         
-        # Action-specific rewards (reduced to encourage patience)
+        # ========== ACTION-SPECIFIC GUIDANCE ==========
         if action == 1:  # Close (take profit)
-            if position_return > 0.02:  # Profit > 2%
-                # Bonus for taking good profit
-                profit_bonus = min(position_return * 50.0, 30.0)  # Cap at 30
-                reward += profit_bonus
-            elif position_return > 0:
-                # Small profit: less bonus
-                reward += position_return * 20.0
-            else:
-                # Penalty for closing profitable position as loss
-                reward -= 30.0
+            if periods_held >= 3 and position_return > 0:
+                # Reward taking profits
+                reward += position_return * 3.0
+            elif periods_held < 3:
+                reward -= 1.0  # Penalty for early closure
         elif action == 2:  # Close (stop loss)
-            if position_return < -0.05:  # Loss > 5%
-                # Bonus for cutting large losses early
-                reward += 10.0
-            elif position_return < 0:
-                # Small loss: neutral reward
-                reward += position_return * 10.0
-            else:
-                # Penalty for closing profitable position as stop loss
-                reward -= 30.0
+            if periods_held >= 5 and position_return < -0.03:
+                # Reward cutting losses at reasonable time
+                reward += 1.0
+            elif periods_held < 3:
+                reward -= 0.5  # Small penalty for very early stop loss
         
-        # Terminal reward adjustment (only on actual exit)
+        # ========== TERMINAL REWARD (Final Outcome) ==========
         if done:
-            # Final reward based on actual outcome (more weight on final result)
+            # Strong final reward based on outcome
             if position_return > 0.02:  # Good profit
-                final_bonus = position_return * 100.0
+                final_bonus = position_return * 20.0
                 reward += final_bonus
             elif position_return > 0:
-                final_bonus = position_return * 50.0
+                final_bonus = position_return * 10.0
                 reward += final_bonus
             elif position_return < -0.1:  # Large loss
-                final_penalty = position_return * 150.0
+                final_penalty = position_return * 20.0
                 reward += final_penalty
             else:
-                final_penalty = position_return * 100.0
+                final_penalty = position_return * 10.0
                 reward += final_penalty
+        
+        # Clip reward to prevent extreme values that cause training instability
+        reward = np.clip(reward, -50.0, 50.0)
         
         return float(reward)
     
@@ -346,6 +384,12 @@ class RiskManagementEnv(gym.Env):
         self.max_drawdown = 0.0
         self.total_reward = 0.0
         self.episode_return = 0.0
+        
+        # Reset portfolio-level metrics
+        self.returns_history = []
+        self.wins = 0
+        self.total_trades = 0
+        self.entry_balance = self.initial_balance
         
         observation = self._get_observation()
         info = {

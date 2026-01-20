@@ -25,6 +25,7 @@ from stable_baselines3.common.callbacks import (
 )
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
 import torch
 import torch.nn as nn
 
@@ -50,34 +51,136 @@ TENSORBOARD_LOG_DIR = MODEL_SAVE_DIR / "tensorboard_logs"
 TENSORBOARD_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 1e10  # Total training steps (use early stopping)
-LEARNING_RATE = 1e-3  # Learning rate (can be adjusted for complex architecture)
-BATCH_SIZE = 128  # Increased batch size for more stable training with complex network
+TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
+LEARNING_RATE = 1e-4  # Learning rate (further reduced for stability with scaled rewards)
+BATCH_SIZE = 128  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
-N_EPOCHS = 10  # Optimization epochs per update
+N_EPOCHS = 5  # Optimization epochs per update (reduced to prevent overfitting)
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # GAE lambda
-ENT_COEF = 0.01  # Entropy coefficient (exploration)
-VF_COEF = 0.5  # Value function coefficient
+ENT_COEF = 0.1  # Entropy coefficient (exploration) - increased to prevent premature convergence
+VF_COEF = 1.0  # Value function coefficient (increased to stabilize value learning)
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
 
 # Model architecture configuration
-POLICY_LAYERS = [512, 512, 256, 256, 128]  # Policy network hidden layers
-VALUE_LAYERS = [512, 512, 256, 256, 128]   # Value network hidden layers
+POLICY_LAYERS = [512, 256, 256, 32]  # Policy network hidden layers
+VALUE_LAYERS = [512, 256, 256, 32]   # Value network hidden layers
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
 
 # Early stopping configuration
-ENABLE_EARLY_STOPPING = True  # Enable early stopping
-EARLY_STOPPING_PATIENCE = 5  # Number of evaluations without improvement before stopping
-EARLY_STOPPING_MIN_DELTA = 0.1  # Minimum change to qualify as improvement
+ENABLE_EARLY_STOPPING = False  # Enable early stopping
+EARLY_STOPPING_PATIENCE = 50  # Number of evaluations without improvement before stopping
+EARLY_STOPPING_MIN_DELTA = 0.0  # Minimum change to qualify as improvement
 EARLY_STOPPING_MONITOR = 'mean_reward'  # Metric to monitor: 'mean_reward', 'mean_ep_length', or 'loss'
 EARLY_STOPPING_MODE = 'max'  # 'max' for reward/ep_length (higher is better), 'min' for loss (lower is better)
 
 # Training/Validation split
-TRAIN_SPLIT = 0.8  # 80% training, 20% validation
+TRAIN_SPLIT = 0.9  # 90% training, 10% validation
+
+
+class DynamicEvalCallback(BaseCallback):
+    """
+    Custom evaluation callback that recreates environments with different episodes each evaluation.
+    This ensures evaluation uses diverse episodes and reflects actual learning progress.
+    """
+    
+    def __init__(
+        self,
+        val_episodes: List[Dict],
+        eval_freq: int,
+        n_eval_episodes: int,
+        model_save_dir: Path,
+        log_path: Path,
+        deterministic: bool = True,
+        verbose: int = 1
+    ):
+        super().__init__(verbose=verbose)
+        self.val_episodes = val_episodes
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.model_save_dir = model_save_dir
+        self.log_path = log_path
+        self.deterministic = deterministic
+        self.last_mean_reward = None
+        self.last_mean_ep_length = None
+        self.best_mean_reward = float('-inf')
+        self.eval_count = 0
+        
+        log_path.mkdir(parents=True, exist_ok=True)
+        
+    def _on_step(self) -> bool:
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            # Recreate evaluation environments with random episodes
+            eval_env_factory = create_eval_env_factory(self.val_episodes, seed=123 + self.eval_count)
+            n_eval_envs = min(self.n_eval_episodes, len(self.val_episodes), 10)
+            eval_env = make_vec_env(
+                eval_env_factory,
+                n_envs=n_eval_envs,
+                vec_env_cls=DummyVecEnv
+            )
+            
+            # Evaluate current model and get episode rewards/lengths
+            episode_rewards, episode_lengths = evaluate_policy(
+                self.model,
+                eval_env,
+                n_eval_episodes=self.n_eval_episodes,
+                deterministic=self.deterministic,
+                return_episode_rewards=True
+            )
+            
+            # Normalize rewards by episode length to make them comparable to training
+            # Training episodes are shorter, so we normalize to reward per step
+            if episode_rewards and episode_lengths:
+                # Calculate reward per step for each episode
+                rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
+                mean_reward = np.mean(rewards_per_step)
+                std_reward = np.std(rewards_per_step)
+                # Also keep total reward for reference
+                mean_total_reward = np.mean(episode_rewards)
+                std_total_reward = np.std(episode_rewards)
+            else:
+                mean_reward = 0.0
+                std_reward = 0.0
+                mean_total_reward = 0.0
+                std_total_reward = 0.0
+            
+            mean_ep_length = np.mean(episode_lengths) if episode_lengths else 0.0
+            
+            # Store normalized reward (per step) for early stopping comparison
+            self.last_mean_reward = mean_reward
+            self.last_mean_ep_length = mean_ep_length
+            self.eval_count += 1
+            
+            # Log to TensorBoard (same format as EvalCallback)
+            self.logger.record("eval/mean_reward", mean_reward)
+            self.logger.record("eval/mean_ep_length", mean_ep_length)
+            self.logger.record("eval/std_reward", std_reward)
+            self.logger.record("eval/mean_total_reward", mean_total_reward)
+            self.logger.record("eval/std_total_reward", std_total_reward)
+            self.logger.dump(step=self.num_timesteps)
+            
+            # Log results (show both normalized and total for reference)
+            if self.verbose >= 1:
+                logger.info(f"Eval num_timesteps={self.num_timesteps}, "
+                          f"episode_reward_per_step={mean_reward:.2f} +/- {std_reward:.2f} "
+                          f"(total: {mean_total_reward:.2f} +/- {std_total_reward:.2f})")
+                logger.info(f"Episode length: {mean_ep_length:.2f}")
+            
+            # Save best model
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                best_model_path = self.model_save_dir / "best_model.zip"
+                self.model.save(str(best_model_path))
+                if self.verbose >= 1:
+                    logger.info(f"New best model saved with mean reward: {mean_reward:.2f}")
+            
+            # Clean up
+            eval_env.close()
+            
+        return True
 
 
 class EarlyStoppingCallback(BaseCallback):
@@ -88,7 +191,7 @@ class EarlyStoppingCallback(BaseCallback):
     
     def __init__(
         self,
-        eval_callback: EvalCallback,
+        eval_callback,  # Can be EvalCallback or DynamicEvalCallback
         patience: int = EARLY_STOPPING_PATIENCE,
         min_delta: float = EARLY_STOPPING_MIN_DELTA,
         monitor: str = EARLY_STOPPING_MONITOR,
@@ -99,7 +202,7 @@ class EarlyStoppingCallback(BaseCallback):
         Initialize early stopping callback.
         
         Args:
-            eval_callback: EvalCallback instance to monitor
+            eval_callback: EvalCallback or DynamicEvalCallback instance to monitor
             patience: Number of evaluations without improvement before stopping
             min_delta: Minimum change to qualify as improvement
             monitor: Metric to monitor ('mean_reward', 'mean_ep_length', or 'loss')
@@ -153,24 +256,42 @@ class EarlyStoppingCallback(BaseCallback):
             if not hasattr(self.eval_callback, 'last_mean_reward'):
                 return True
             current_value = self.eval_callback.last_mean_reward
-            if np.isnan(current_value):
-                return True  # Skip if NaN
+            if current_value is None:
+                return True
+            try:
+                current_value = float(current_value)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True  # Skip if NaN or Inf
+            except (TypeError, ValueError):
+                return True  # Skip if not numeric
         
         elif self.monitor == 'mean_ep_length':
             if not hasattr(self.eval_callback, 'last_mean_ep_length'):
                 return True
             current_value = self.eval_callback.last_mean_ep_length
-            if np.isnan(current_value):
-                return True  # Skip if NaN
+            if current_value is None:
+                return True
+            try:
+                current_value = float(current_value)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True  # Skip if NaN or Inf
+            except (TypeError, ValueError):
+                return True  # Skip if not numeric
         
         elif self.monitor == 'loss':
             # For loss, we'll use negative mean reward as proxy
             # (lower reward = higher loss, so we minimize negative reward)
             if not hasattr(self.eval_callback, 'last_mean_reward'):
                 return True
-            current_value = -self.eval_callback.last_mean_reward
-            if np.isnan(current_value):
-                return True  # Skip if NaN
+            reward = self.eval_callback.last_mean_reward
+            if reward is None:
+                return True
+            try:
+                current_value = -float(reward)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True  # Skip if NaN or Inf
+            except (TypeError, ValueError):
+                return True  # Skip if not numeric
             # Use min mode for loss
             effective_mode = 'min'
         else:
@@ -178,7 +299,13 @@ class EarlyStoppingCallback(BaseCallback):
             if not hasattr(self.eval_callback, 'last_mean_reward'):
                 return True
             current_value = self.eval_callback.last_mean_reward
-            if np.isnan(current_value):
+            if current_value is None:
+                return True
+            try:
+                current_value = float(current_value)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True
+            except (TypeError, ValueError):
                 return True
             effective_mode = self.mode
         
@@ -190,9 +317,9 @@ class EarlyStoppingCallback(BaseCallback):
         
         # Check for improvement
         if check_mode == 'max':
-            improved = current_value > self.best_value + self.min_delta
+            improved = current_value >= self.best_value + self.min_delta
         else:  # mode == 'min'
-            improved = current_value < self.best_value - self.min_delta
+            improved = current_value <= self.best_value - self.min_delta
         
         if improved:
             self.best_value = current_value
@@ -330,7 +457,7 @@ def create_env_factory(train_episodes: List[Dict], seed: int = 42) -> callable:
 
 def create_eval_env_factory(val_episodes: List[Dict], seed: int = 42) -> callable:
     """
-    Create evaluation environment factory.
+    Create evaluation environment factory that randomly samples episodes.
     
     Args:
         val_episodes: List of validation episodes
@@ -339,15 +466,23 @@ def create_eval_env_factory(val_episodes: List[Dict], seed: int = 42) -> callabl
     Returns:
         Function that returns an environment
     """
-    np.random.seed(seed)
-    val_episode_idx = 0
+    # Store episodes list for random sampling
+    episodes_list = val_episodes
     
     def _make_env(rank: int = 0):
-        nonlocal val_episode_idx
-        # Cycle through validation episodes
-        episode = val_episodes[val_episode_idx % len(val_episodes)]
-        val_episode_idx += 1
-        return make_env(episode, rank=rank, seed=seed)()
+        # Create a new random state for each environment creation
+        # This ensures different episodes are selected
+        local_rng = np.random.RandomState(seed + rank + int(np.random.random() * 1000000))
+        # Randomly sample a validation episode
+        episode_idx = local_rng.randint(0, len(episodes_list))
+        episode = episodes_list[episode_idx]
+        # Use different seed for each environment instance
+        env_seed = seed + rank + local_rng.randint(0, 10000)
+        env = make_env(episode, rank=rank, seed=env_seed)()
+        # Store episode list in env for later random resets
+        env._available_episodes = episodes_list
+        env._episode_rng = np.random.RandomState(env_seed)
+        return env
     
     return _make_env
 
@@ -358,7 +493,7 @@ def train_ppo_agent(
     model_save_dir: Path,
     tensorboard_log_dir: Path,
     total_timesteps: int = TOTAL_TIMESTEPS,
-    n_envs: int = 4
+    n_envs: int = 32
 ):
     """
     Train PPO agent on episodes.
@@ -385,12 +520,15 @@ def train_ppo_agent(
     )
     
     # Create evaluation environment
+    # Use multiple environments to evaluate different episodes in parallel
     eval_env_factory = create_eval_env_factory(val_episodes, seed=123)
+    n_eval_envs = min(EVAL_EPISODES, len(val_episodes), 10)  # Use up to 10 parallel envs
     eval_env = make_vec_env(
         eval_env_factory,
-        n_envs=1,
+        n_envs=n_eval_envs,
         vec_env_cls=DummyVecEnv
     )
+    logger.info(f"Created {n_eval_envs} evaluation environments for {EVAL_EPISODES} episodes")
     
     # Create PPO model with more complex architecture
     logger.info("Creating PPO model with complex architecture...")
@@ -469,18 +607,20 @@ def train_ppo_agent(
     )
     callbacks.append(checkpoint_callback)
     
-    # Evaluation callback
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(model_save_dir),
-        log_path=str(model_save_dir / "eval_logs"),
+    # Evaluation callback - use custom callback that recreates environments each time
+    eval_callback = DynamicEvalCallback(
+        val_episodes=val_episodes,
         eval_freq=EVAL_FREQ,
         n_eval_episodes=EVAL_EPISODES,
+        model_save_dir=model_save_dir,
+        log_path=model_save_dir / "eval_logs",
         deterministic=True,
-        render=False,
         verbose=1
     )
     callbacks.append(eval_callback)
+    
+    # Close the pre-created eval_env since we'll recreate it each time
+    eval_env.close()
     
     # Early stopping callback
     if ENABLE_EARLY_STOPPING:
@@ -529,7 +669,8 @@ def train_ppo_agent(
     
     # Cleanup
     train_env.close()
-    eval_env.close()
+    # Note: eval_env was already closed when we switched to DynamicEvalCallback
+    # (it creates its own environments each evaluation)
     
     logger.info("="*60)
     logger.info("Training complete!")
@@ -567,12 +708,18 @@ def main():
     logger.info(f"  Validation episodes: {len(val_episodes)}")
     
     train_returns = [ep['trade_return'] for ep in train_episodes]
+    train_lengths = [ep['episode_length'] for ep in train_episodes]
     logger.info(f"  Training avg return: {np.mean(train_returns):.4f} ({np.mean(train_returns)*100:.2f}%)")
     logger.info(f"  Training win rate: {np.mean([r > 0 for r in train_returns])*100:.1f}%")
+    logger.info(f"  Training avg episode length: {np.mean(train_lengths):.1f} periods")
+    logger.info(f"  Training episode length range: {np.min(train_lengths)} - {np.max(train_lengths)} periods")
     
     val_returns = [ep['trade_return'] for ep in val_episodes]
+    val_lengths = [ep['episode_length'] for ep in val_episodes]
     logger.info(f"  Validation avg return: {np.mean(val_returns):.4f} ({np.mean(val_returns)*100:.2f}%)")
     logger.info(f"  Validation win rate: {np.mean([r > 0 for r in val_returns])*100:.1f}%")
+    logger.info(f"  Validation avg episode length: {np.mean(val_lengths):.1f} periods")
+    logger.info(f"  Validation episode length range: {np.min(val_lengths)} - {np.max(val_lengths)} periods")
     
     # Train model
     model = train_ppo_agent(

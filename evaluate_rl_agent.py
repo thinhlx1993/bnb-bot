@@ -15,26 +15,17 @@ import logging
 import warnings
 warnings.filterwarnings('ignore')
 
-# Try to import backtest functions with error handling
-try:
-    # Import backtest functions
-    from backtest import (
-        backtest_strategy,
-        analyze_results,
-        plot_account_balance,
-        save_account_balance,
-        save_trade_history,
-        INITIAL_BALANCE,
-        TIME_INTERVAL,
-        TICKER_LIST
-    )
-except ImportError as e:
-    logger = logging.getLogger(__name__)
-    logger.error(f"Error importing backtest module: {e}")
-    logger.error("This may be due to numpy/numba compatibility issues.")
-    logger.error("Please try: pip install --upgrade numpy numba")
-    logger.error("Or: conda install numpy numba")
-    raise
+# Import backtest functions
+from backtest import (
+    backtest_strategy,
+    analyze_results,
+    plot_account_balance,
+    save_account_balance,
+    save_trade_history,
+    INITIAL_BALANCE,
+    TIME_INTERVAL,
+    TICKER_LIST
+)
 
 # Import RL risk management
 from rl_risk_management import apply_rl_risk_management, RLRiskManager
