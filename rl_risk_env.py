@@ -28,11 +28,12 @@ class RiskManagementEnv(gym.Env):
     
     def __init__(
         self,
-        price_data: pd.Series,
-        balance_data: pd.Series,
-        entry_price: float,
-        entry_idx: int,
-        exit_idx: int,
+        all_tickers_data: Optional[Dict[str, Dict[str, pd.Series]]] = None,
+        price_data: Optional[pd.Series] = None,
+        balance_data: Optional[pd.Series] = None,
+        entry_price: Optional[float] = None,
+        entry_idx: Optional[int] = None,
+        exit_idx: Optional[int] = None,
         initial_balance: float = 100.0,
         history_length: int = 30,
         max_steps: int = 1000,
@@ -43,11 +44,12 @@ class RiskManagementEnv(gym.Env):
         Initialize the risk management environment.
         
         Args:
-            price_data: Price series (pandas Series with datetime index)
-            balance_data: Account balance series (aligned with price_data)
-            entry_price: Entry price for this position
-            entry_idx: Entry index in price_data
-            exit_idx: Exit index in price_data (ground truth exit)
+            all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for all tickers
+            price_data: Price series (legacy - used if all_tickers_data not provided)
+            balance_data: Account balance series (legacy - used if all_tickers_data not provided)
+            entry_price: Entry price (legacy - will be set on reset if all_tickers_data provided)
+            entry_idx: Entry index (legacy - will be set on reset if all_tickers_data provided)
+            exit_idx: Exit index (legacy - will be set on reset if all_tickers_data provided)
             initial_balance: Initial account balance
             history_length: Number of historical periods to include in observations
             max_steps: Maximum steps per episode
@@ -56,26 +58,50 @@ class RiskManagementEnv(gym.Env):
         """
         super().__init__()
         
-        self.price_data = price_data
-        self.balance_data = balance_data
-        self.entry_price = entry_price
-        self.entry_idx = entry_idx
-        self.exit_idx = exit_idx
+        # New approach: store all tickers' data
+        if all_tickers_data is not None:
+            self.all_tickers_data = all_tickers_data
+            self.tickers_list = list(all_tickers_data.keys())
+            self.use_all_tickers = True
+            # Will be set on reset
+            self.current_ticker = None
+            self.price_data = None
+            self.balance_data = None
+            self.entry_price = None
+            self.entry_idx = None
+            self.exit_idx = None
+        else:
+            # Legacy approach: single episode data
+            self.all_tickers_data = None
+            self.use_all_tickers = False
+            self.price_data = price_data
+            self.balance_data = balance_data
+            self.entry_price = entry_price
+            self.entry_idx = entry_idx
+            self.exit_idx = exit_idx
+        
         self.initial_balance = initial_balance
         self.history_length = history_length
         self.max_steps = max_steps
         self.fee_rate = fee_rate
         self.render_mode = render_mode
         
-        # Extract the episode price and balance data (entry_idx to exit_idx)
-        self.episode_start_idx = entry_idx
-        self.episode_end_idx = exit_idx
-        self.episode_length = exit_idx - entry_idx + 1
+        # Initialize episode tracking variables (will be set on reset)
+        self.episode_start_idx = None
+        self.episode_end_idx = None
+        self.episode_length = None
+        self.data_start_idx = None
+        self.price_window = None
+        self.balance_window = None
         
-        # Ensure we have enough data before entry for history
-        self.data_start_idx = max(0, entry_idx - history_length)
-        self.price_window = price_data.iloc[self.data_start_idx:exit_idx + 1].copy()
-        self.balance_window = balance_data.iloc[self.data_start_idx:exit_idx + 1].copy()
+        # If using legacy approach (single episode), set up windows now
+        if not self.use_all_tickers:
+            self.episode_start_idx = entry_idx
+            self.episode_end_idx = exit_idx
+            self.episode_length = exit_idx - entry_idx + 1
+            self.data_start_idx = max(0, entry_idx - history_length)
+            self.price_window = price_data.iloc[self.data_start_idx:exit_idx + 1].copy()
+            self.balance_window = balance_data.iloc[self.data_start_idx:exit_idx + 1].copy()
         
         # Action space: 0 = Hold, 1 = Close (take profit), 2 = Close (stop loss)
         self.action_space = spaces.Discrete(3)
@@ -119,11 +145,17 @@ class RiskManagementEnv(gym.Env):
         Returns:
             Observation array of 67 features
         """
+        # Ensure environment is initialized (should have been reset)
+        if self.price_window is None or self.balance_window is None:
+            raise RuntimeError("Environment not initialized. Call reset() first.")
+        
         if self.current_idx is None:
             # First step, use entry point
             self.current_idx = 0
             
         # Get actual data index
+        if self.episode_start_idx is None:
+            self.episode_start_idx = 0
         data_idx = self.episode_start_idx + self.current_idx
         
         # Ensure we don't go beyond available data
@@ -247,7 +279,8 @@ class RiskManagementEnv(gym.Env):
         
         # ========== 1. RETURN MAXIMIZATION ==========
         # Direct reward proportional to return (maximize total return)
-        return_weight = 15.0
+        # Reduced weight to keep rewards in reasonable range for stable training
+        return_weight = 2.0  # Reduced from 15.0 to prevent high value loss
         reward = position_return * return_weight
         
         # ========== 2. SHARPE RATIO (Risk-Adjusted Return) ==========
@@ -268,11 +301,11 @@ class RiskManagementEnv(gym.Env):
                 returns_std = np.std(recent_returns)
                 # Penalize high volatility (lower Sharpe)
                 if returns_std > 0.02:  # High volatility threshold
-                    volatility_penalty = (returns_std - 0.02) * 10.0
+                    volatility_penalty = (returns_std - 0.02) * 1.0  # Reduced from 10.0
                     reward -= volatility_penalty
                 # Reward consistent positive returns (high Sharpe)
                 if position_return > 0 and returns_std < 0.01:
-                    consistency_bonus = 2.0
+                    consistency_bonus = 0.3  # Reduced from 2.0
                     reward += consistency_bonus
         
         # ========== 3. WIN RATE MAXIMIZATION ==========
@@ -280,12 +313,12 @@ class RiskManagementEnv(gym.Env):
         if is_closing:
             if position_return > 0:
                 # Win: Higher reward for profitable exits
-                win_bonus = 5.0 + position_return * 10.0  # Base win bonus + scaled by return
+                win_bonus = 0.5 + position_return * 1.0  # Reduced from 5.0 + 10.0
                 reward += win_bonus
                 self.wins += 1
             else:
                 # Loss: Smaller penalty (we want to minimize losses but not over-penalize)
-                loss_penalty = abs(position_return) * 5.0
+                loss_penalty = abs(position_return) * 0.5  # Reduced from 5.0
                 reward -= loss_penalty
             self.total_trades += 1
             # Store return for tracking (used in future episodes if multi-trade)
@@ -300,16 +333,16 @@ class RiskManagementEnv(gym.Env):
             if position_return > -1.0:  # Avoid log of negative
                 annualized_return = (1 + position_return) ** (periods_per_year / periods_held) - 1
                 # Reward higher annualized returns
-                annualized_bonus = annualized_return * 2.0
+                annualized_bonus = annualized_return * 0.3  # Reduced from 2.0
                 reward += annualized_bonus
             # Penalty for holding too long with small returns (inefficient time usage)
             if periods_held > 20 and abs(position_return) < 0.01:
-                inefficiency_penalty = (periods_held - 20) * 0.1
+                inefficiency_penalty = (periods_held - 20) * 0.01  # Reduced from 0.1
                 reward -= inefficiency_penalty
         
         # ========== 5. DRAWDOWN MINIMIZATION ==========
         # Penalty for drawdowns (minimize max drawdown)
-        drawdown_weight = 10.0
+        drawdown_weight = 1.0  # Reduced from 10.0 to prevent high value loss
         reward -= self.max_drawdown * drawdown_weight
         
         # ========== TIME-BASED OPTIMIZATION ==========
@@ -317,54 +350,55 @@ class RiskManagementEnv(gym.Env):
         if is_closing:
             # Prevent immediate closure bug
             if periods_held < 3:
-                early_close_penalty = (3 - periods_held) * 2.0
+                early_close_penalty = (3 - periods_held) * 0.2  # Reduced from 2.0
                 reward -= early_close_penalty
         else:
             # Holding action: encourage holding profitable positions, penalize holding losses
             if periods_held < 3:
                 # Prevent immediate closure
-                reward += 0.3
+                reward += 0.03  # Reduced from 0.3
             elif position_return > 0.01:  # Profitable position
                 # Reward holding profitable positions (but not too long)
                 if periods_held < 30:
-                    reward += 0.1
+                    reward += 0.01  # Reduced from 0.1
             elif position_return < -0.05:  # Large loss
                 # Penalty for holding large losses too long
                 if periods_held > 10:
-                    reward -= abs(position_return) * 3.0
+                    reward -= abs(position_return) * 0.3  # Reduced from 3.0
         
         # ========== ACTION-SPECIFIC GUIDANCE ==========
         if action == 1:  # Close (take profit)
             if periods_held >= 3 and position_return > 0:
                 # Reward taking profits
-                reward += position_return * 3.0
+                reward += position_return * 0.3  # Reduced from 3.0
             elif periods_held < 3:
-                reward -= 1.0  # Penalty for early closure
+                reward -= 0.1  # Reduced from 1.0
         elif action == 2:  # Close (stop loss)
             if periods_held >= 5 and position_return < -0.03:
                 # Reward cutting losses at reasonable time
-                reward += 1.0
+                reward += 0.1  # Reduced from 1.0
             elif periods_held < 3:
-                reward -= 0.5  # Small penalty for very early stop loss
+                reward -= 0.05  # Reduced from 0.5
         
         # ========== TERMINAL REWARD (Final Outcome) ==========
         if done:
             # Strong final reward based on outcome
             if position_return > 0.02:  # Good profit
-                final_bonus = position_return * 20.0
+                final_bonus = position_return * 2.0  # Reduced from 20.0
                 reward += final_bonus
             elif position_return > 0:
-                final_bonus = position_return * 10.0
+                final_bonus = position_return * 1.0  # Reduced from 10.0
                 reward += final_bonus
             elif position_return < -0.1:  # Large loss
-                final_penalty = position_return * 20.0
+                final_penalty = position_return * 2.0  # Reduced from 20.0
                 reward += final_penalty
             else:
-                final_penalty = position_return * 10.0
+                final_penalty = position_return * 1.0  # Reduced from 10.0
                 reward += final_penalty
         
         # Clip reward to prevent extreme values that cause training instability
-        reward = np.clip(reward, -50.0, 50.0)
+        # Reduced clipping range to match scaled rewards
+        reward = np.clip(reward, -5.0, 5.0)  # Reduced from -50.0, 50.0
         
         return float(reward)
     
@@ -375,6 +409,60 @@ class RiskManagementEnv(gym.Env):
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reset the environment to initial state."""
         super().reset(seed=seed)
+        
+        # If using all tickers, randomly select ticker and entry point
+        if self.use_all_tickers:
+            # Set random seed if provided
+            if seed is not None:
+                np.random.seed(seed)
+            
+            # Randomly select a ticker
+            self.current_ticker = np.random.choice(self.tickers_list)
+            ticker_data = self.all_tickers_data[self.current_ticker]
+            
+            # Get price and balance series for this ticker
+            price_series = ticker_data['price']
+            balance_series = ticker_data['balance']
+            
+            # Ensure balance series exists and is aligned
+            if balance_series is None or len(balance_series) == 0:
+                # Create default balance series
+                balance_series = pd.Series(self.initial_balance, index=price_series.index)
+            
+            # Randomly select entry point (must have enough history and future)
+            min_entry_idx = self.history_length
+            max_entry_idx = len(price_series) - self.max_steps - 1
+            
+            if max_entry_idx <= min_entry_idx:
+                # Not enough data, use available range
+                min_entry_idx = 0
+                max_entry_idx = max(0, len(price_series) - 10)
+            
+            if max_entry_idx > min_entry_idx:
+                entry_idx = np.random.randint(min_entry_idx, max_entry_idx)
+            else:
+                entry_idx = min_entry_idx if min_entry_idx < len(price_series) else 0
+            
+            # Set exit index (end of available data or max_steps ahead)
+            exit_idx = min(entry_idx + self.max_steps, len(price_series) - 1)
+            
+            # Set entry price
+            entry_price = float(price_series.iloc[entry_idx])
+            
+            # Update environment with selected ticker and position
+            self.price_data = price_series
+            self.balance_data = balance_series
+            self.entry_price = entry_price
+            self.entry_idx = entry_idx
+            self.exit_idx = exit_idx
+            
+            # Set up episode windows
+            self.episode_start_idx = entry_idx
+            self.episode_end_idx = exit_idx
+            self.episode_length = exit_idx - entry_idx + 1
+            self.data_start_idx = max(0, entry_idx - self.history_length)
+            self.price_window = price_series.iloc[self.data_start_idx:exit_idx + 1].copy()
+            self.balance_window = balance_series.iloc[self.data_start_idx:exit_idx + 1].copy()
         
         # Reset episode tracking
         self.current_step = 0
@@ -398,6 +486,9 @@ class RiskManagementEnv(gym.Env):
             "entry_idx": self.entry_idx,
             "exit_idx": self.exit_idx
         }
+        
+        if self.use_all_tickers:
+            info["ticker"] = self.current_ticker
         
         return observation, info
     

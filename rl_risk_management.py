@@ -167,9 +167,10 @@ class RLRiskManager:
         balance: Optional[pd.Series] = None
     ) -> pd.Series:
         """
-        Apply RL-based risk management to exits.
+        Apply RL-based risk management to exits using a single continuous environment.
         
-        This replaces or augments the rule-based apply_risk_management function.
+        Creates one environment for the entire price series and processes sequentially
+        from index 0 to the end, tracking all positions within that environment.
         
         Args:
             entries: Entry signals (boolean series)
@@ -186,8 +187,6 @@ class RLRiskManager:
         if balance is None:
             # Initialize with initial balance
             balance = pd.Series(self.initial_balance, index=price.index)
-            # Simple approximation: balance changes with price changes
-            # In production, you'd track actual balance from portfolio
             logger.warning("Balance series not provided, using approximation")
         
         # Ensure balance is aligned with price
@@ -196,114 +195,121 @@ class RLRiskManager:
             balance = balance.reindex(price.index, method='ffill')
             balance = balance.fillna(self.initial_balance)
         
-        logger.info(f"Applying RL risk management to {len(price)} periods...")
+        logger.info(f"Applying RL risk management to {len(price)} periods with single continuous environment...")
         
-        # Track positions and RL decisions
+        # Create ONE environment for the entire price series
+        # We'll update entry_price and current_idx dynamically for each position
+        # The environment uses the full price/balance series, so we can point to any position
+        dummy_entry_price = price.iloc[0]
+        env = RiskManagementEnv(
+            price_data=price,  # Full price series
+            balance_data=balance,  # Full balance series
+            entry_price=dummy_entry_price,  # Will be updated per position
+            entry_idx=0,  # Will be updated per position
+            exit_idx=len(price) - 1,  # End of series
+            initial_balance=self.initial_balance,
+            history_length=self.history_length,
+            max_steps=self.max_steps,
+            fee_rate=self.fee_rate
+        )
+        # Store reference to full data for dynamic updates
+        env.full_price_data = price
+        env.full_balance_data = balance
+        obs, _ = env.reset()
+        
+        # Track open positions (entry_idx, entry_price, current_step_in_position)
+        open_positions = []  # List of dicts: {'entry_idx': i, 'entry_price': p, 'position_step': s}
+        
+        # Track RL decisions
         rl_exit_count = 0
         rl_hold_count = 0
         
-        # Process each time step with progress bar
+        # Process each time step sequentially from 0 to end
         pbar = tqdm(range(len(price)), desc="Processing periods", unit="period")
         for i in pbar:
             # Check for new entries
             if entries.iloc[i]:
-                # New position opened
+                # New position opened - track it
                 entry_price = price.iloc[i]
-                current_balance = balance.iloc[i]
-                
-                # Create environment for this position with large enough window
-                try:
-                    # Create environment with window extending well into the future
-                    exit_idx_guess = min(i + self.max_steps * 2, len(price) - 1)
-                    env = self._create_env_for_position(
-                        price,
-                        balance,
-                        i,
-                        entry_price,
-                        i,
-                        exit_idx_guess=exit_idx_guess
-                    )
-                    obs, _ = env.reset()
-                    
-                    # Track position
-                    self.positions.append({
-                        'entry_idx': i,
-                        'entry_price': entry_price,
-                        'current_idx': i,
-                        'env': env,
-                        'peak_balance': current_balance,
-                        'closed': False,
-                        'env_steps': 0  # Track how many steps env has taken
-                    })
-                    logger.debug(f"  New position opened at step {i}, price ${entry_price:.2f}")
-                except Exception as e:
-                    logger.warning(f"  Error creating environment for new position at step {i}: {e}")
-                    continue
+                open_positions.append({
+                    'entry_idx': i,
+                    'entry_price': entry_price,
+                    'position_step': 0  # Steps since this position opened
+                })
+                logger.debug(f"  New position opened at step {i}, price ${entry_price:.2f}")
             
-            # Process open positions
+            # Process all open positions using the single environment
             positions_to_remove = []
-            for pos_idx, position in enumerate(self.positions):
-                if position['closed']:
+            for pos in open_positions:
+                entry_idx = pos['entry_idx']
+                entry_price = pos['entry_price']
+                position_step = pos['position_step']
+                current_idx_in_price = entry_idx + position_step
+                
+                # Check if we've reached the end of price series
+                if current_idx_in_price >= len(price):
+                    # Position should be closed (reached end of data)
+                    exits_with_rl.iloc[i] = True
+                    positions_to_remove.append(pos)
                     continue
                 
-                entry_idx = position['entry_idx']
-                entry_price = position['entry_price']
-                env = position['env']
-                current_idx = i
+                # Update environment to reflect current position
+                # Recalculate price_window and balance_window for this position
+                data_start = max(0, entry_idx - self.history_length)
+                data_end = min(current_idx_in_price + 1, len(price))
                 
-                # Update position tracking
-                position['current_idx'] = current_idx
-                current_balance = balance.iloc[i]
-                if current_balance > position['peak_balance']:
-                    position['peak_balance'] = current_balance
+                env.entry_price = entry_price
+                env.entry_idx = entry_idx - data_start  # Relative to window start
+                env.current_idx = current_idx_in_price - data_start  # Relative to window start
+                env.current_step = position_step
+                env.episode_start_idx = entry_idx
+                env.data_start_idx = data_start
                 
-                # Get observation from environment
+                # Update price and balance windows for this position
+                env.price_window = price.iloc[data_start:data_end].copy()
+                env.balance_window = balance.iloc[data_start:data_end].copy()
+                
+                # Update position tracking variables
+                current_balance = balance.iloc[current_idx_in_price]
+                if current_balance > env.peak_balance:
+                    env.peak_balance = current_balance
+                
+                # Calculate current drawdown
+                if env.peak_balance > 0:
+                    env.max_drawdown = max(env.max_drawdown, 
+                                         (env.peak_balance - current_balance) / env.peak_balance)
+                
+                # Get observation for current position
                 try:
-                    # Calculate steps since entry (relative to episode start in env)
-                    steps_since_entry = current_idx - entry_idx
-                    
-                    # Step environment forward once (incremental - only one step per period)
-                    # At entry (steps_since_entry=0), we already have observation from reset
-                    # At subsequent periods, we step forward to get the next observation
-                    if steps_since_entry > 0 and position['env_steps'] < steps_since_entry:
-                        # Step forward once (not replay all history)
-                        obs, _, terminated, truncated, _ = env.step(0)  # Hold action to advance
-                        position['env_steps'] += 1
-                        
-                        if terminated or truncated:
-                            # Position should be closed
-                            exits_with_rl.iloc[i] = True
-                            position['closed'] = True
-                            rl_exit_count += 1
-                            continue
-                    else:
-                        # Get current observation (either at entry or already at correct step)
-                        obs = env._get_observation()
+                    obs = env._get_observation()
                     
                     # Query RL agent for action
                     action, _ = self.model.predict(obs, deterministic=self.deterministic)
                     
                     # Execute action
                     if action in [1, 2]:  # Close actions
-                        exits_with_rl.iloc[i] = True
-                        position['closed'] = True
+                        exits_with_rl.iloc[current_idx_in_price] = True
+                        positions_to_remove.append(pos)
                         rl_exit_count += 1
-                        logger.debug(f"  RL agent closed position at step {i} (action={action})")
+                        logger.debug(f"  RL agent closed position at step {current_idx_in_price} (action={action})")
                     else:  # Hold (action=0)
                         rl_hold_count += 1
+                        # Increment position step for next iteration
+                        pos['position_step'] += 1
                     
                 except Exception as e:
-                    logger.warning(f"  Error processing position at step {i}: {e}")
-                    # Fall back to original exit signal
+                    logger.warning(f"  Error processing position at step {current_idx_in_price}: {e}")
                     continue
             
-            # Clean up closed positions
-            self.positions = [p for p in self.positions if not p['closed']]
+            # Remove closed positions
+            for pos in positions_to_remove:
+                if pos in open_positions:
+                    open_positions.remove(pos)
             
             # Update progress bar with current stats
-            open_positions = len([p for p in self.positions if not p['closed']])
+            num_open_positions = len(open_positions)
             pbar.set_postfix({
-                'open_pos': open_positions,
+                'open_pos': num_open_positions,
                 'exits': rl_exit_count,
                 'holds': rl_hold_count
             })

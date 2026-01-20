@@ -23,7 +23,7 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
     BaseCallback
 )
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.evaluation import evaluate_policy
 import torch
@@ -50,22 +50,30 @@ MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 TENSORBOARD_LOG_DIR = MODEL_SAVE_DIR / "tensorboard_logs"
 TENSORBOARD_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# Ticker list (should match backtest.py)
+TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
+INITIAL_BALANCE = 1000.0  # Default initial balance
+
 # Training hyperparameters
 TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
-LEARNING_RATE = 1e-4  # Learning rate (further reduced for stability with scaled rewards)
-BATCH_SIZE = 128  # Batch size for stable training
+LEARNING_RATE = 2e-4  # Learning rate (slightly increased - value function needs more learning)
+BATCH_SIZE = 256  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
-N_EPOCHS = 5  # Optimization epochs per update (reduced to prevent overfitting)
+N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # GAE lambda
-ENT_COEF = 0.1  # Entropy coefficient (exploration) - increased to prevent premature convergence
-VF_COEF = 1.0  # Value function coefficient (increased to stabilize value learning)
+ENT_COEF = 0.01  # Entropy coefficient (exploration) - increased to prevent premature convergence
+VF_COEF = 0.25  # Value function coefficient (further reduced to prevent value loss from dominating)
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
+CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conservative)
+
+# Reward normalization settings
+USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stable training
 
 # Model architecture configuration
-POLICY_LAYERS = [512, 256, 256, 32]  # Policy network hidden layers
-VALUE_LAYERS = [512, 256, 256, 32]   # Value network hidden layers
-ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
+POLICY_LAYERS = [256, 256]  # Policy network hidden layers
+VALUE_LAYERS = [256, 256]   # Value network hidden layers
+ACTIVATION_FN = 'relu'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
@@ -344,6 +352,76 @@ class EarlyStoppingCallback(BaseCallback):
         return True  # Continue training
 
 
+def load_all_tickers_data(tickers_list: List[str], results_dir: Path = Path("results"), strategy: str = "Combined") -> Dict[str, Dict[str, pd.Series]]:
+    """
+    Load price and balance data for all tickers.
+    
+    Args:
+        tickers_list: List of ticker symbols
+        results_dir: Results directory containing balance data
+        strategy: Strategy name for balance data
+    
+    Returns:
+        Dict of {ticker: {'price': Series, 'balance': Series}}
+    """
+    logger.info(f"Loading data for {len(tickers_list)} tickers...")
+    
+    all_tickers_data = {}
+    data_dir = Path("data")
+    dataset_file = data_dir / "dataset.csv"
+    
+    # Load price data from dataset
+    if dataset_file.exists():
+        try:
+            df = pd.read_csv(dataset_file)
+            if 'tic' in df.columns and 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'])
+                df = df.set_index('time').sort_index()
+                
+                for ticker in tickers_list:
+                    ticker_df = df[df['tic'] == ticker].copy()
+                    if len(ticker_df) > 0:
+                        price_series = ticker_df['close']
+                        
+                        # Load balance data
+                        balance_file = results_dir / strategy / f"{ticker}_account_balance.csv"
+                        balance_series = None
+                        if balance_file.exists():
+                            try:
+                                balance_df = pd.read_csv(balance_file)
+                                balance_df['Date'] = pd.to_datetime(balance_df['Date'])
+                                balance_df = balance_df.set_index('Date').sort_index()
+                                balance_series = balance_df['Balance']
+                                
+                                # Align balance with price timestamps
+                                balance_series = balance_series.reindex(price_series.index, method='ffill')
+                                balance_series = balance_series.fillna(INITIAL_BALANCE)
+                            except Exception as e:
+                                logger.warning(f"Could not load balance for {ticker}: {e}")
+                                balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
+                        else:
+                            # Create default balance series
+                            balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
+                        
+                        all_tickers_data[ticker] = {
+                            'price': price_series,
+                            'balance': balance_series
+                        }
+                        logger.info(f"  Loaded {ticker}: {len(price_series)} price points, {len(balance_series)} balance points")
+                    else:
+                        logger.warning(f"  No data found for {ticker}")
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    if len(all_tickers_data) == 0:
+        logger.error("No ticker data loaded!")
+    
+    logger.info(f"Successfully loaded data for {len(all_tickers_data)} tickers")
+    return all_tickers_data
+
+
 def load_episodes(data_dir: Path) -> List[Dict]:
     """
     Load training episodes from disk.
@@ -427,30 +505,34 @@ def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
     return _init
 
 
-def create_env_factory(train_episodes: List[Dict], seed: int = 42) -> callable:
+def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: int = 42) -> callable:
     """
-    Create environment factory that samples random episodes.
+    Create environment factory that uses all tickers' data.
+    On reset, randomly selects ticker and entry point.
     
     Args:
-        train_episodes: List of training episodes
+        all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}}
         seed: Random seed
     
     Returns:
         Function that returns an environment
     """
     np.random.seed(seed)
-    episode_counter = [0]  # Use list to allow modification in closure
     
     def _make_env(rank: int = 0):
-        # Cycle through episodes with some randomness
-        if np.random.random() < 0.5:
-            # Random sampling
-            episode = train_episodes[np.random.randint(len(train_episodes))]
-        else:
-            # Sequential cycling
-            episode = train_episodes[episode_counter[0] % len(train_episodes)]
-            episode_counter[0] += 1
-        return make_env(episode, rank=rank, seed=seed + rank)()
+        # Create environment with all tickers' data
+        # Entry point will be randomly selected on reset
+        env = RiskManagementEnv(
+            all_tickers_data=all_tickers_data,
+            initial_balance=INITIAL_BALANCE,
+            history_length=30,
+            max_steps=1000,
+            fee_rate=0.001
+        )
+        # Wrap with Monitor for statistics
+        env = Monitor(env, filename=None, allow_early_resets=True)
+        env.reset(seed=seed + rank)
+        return env
     
     return _make_env
 
@@ -488,7 +570,7 @@ def create_eval_env_factory(val_episodes: List[Dict], seed: int = 42) -> callabl
 
 
 def train_ppo_agent(
-    train_episodes: List[Dict],
+    all_tickers_data: Dict[str, Dict[str, pd.Series]],
     val_episodes: List[Dict],
     model_save_dir: Path,
     tensorboard_log_dir: Path,
@@ -496,11 +578,11 @@ def train_ppo_agent(
     n_envs: int = 32
 ):
     """
-    Train PPO agent on episodes.
+    Train PPO agent on all tickers' data.
     
     Args:
-        train_episodes: Training episodes
-        val_episodes: Validation episodes
+        all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for all tickers
+        val_episodes: Validation episodes (for evaluation)
         model_save_dir: Directory to save models
         tensorboard_log_dir: Directory for TensorBoard logs
         total_timesteps: Total training steps
@@ -512,12 +594,25 @@ def train_ppo_agent(
     
     # Create vectorized environments
     logger.info(f"Creating {n_envs} parallel environments...")
-    train_env_factory = create_env_factory(train_episodes, seed=42)
+    train_env_factory = create_env_factory(all_tickers_data, seed=42)
     train_env = make_vec_env(
         train_env_factory,
         n_envs=n_envs,
         vec_env_cls=DummyVecEnv  # Use DummyVecEnv for simplicity
     )
+    
+    # Apply reward and observation normalization for stable training
+    if USE_VEC_NORMALIZE:
+        logger.info("Applying VecNormalize for reward and observation normalization...")
+        train_env = VecNormalize(
+            train_env,
+            norm_obs=False,  # Don't normalize observations (they're already normalized in env)
+            norm_reward=True,  # Normalize rewards (critical for stable value function learning)
+            clip_obs=10.0,  # Clip observations to prevent extreme values
+            clip_reward=5.0,  # Reduced clip range for rewards (rewards are already scaled down)
+            gamma=GAMMA  # Use same gamma for reward normalization
+        )
+        logger.info("VecNormalize enabled: rewards will be normalized (observations already normalized in env)")
     
     # Create evaluation environment
     # Use multiple environments to evaluate different episodes in parallel
@@ -574,6 +669,7 @@ def train_ppo_agent(
         ent_coef=ENT_COEF,
         vf_coef=VF_COEF,
         max_grad_norm=MAX_GRAD_NORM,
+        clip_range=CLIP_RANGE,  # Explicit clip range for conservative policy updates
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(tensorboard_log_dir),
         verbose=1,
@@ -593,6 +689,7 @@ def train_ppo_agent(
     logger.info(f"  Batch size: {BATCH_SIZE}")
     logger.info(f"  Steps per update: {N_STEPS}")
     logger.info(f"  Epochs per update: {N_EPOCHS}")
+    logger.info(f"  Reward normalization: {USE_VEC_NORMALIZE}")
     
     # Create callbacks
     callbacks = []
@@ -687,48 +784,41 @@ def main():
     logger.info("RL Risk Management Agent Training")
     logger.info("="*60)
     
-    # Load episodes
-    episodes = load_episodes(TRAINING_DATA_DIR)
+    # Load all tickers' data
+    logger.info("Loading all tickers' data...")
+    all_tickers_data = load_all_tickers_data(TICKER_LIST)
     
-    if len(episodes) == 0:
-        logger.error("No episodes found! Please run prepare_rl_training_data.py first.")
-        return
-    
-    # Split into train/val
-    train_episodes, val_episodes = split_episodes(episodes, TRAIN_SPLIT)
-    
-    if len(train_episodes) == 0 or len(val_episodes) == 0:
-        logger.error("Not enough episodes for training/validation split!")
+    if len(all_tickers_data) == 0:
+        logger.error("No ticker data loaded! Please ensure dataset.csv exists and contains ticker data.")
         return
     
     # Print statistics
-    logger.info(f"\nTraining Statistics:")
-    logger.info(f"  Total episodes: {len(episodes)}")
-    logger.info(f"  Training episodes: {len(train_episodes)}")
-    logger.info(f"  Validation episodes: {len(val_episodes)}")
+    logger.info(f"\nTicker Data Statistics:")
+    for ticker, data in all_tickers_data.items():
+        price_len = len(data['price'])
+        balance_len = len(data['balance'])
+        logger.info(f"  {ticker}: {price_len} price points, {balance_len} balance points")
     
-    train_returns = [ep['trade_return'] for ep in train_episodes]
-    train_lengths = [ep['episode_length'] for ep in train_episodes]
-    logger.info(f"  Training avg return: {np.mean(train_returns):.4f} ({np.mean(train_returns)*100:.2f}%)")
-    logger.info(f"  Training win rate: {np.mean([r > 0 for r in train_returns])*100:.1f}%")
-    logger.info(f"  Training avg episode length: {np.mean(train_lengths):.1f} periods")
-    logger.info(f"  Training episode length range: {np.min(train_lengths)} - {np.max(train_lengths)} periods")
+    total_timesteps_available = sum(len(data['price']) for data in all_tickers_data.values())
+    logger.info(f"  Total timesteps across all tickers: {total_timesteps_available}")
     
-    val_returns = [ep['trade_return'] for ep in val_episodes]
-    val_lengths = [ep['episode_length'] for ep in val_episodes]
-    logger.info(f"  Validation avg return: {np.mean(val_returns):.4f} ({np.mean(val_returns)*100:.2f}%)")
-    logger.info(f"  Validation win rate: {np.mean([r > 0 for r in val_returns])*100:.1f}%")
-    logger.info(f"  Validation avg episode length: {np.mean(val_lengths):.1f} periods")
-    logger.info(f"  Validation episode length range: {np.min(val_lengths)} - {np.max(val_lengths)} periods")
+    # Load validation episodes (for evaluation only)
+    episodes = load_episodes(TRAINING_DATA_DIR)
+    val_episodes = []
+    if len(episodes) > 0:
+        _, val_episodes = split_episodes(episodes, TRAIN_SPLIT)
+        logger.info(f"\nValidation Episodes: {len(val_episodes)} (for evaluation)")
+    else:
+        logger.warning("No validation episodes found. Evaluation will use random ticker selection.")
     
     # Train model
     model = train_ppo_agent(
-        train_episodes,
+        all_tickers_data,
         val_episodes,
         MODEL_SAVE_DIR,
         TENSORBOARD_LOG_DIR,
         total_timesteps=TOTAL_TIMESTEPS,
-        n_envs=4  # Number of parallel environments
+        n_envs=16  # Number of parallel environments
     )
     
     logger.info("\nTraining pipeline complete!")
