@@ -279,9 +279,18 @@ class RiskManagementEnv(gym.Env):
         
         # ========== 1. RETURN MAXIMIZATION ==========
         # Direct reward proportional to return (maximize total return)
-        # Reduced weight to keep rewards in reasonable range for stable training
-        return_weight = 2.0  # Reduced from 15.0 to prevent high value loss
-        reward = position_return * return_weight
+        # Increased weight to incentivize higher total returns
+        # Progressive scaling: larger profits get exponentially more reward
+        if position_return > 0:
+            # Profitable: exponential scaling to encourage larger profits
+            # Base reward + progressive bonus
+            return_weight = 10.0  # Base multiplier for all returns
+            progressive_bonus = (position_return ** 1.5) * 50.0  # Extra reward for larger profits
+            reward = position_return * return_weight + progressive_bonus
+        else:
+            # Loss: linear penalty (less aggressive than profit reward)
+            return_weight = 5.0
+            reward = position_return * return_weight
         
         # ========== 2. SHARPE RATIO (Risk-Adjusted Return) ==========
         # Sharpe ratio = (Return - Risk-free) / StdDev
@@ -305,20 +314,29 @@ class RiskManagementEnv(gym.Env):
                     reward -= volatility_penalty
                 # Reward consistent positive returns (high Sharpe)
                 if position_return > 0 and returns_std < 0.01:
-                    consistency_bonus = 0.3  # Reduced from 2.0
+                    # Scale consistency bonus with profit size
+                    consistency_bonus = 0.5 + position_return * 3.0
                     reward += consistency_bonus
         
         # ========== 3. WIN RATE MAXIMIZATION ==========
         # Higher reward for profitable exits (encourages more wins)
         if is_closing:
             if position_return > 0:
-                # Win: Higher reward for profitable exits
-                win_bonus = 0.5 + position_return * 1.0  # Reduced from 5.0 + 10.0
+                # Win: Much higher reward for profitable exits with progressive scaling
+                # Base win bonus + return-scaled bonus
+                base_win_bonus = 2.0  # Base bonus for any profitable trade
+                # Progressive scaling: small profits get 5x, large profits get even more
+                scaled_bonus = position_return * 15.0
+                # Extra bonus for exceptional profits (>5% returns)
+                if position_return > 0.05:
+                    exceptional_bonus = (position_return - 0.05) * 50.0
+                    scaled_bonus += exceptional_bonus
+                win_bonus = base_win_bonus + scaled_bonus
                 reward += win_bonus
                 self.wins += 1
             else:
                 # Loss: Smaller penalty (we want to minimize losses but not over-penalize)
-                loss_penalty = abs(position_return) * 0.5  # Reduced from 5.0
+                loss_penalty = abs(position_return) * 2.0  # Moderate penalty
                 reward -= loss_penalty
             self.total_trades += 1
             # Store return for tracking (used in future episodes if multi-trade)
@@ -332,9 +350,13 @@ class RiskManagementEnv(gym.Env):
             periods_per_year = 252.0
             if position_return > -1.0:  # Avoid log of negative
                 annualized_return = (1 + position_return) ** (periods_per_year / periods_held) - 1
-                # Reward higher annualized returns
-                annualized_bonus = annualized_return * 0.3  # Reduced from 2.0
-                reward += annualized_bonus
+                # Reward higher annualized returns - scale with profit
+                if annualized_return > 0:
+                    # Progressive scaling: higher annualized returns get more reward
+                    annualized_bonus = annualized_return * 2.0
+                    if annualized_return > 1.0:  # >100% annualized return
+                        annualized_bonus += (annualized_return - 1.0) * 5.0
+                    reward += annualized_bonus
             # Penalty for holding too long with small returns (inefficient time usage)
             if periods_held > 20 and abs(position_return) < 0.01:
                 inefficiency_penalty = (periods_held - 20) * 0.01  # Reduced from 0.1
@@ -356,23 +378,29 @@ class RiskManagementEnv(gym.Env):
             # Holding action: encourage holding profitable positions, penalize holding losses
             if periods_held < 3:
                 # Prevent immediate closure
-                reward += 0.03  # Reduced from 0.3
+                reward += 0.03
             elif position_return > 0.01:  # Profitable position
-                # Reward holding profitable positions (but not too long)
+                # Reward holding profitable positions (scaled by profit size)
                 if periods_held < 30:
-                    reward += 0.01  # Reduced from 0.1
+                    # More reward for larger unrealized profits
+                    holding_bonus = position_return * 3.0  # Reward proportional to profit
+                    reward += holding_bonus
             elif position_return < -0.05:  # Large loss
                 # Penalty for holding large losses too long
                 if periods_held > 10:
-                    reward -= abs(position_return) * 0.3  # Reduced from 3.0
+                    reward -= abs(position_return) * 0.3
         
         # ========== ACTION-SPECIFIC GUIDANCE ==========
         if action == 1:  # Close (take profit)
             if periods_held >= 3 and position_return > 0:
-                # Reward taking profits
-                reward += position_return * 0.3  # Reduced from 3.0
+                # Reward taking profits - scaled by profit size
+                # Base reward + progressive bonus for larger profits
+                profit_action_bonus = position_return * 8.0
+                if position_return > 0.03:  # Good profit (>3%)
+                    profit_action_bonus += (position_return - 0.03) * 20.0
+                reward += profit_action_bonus
             elif periods_held < 3:
-                reward -= 0.1  # Reduced from 1.0
+                reward -= 0.1
         elif action == 2:  # Close (stop loss)
             if periods_held >= 5 and position_return < -0.03:
                 # Reward cutting losses at reasonable time
@@ -382,23 +410,29 @@ class RiskManagementEnv(gym.Env):
         
         # ========== TERMINAL REWARD (Final Outcome) ==========
         if done:
-            # Strong final reward based on outcome
-            if position_return > 0.02:  # Good profit
-                final_bonus = position_return * 2.0  # Reduced from 20.0
+            # Strong final reward based on outcome - much higher for profits
+            if position_return > 0.05:  # Excellent profit (>5%)
+                # Exponential scaling for large profits
+                final_bonus = position_return * 30.0 + (position_return - 0.05) * 100.0
+                reward += final_bonus
+            elif position_return > 0.02:  # Good profit (>2%)
+                final_bonus = position_return * 20.0
                 reward += final_bonus
             elif position_return > 0:
-                final_bonus = position_return * 1.0  # Reduced from 10.0
+                # Small profit - still reward it well
+                final_bonus = position_return * 10.0
                 reward += final_bonus
             elif position_return < -0.1:  # Large loss
-                final_penalty = position_return * 2.0  # Reduced from 20.0
+                final_penalty = position_return * 5.0  # Moderate penalty
                 reward += final_penalty
             else:
-                final_penalty = position_return * 1.0  # Reduced from 10.0
+                final_penalty = position_return * 3.0  # Moderate penalty
                 reward += final_penalty
         
         # Clip reward to prevent extreme values that cause training instability
-        # Reduced clipping range to match scaled rewards
-        reward = np.clip(reward, -5.0, 5.0)  # Reduced from -50.0, 50.0
+        # Increased upper bound to allow larger rewards for profits
+        # Profits can now get much larger rewards, but losses are still capped
+        reward = np.clip(reward, -10.0, 50.0)  # Allow high rewards for large profits
         
         return float(reward)
     
