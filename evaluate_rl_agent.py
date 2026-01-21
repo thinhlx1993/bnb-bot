@@ -48,21 +48,33 @@ RL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_LOAD_DIR = Path("models/rl_agent")
 DEFAULT_MODEL_NAME = "best_model"
 
+# Evaluation date range configuration
+# Set to None to use all available data, or specify date range for evaluation
+EVAL_START_DATE = "2025-01-01"  # YYYY-MM-DD format, or None for all data
+EVAL_END_DATE = "2026-01-21"    # YYYY-MM-DD format, or None for all data
+
 # Test configuration
 USE_RL_RISK_MANAGEMENT = True  # Enable RL risk management
 USE_RULE_BASED_BASELINE = True  # Also test rule-based for comparison
 
 
-def load_test_data(ticker: str, strategy: str = "Combined") -> Tuple[pd.DataFrame, pd.Series]:
+def load_test_data(
+    ticker: str, 
+    strategy: str = "Combined",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Load test data for a ticker.
+    Load test data for a ticker, optionally filtered by date range.
     
     Args:
         ticker: Ticker symbol
         strategy: Strategy name (e.g., "Combined", "MACD_Trend_Reversal")
+        start_date: Start date for filtering (YYYY-MM-DD format, or None for all data)
+        end_date: End date for filtering (YYYY-MM-DD format, or None for all data)
     
     Returns:
-        ticker_df, price_series
+        ticker_df, price_series (filtered by date range if specified)
     """
     # Load from main dataset if available
     data_dir = Path("data")
@@ -76,6 +88,21 @@ def load_test_data(ticker: str, strategy: str = "Combined") -> Tuple[pd.DataFram
                 if len(ticker_df) > 0:
                     ticker_df['time'] = pd.to_datetime(ticker_df['time'])
                     ticker_df = ticker_df.set_index('time').sort_index()
+                    
+                    # Apply date filtering if specified
+                    if start_date is not None:
+                        start_dt = pd.to_datetime(start_date)
+                        ticker_df = ticker_df[ticker_df.index >= start_dt]
+                        logger.info(f"Filtered data from {start_date}: {len(ticker_df)} rows remaining")
+                    
+                    if end_date is not None:
+                        end_dt = pd.to_datetime(end_date)
+                        ticker_df = ticker_df[ticker_df.index <= end_dt]
+                        logger.info(f"Filtered data to {end_date}: {len(ticker_df)} rows remaining")
+                    
+                    if len(ticker_df) == 0:
+                        raise ValueError(f"No data available for {ticker} in date range {start_date} to {end_date}")
+                    
                     price = ticker_df['close']
                     return ticker_df, price
         except Exception as e:
@@ -87,9 +114,23 @@ def load_test_data(ticker: str, strategy: str = "Combined") -> Tuple[pd.DataFram
         try:
             balance_df = pd.read_csv(balance_file)
             balance_df['Date'] = pd.to_datetime(balance_df['Date'])
+            balance_df = balance_df.set_index('Date').sort_index()
+            
+            # Apply date filtering if specified
+            if start_date is not None:
+                start_dt = pd.to_datetime(start_date)
+                balance_df = balance_df[balance_df.index >= start_dt]
+            
+            if end_date is not None:
+                end_dt = pd.to_datetime(end_date)
+                balance_df = balance_df[balance_df.index <= end_dt]
+            
+            if len(balance_df) == 0:
+                raise ValueError(f"No balance data available for {ticker} in date range {start_date} to {end_date}")
+            
             # Create dummy price series from balance (not ideal, but works for evaluation)
             logger.warning(f"Using balance data to infer price timestamps for {ticker}")
-            price_index = balance_df['Date']
+            price_index = balance_df.index
             price_values = np.ones(len(price_index)) * 100.0  # Placeholder
             price = pd.Series(price_values, index=price_index)
             
@@ -347,11 +388,29 @@ def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_di
     return comparison_df
 
 
-def main():
-    """Main evaluation function."""
+def main(
+    eval_start_date: Optional[str] = None,
+    eval_end_date: Optional[str] = None
+):
+    """
+    Main evaluation function.
+    
+    Args:
+        eval_start_date: Start date for evaluation (YYYY-MM-DD format, or None to use EVAL_START_DATE)
+        eval_end_date: End date for evaluation (YYYY-MM-DD format, or None to use EVAL_END_DATE)
+    """
     logger.info("="*60)
     logger.info("RL Risk Management Agent Evaluation")
     logger.info("="*60)
+    
+    # Use provided dates or fall back to configuration
+    start_date = eval_start_date if eval_start_date is not None else EVAL_START_DATE
+    end_date = eval_end_date if eval_end_date is not None else EVAL_END_DATE
+    
+    if start_date or end_date:
+        logger.info(f"Evaluation date range: {start_date or 'beginning'} to {end_date or 'end'}")
+    else:
+        logger.info("Using all available data (no date filtering)")
     
     # Test on all tickers
     all_results = {}
@@ -362,8 +421,13 @@ def main():
         logger.info(f"{'='*60}")
         
         try:
-            # Load test data
-            ticker_df, price = load_test_data(ticker, strategy="Combined")
+            # Load test data with date filtering
+            ticker_df, price = load_test_data(
+                ticker, 
+                strategy="Combined",
+                start_date=start_date,
+                end_date=end_date
+            )
             
             # Get strategy signals
             entries, exits = get_strategy_signals(ticker_df, price, strategy="Combined")
@@ -440,4 +504,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Evaluate RL Risk Management Agent')
+    parser.add_argument('--eval-start-date', type=str, default=None,
+                       help='Start date for evaluation (YYYY-MM-DD format). Default: use EVAL_START_DATE from config')
+    parser.add_argument('--eval-end-date', type=str, default=None,
+                       help='End date for evaluation (YYYY-MM-DD format). Default: use EVAL_END_DATE from config')
+    
+    args = parser.parse_args()
+    
+    main(
+        eval_start_date=args.eval_start_date,
+        eval_end_date=args.eval_end_date
+    )

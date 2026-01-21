@@ -12,6 +12,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Reward function configuration
+# Options: 'total_return_only' or 'multi_objective'
+REWARD_FUNCTION = 'total_return_only'  # Switch between reward functions
+
 
 class RiskManagementEnv(gym.Env):
     """
@@ -251,7 +255,49 @@ class RiskManagementEnv(gym.Env):
         
         return observation
     
-    def _calculate_reward(self, action: int, done: bool) -> float:
+    def _calculate_reward_total_return_only(self, action: int, done: bool) -> float:
+        """
+        Calculate reward to maximize total return only.
+        
+        Reward is directly proportional to position return (accounting for fees).
+        - Positive returns get positive rewards
+        - Negative returns get negative rewards (penalties)
+        - Reward is proportional to the return magnitude
+        """
+        current_price = float(self.price_window.iloc[self.current_idx])
+        price_change_pct = (current_price - self.entry_price) / self.entry_price
+        periods_held = self.current_idx + 1
+        
+        # Net return accounting for fees (if closing)
+        if action in [1, 2] or done:
+            position_return = price_change_pct - 2 * self.fee_rate
+            is_closing = True
+        else:
+            # Unrealized P&L while holding
+            position_return = price_change_pct - self.fee_rate  # Only entry fee so far
+            is_closing = False
+        
+        # Track statistics for portfolio-level metrics
+        if is_closing:
+            if position_return > 0:
+                self.wins += 1
+            self.total_trades += 1
+            self.returns_history.append(position_return)
+        
+        # ========== RETURN MAXIMIZATION ONLY ==========
+        # Direct reward proportional to return (maximize total return)
+        # Simple linear scaling: reward = return * scale_factor
+        # Use a reasonable scale factor to provide meaningful signal
+        scale_factor = 10.0  # Multiply return by this factor
+        reward = position_return * scale_factor
+        
+        # Clip reward to prevent extreme values that cause training instability
+        # Set reasonable bounds based on typical return range
+        reward = np.clip(reward, -10.0, 10.0)
+        
+        return float(reward)
+    
+    def _calculate_reward_multi_objective(self, action: int, done: bool) -> float:
         """
         Calculate reward optimized for portfolio-level metrics:
         - Maximize: return, sharpe_ratio, win_rate, annualized_return
@@ -435,6 +481,21 @@ class RiskManagementEnv(gym.Env):
         reward = np.clip(reward, -10.0, 50.0)  # Allow high rewards for large profits
         
         return float(reward)
+    
+    def _calculate_reward(self, action: int, done: bool) -> float:
+        """
+        Calculate reward based on configured reward function.
+        
+        This is the main entry point that routes to the appropriate reward function
+        based on the REWARD_FUNCTION configuration.
+        """
+        if REWARD_FUNCTION == 'total_return_only':
+            return self._calculate_reward_total_return_only(action, done)
+        elif REWARD_FUNCTION == 'multi_objective':
+            return self._calculate_reward_multi_objective(action, done)
+        else:
+            logger.warning(f"Unknown reward function: {REWARD_FUNCTION}, using total_return_only")
+            return self._calculate_reward_total_return_only(action, done)
     
     def reset(
         self, 

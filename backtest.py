@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 START_DATE = "2023-01-01" # YYYY-MM-DD
-END_DATE = "2026-01-15" # YYYY-MM-DD
+END_DATE = "2025-01-01" # YYYY-MM-DD
 TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
 TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # You can add more cryptocurrencies
 
@@ -56,6 +56,7 @@ MA99_PERIOD = 50              # EMA period (default: 50, originally 99)
 ENABLE_MACD_TREND_REVERSAL = True   # Strategy 1: MACD Trend Reversals (Divergence)
 ENABLE_RSI_TREND_REVERSAL = True    # Strategy 2: RSI Trend Reversals (Divergence)
 ENABLE_BULLISH_CONFIRMATION = False  # Strategy 3: Bullish Trend Confirmation (EMA Crossover)
+ENABLE_EMA_25_99_CROSSOVER = True   # Strategy 4: EMA 25/99 Crossover (Entry when EMA 25 crosses above EMA 99)
 
 # RSI Parameters
 RSI_PERIOD = 14                     # RSI calculation period
@@ -65,6 +66,10 @@ RSI_OVERBOUGHT = 70                 # RSI overbought level
 # Bullish Trend Confirmation Parameters
 BULLISH_EMA_FAST = 9                # Fast EMA for bullish confirmation
 BULLISH_EMA_SLOW = 21               # Slow EMA for bullish confirmation
+
+# EMA 25/99 Crossover Parameters
+EMA_25_99_FAST = 99                 # Fast EMA period (25)
+EMA_25_99_SLOW = 200                 # Slow EMA period (99)
 
 # Portfolio Parameters
 INITIAL_BALANCE = 100.0  # Starting balance in USD ($)
@@ -348,6 +353,44 @@ def identify_bullish_trend_confirmation(price, ema_fast_period=BULLISH_EMA_FAST,
     }
 
 
+def identify_ema_25_99_crossover(price, ema_fast_period=EMA_25_99_FAST, ema_slow_period=EMA_25_99_SLOW):
+    """
+    Identify EMA 25/99 crossover signals:
+    - Entry signal when EMA 25 crosses above EMA 99 (bullish golden cross)
+    - Exit signal when EMA 25 crosses below EMA 99 (bearish death cross)
+    
+    Args:
+        price: Price series
+        ema_fast_period: Fast EMA period (default: 25)
+        ema_slow_period: Slow EMA period (default: 99)
+    
+    Returns:
+        Dictionary with entry and exit signals, plus EMA series
+    """
+    ema_fast = calculate_ema(price, ema_fast_period)
+    ema_slow = calculate_ema(price, ema_slow_period)
+    
+    # Initialize signals
+    entry_signal = pd.Series(False, index=price.index)
+    exit_signal = pd.Series(False, index=price.index)
+    
+    # Detect crossovers
+    for i in range(1, len(price)):
+        # Golden cross: EMA 25 crosses above EMA 99 (entry signal)
+        if ema_fast.iloc[i-1] <= ema_slow.iloc[i-1] and ema_fast.iloc[i] > ema_slow.iloc[i]:
+            entry_signal.iloc[i] = True
+        # Death cross: EMA 25 crosses below EMA 99 (exit signal)
+        elif ema_fast.iloc[i-1] >= ema_slow.iloc[i-1] and ema_fast.iloc[i] < ema_slow.iloc[i]:
+            exit_signal.iloc[i] = True
+    
+    return {
+        'entry': entry_signal,
+        'exit': exit_signal,
+        'ema_fast': ema_fast,
+        'ema_slow': ema_slow
+    }
+
+
 def apply_risk_management(entries, exits, price):
     """Apply stop-loss, take-profit, and maximum holding period to exits.
     
@@ -465,6 +508,17 @@ def create_vectorbt_signals(df, all_strategies, price):
         strategy_counts['Bullish Trend Confirmation'] = {
             'entries': bullish_entries.sum(),
             'exits': bullish_exits.sum()
+        }
+    
+    if ENABLE_EMA_25_99_CROSSOVER and 'ema_25_99_crossover' in all_strategies:
+        ema_25_99_signals = all_strategies['ema_25_99_crossover']
+        ema_25_99_entries = ema_25_99_signals.get('entry', pd.Series(False, index=price.index)).fillna(False)
+        ema_25_99_exits = ema_25_99_signals.get('exit', pd.Series(False, index=price.index)).fillna(False)
+        entries = entries | ema_25_99_entries
+        exits = exits | ema_25_99_exits
+        strategy_counts['EMA 25/99 Crossover'] = {
+            'entries': ema_25_99_entries.sum(),
+            'exits': ema_25_99_exits.sum()
         }
     
     # Apply EMA trend filter to entries (only buy when price > EMA)
@@ -1066,8 +1120,11 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
     
     # Create portfolio plots - use default plots which work across vectorbt versions
     try:
-        # Try to plot with default settings
-        fig = portfolio.plot(figsize=(16, 12))
+        # Try to plot with default settings (without figsize for plotly compatibility)
+        fig = portfolio.plot()
+        # If plotly figure, update layout for size
+        if hasattr(fig, 'update_layout'):
+            fig.update_layout(width=1600, height=1200)
     except Exception as e:
         logger.warning(f"Warning: Could not create portfolio plot: {e}")
         fig = None
@@ -1157,10 +1214,21 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
         # Hide third subplot for RSI
         axes[2].axis('off')
     elif 'ema_fast' in signals_dict and 'ema_slow' in signals_dict:
-        # EMA Crossover indicators
+        # EMA Crossover indicators (for Bullish Trend Confirmation)
         axes[1].plot(df.index, signals_dict['ema_fast'], label=f'EMA{BULLISH_EMA_FAST}', linewidth=1.5, color='blue')
         axes[1].plot(df.index, signals_dict['ema_slow'], label=f'EMA{BULLISH_EMA_SLOW}', linewidth=1.5, color='orange')
         axes[1].set_title('EMA Crossover')
+        axes[1].set_ylabel('Price (USDT)')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        axes[1].set_xlabel('Date')
+        # Hide third subplot for EMA crossover
+        axes[2].axis('off')
+    elif 'ema_25' in signals_dict and 'ema_99' in signals_dict:
+        # EMA 25/99 Crossover indicators
+        axes[1].plot(df.index, signals_dict['ema_25'], label='EMA25', linewidth=1.5, color='blue')
+        axes[1].plot(df.index, signals_dict['ema_99'], label='EMA99', linewidth=1.5, color='orange')
+        axes[1].set_title('EMA 25/99 Crossover')
         axes[1].set_ylabel('Price (USDT)')
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
@@ -1176,8 +1244,31 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
     
     # Save plots to strategy-specific folder (passed as output_dir)
     if fig is not None:
-        fig.savefig(output_dir / f"{ticker_name}_portfolio.png", dpi=150, bbox_inches='tight')
-        plt.close(fig)
+        try:
+            # Check if it's a Plotly figure
+            if hasattr(fig, 'write_image'):
+                # Plotly figure - use write_image
+                try:
+                    fig.write_image(output_dir / f"{ticker_name}_portfolio.png", width=1600, height=1200)
+                except Exception as img_error:
+                    # If write_image fails (e.g., kaleido not installed), try HTML
+                    logger.warning(f"Could not save Plotly image, saving as HTML instead: {img_error}")
+                    fig.write_html(output_dir / f"{ticker_name}_portfolio.html")
+                # Plotly figures don't need to be closed with plt.close()
+            elif hasattr(fig, 'savefig'):
+                # Matplotlib figure - use savefig
+                fig.savefig(output_dir / f"{ticker_name}_portfolio.png", dpi=150, bbox_inches='tight')
+                plt.close(fig)
+            else:
+                logger.warning(f"Unknown figure type for portfolio plot, skipping save")
+        except Exception as e:
+            logger.warning(f"Could not save portfolio plot: {e}")
+            # Only try to close if it's a matplotlib figure
+            if hasattr(fig, 'savefig') and not hasattr(fig, 'write_image'):
+                try:
+                    plt.close(fig)
+                except:
+                    pass
     
     # Save account balance plot
     fig_balance.savefig(output_dir / f"{ticker_name}_account_balance.png", dpi=150, bbox_inches='tight')
@@ -1205,6 +1296,8 @@ def main():
         enabled_strategies.append("2. RSI Trend Reversals")
     if ENABLE_BULLISH_CONFIRMATION:
         enabled_strategies.append("3. Bullish Trend Confirmation")
+    if ENABLE_EMA_25_99_CROSSOVER:
+        enabled_strategies.append("4. EMA 25/99 Crossover")
     
     logger.info(f"Enabled Strategies:")
     for strategy in enabled_strategies:
@@ -1424,12 +1517,69 @@ def main():
             if training_df is not None:
                 save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
         
+        # Strategy 4: EMA 25/99 Crossover
+        if ENABLE_EMA_25_99_CROSSOVER:
+            strategy_name = "EMA_25_99_Crossover"
+            logger.info(f"[Strategy 4] {strategy_name}")
+            
+            # Create strategy-specific folder
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            
+            ema_25_99_signals = identify_ema_25_99_crossover(price)
+            
+            # Create signals for this strategy only
+            entries = ema_25_99_signals['entry'].fillna(False)
+            exits = ema_25_99_signals['exit'].fillna(False).copy()
+            
+            # Apply EMA filter if enabled
+            if USE_MA99_FILTER:
+                ema = calculate_ema(price, MA99_PERIOD)
+                entries = entries & (price > ema)
+            
+            # Apply risk management
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            
+            # Backtest this strategy
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            
+            # Analyze and save results
+            actual_start = ticker_df.index.min()
+            actual_end = ticker_df.index.max()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", actual_start, actual_end, entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            
+            # Save CSV files for this strategy
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            
+            # Plot individual strategy
+            signals_dict = {
+                'ema_fast': ema_25_99_signals.get('ema_fast'),
+                'ema_slow': ema_25_99_signals.get('ema_slow'),
+                'entry': ema_25_99_signals['entry'],
+                'exit': ema_25_99_signals['exit']
+            }
+            plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
+            
+            # Extract training features for EMA 25/99 Crossover strategy
+            all_strategies_for_training = {'ema_25_99_crossover': ema_25_99_signals}
+            training_df = extract_training_features(
+                portfolio, ticker_df, price, all_strategies_for_training, 
+                ticker, strategy_name, lookback_periods=30
+            )
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+        
         # Create comparison plot for all strategies
         if len(strategy_equity_curves) > 1:
             plot_strategy_comparison(strategy_equity_curves, ticker, base_output_dir)
         
         # Also create combined strategy (if multiple enabled)
-        if len([s for s in [ENABLE_MACD_TREND_REVERSAL, ENABLE_RSI_TREND_REVERSAL, ENABLE_BULLISH_CONFIRMATION] if s]) > 1:
+        if len([s for s in [ENABLE_MACD_TREND_REVERSAL, ENABLE_RSI_TREND_REVERSAL, ENABLE_BULLISH_CONFIRMATION, ENABLE_EMA_25_99_CROSSOVER] if s]) > 1:
             logger.info(f"[Combined Strategy] Running all strategies together...")
             
             # Create combined strategy folder
@@ -1456,6 +1606,12 @@ def main():
                 all_strategies['bullish_confirmation'] = bullish_signals
                 signals_dict['ema_fast'] = bullish_signals.get('ema_fast')
                 signals_dict['ema_slow'] = bullish_signals.get('ema_slow')
+            
+            if ENABLE_EMA_25_99_CROSSOVER:
+                ema_25_99_signals = identify_ema_25_99_crossover(price)
+                all_strategies['ema_25_99_crossover'] = ema_25_99_signals
+                signals_dict['ema_25'] = ema_25_99_signals.get('ema_fast')
+                signals_dict['ema_99'] = ema_25_99_signals.get('ema_slow')
             
             entries, exits = create_vectorbt_signals(ticker_df, all_strategies, price)
             portfolio = backtest_strategy(price, entries, exits, ticker)
@@ -1498,6 +1654,7 @@ def main():
         logger.info(f"  {output_dir}/MACD_Trend_Reversal/")
         logger.info(f"  {output_dir}/RSI_Trend_Reversal/")
         logger.info(f"  {output_dir}/Bullish_Trend_Confirmation/")
+        logger.info(f"  {output_dir}/EMA_25_99_Crossover/")
         logger.info(f"  {output_dir}/Combined/")
         logger.info(f"  {output_dir}/strategy_comparison/")
         logger.info(f"  {output_dir}/training_data/")
