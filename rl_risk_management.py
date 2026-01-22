@@ -44,7 +44,7 @@ class RLRiskManager:
         model_path: Optional[Path] = None,
         model_name: str = DEFAULT_MODEL_NAME,
         initial_balance: float = 100.0,
-        history_length: int = 30,
+        history_length: int = 60,
         max_steps: int = 1000,
         fee_rate: float = 0.001,
         deterministic: bool = True

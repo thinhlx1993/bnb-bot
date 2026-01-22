@@ -73,7 +73,7 @@ USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stab
 # Model architecture configuration
 POLICY_LAYERS = [256, 256]  # Policy network hidden layers
 VALUE_LAYERS = [256, 256]   # Value network hidden layers
-ACTIVATION_FN = 'relu'  # Activation function: 'tanh', 'relu', or 'elu'
+ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
@@ -494,7 +494,7 @@ def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
             entry_idx=episode['entry_idx'] - episode['entry_idx'],  # Relative to episode start
             exit_idx=episode['exit_idx'] - episode['entry_idx'],
             initial_balance=episode['initial_balance'],
-            history_length=30,
+            history_length=60,
             max_steps=min(episode['episode_length'] + 100, 1000),
             fee_rate=0.001
         )
@@ -525,7 +525,7 @@ def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: 
         env = RiskManagementEnv(
             all_tickers_data=all_tickers_data,
             initial_balance=INITIAL_BALANCE,
-            history_length=30,
+            history_length=60,
             max_steps=1000,
             fee_rate=0.001
         )

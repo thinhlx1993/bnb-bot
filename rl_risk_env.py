@@ -39,7 +39,7 @@ class RiskManagementEnv(gym.Env):
         entry_idx: Optional[int] = None,
         exit_idx: Optional[int] = None,
         initial_balance: float = 100.0,
-        history_length: int = 30,
+        history_length: int = 60,
         max_steps: int = 1000,
         fee_rate: float = 0.001,
         render_mode: Optional[str] = None
@@ -110,20 +110,20 @@ class RiskManagementEnv(gym.Env):
         # Action space: 0 = Hold, 1 = Close (take profit), 2 = Close (stop loss)
         self.action_space = spaces.Discrete(3)
         
-        # Observation space: 67 features
+        # Observation space: 127 features
         # 1. Current account balance (normalized)
         # 2. Current price change % (since entry)
         # 3. Position unrealized P&L %
         # 4. Periods held (normalized)
-        # 5-34. Price change history (last 30 periods)
-        # 35-64. Balance change history (last 30 periods)
-        # 65. Current price position relative to entry (normalized)
-        # 66. Recent volatility (rolling std of returns)
-        # 67. Current drawdown from peak
+        # 5-64. Price change history (last 60 periods)
+        # 65-124. Balance change history (last 60 periods)
+        # 125. Current price position relative to entry (normalized)
+        # 126. Recent volatility (rolling std of returns)
+        # 127. Current drawdown from peak
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(67,),
+            shape=(127,),
             dtype=np.float32
         )
         
@@ -147,7 +147,7 @@ class RiskManagementEnv(gym.Env):
         Construct observation vector from current state.
         
         Returns:
-            Observation array of 67 features
+            Observation array of 127 features
         """
         # Ensure environment is initialized (should have been reset)
         if self.price_window is None or self.balance_window is None:
@@ -182,7 +182,7 @@ class RiskManagementEnv(gym.Env):
         # Periods held (normalized by max steps)
         periods_held = self.current_idx / max(self.max_steps, 1)
         
-        # Price change history (last 30 periods)
+        # Price change history (last 60 periods)
         price_history = []
         for i in range(self.history_length):
             hist_idx = self.current_idx - (self.history_length - 1 - i)
@@ -198,7 +198,7 @@ class RiskManagementEnv(gym.Env):
                 price_change = (hist_price - self.entry_price) / self.entry_price
             price_history.append(price_change)
         
-        # Balance change history (last 30 periods)
+        # Balance change history (last 60 periods)
         balance_history = []
         initial_balance_value = float(self.balance_data.iloc[max(0, self.data_start_idx)])
         for i in range(self.history_length):
@@ -218,7 +218,7 @@ class RiskManagementEnv(gym.Env):
         # Use a simple normalization: clip to [-2, 2] range and normalize
         price_relative = np.clip(price_change_pct, -0.5, 0.5) / 0.5  # Normalize to [-1, 1]
         
-        # Recent volatility (rolling std of returns over last 30 periods)
+        # Recent volatility (rolling std of returns over last 60 periods)
         if self.current_idx >= 1:
             recent_prices = [float(self.price_window.iloc[max(0, self.current_idx - i)]) 
                            for i in range(min(self.current_idx + 1, self.history_length))]
@@ -246,11 +246,11 @@ class RiskManagementEnv(gym.Env):
             price_change_pct,            # 1: Current price change %
             unrealized_pnl_pct,          # 2: Position unrealized P&L %
             periods_held,                # 3: Periods held (normalized)
-            *price_history,              # 4-33: Price change history (30 values)
-            *balance_history,            # 34-63: Balance change history (30 values)
-            price_relative,              # 64: Current price relative to entry
-            volatility,                  # 65: Recent volatility
-            current_drawdown             # 66: Current drawdown
+            *price_history,              # 4-63: Price change history (60 values)
+            *balance_history,            # 64-123: Balance change history (60 values)
+            price_relative,              # 124: Current price relative to entry
+            volatility,                  # 125: Recent volatility
+            current_drawdown             # 126: Current drawdown
         ], dtype=np.float32)
         
         return observation
