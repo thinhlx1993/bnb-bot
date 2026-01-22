@@ -388,6 +388,236 @@ def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_di
     return comparison_df
 
 
+def plot_all_tickers_comparison(all_results: Dict, output_dir: Path):
+    """
+    Create a comprehensive comparison chart for all tickers.
+    
+    Args:
+        all_results: Dictionary of {ticker: {rule_based: Dict, rl_agent: Dict, comparison: DataFrame}}
+        output_dir: Output directory
+    """
+    logger.info("Creating comprehensive comparison chart for all tickers...")
+    
+    # Prepare data for visualization
+    tickers = []
+    rule_returns = []
+    rl_returns = []
+    rule_sharpe = []
+    rl_sharpe = []
+    rule_drawdown = []
+    rl_drawdown = []
+    rule_winrate = []
+    rl_winrate = []
+    
+    for ticker, results in all_results.items():
+        rule_based = results.get('rule_based', {})
+        rl_agent = results.get('rl_agent', {})
+        
+        tickers.append(ticker)
+        rule_returns.append(rule_based.get('total_return', 0))
+        rl_returns.append(rl_agent.get('total_return', 0))
+        rule_sharpe.append(rule_based.get('sharpe_ratio', 0))
+        rl_sharpe.append(rl_agent.get('sharpe_ratio', 0))
+        rule_drawdown.append(rule_based.get('max_drawdown', 0))
+        rl_drawdown.append(rl_agent.get('max_drawdown', 0))
+        rule_winrate.append(rule_based.get('win_rate', 0))
+        rl_winrate.append(rl_agent.get('win_rate', 0))
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 12))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    
+    x_pos = np.arange(len(tickers))
+    width = 0.35
+    
+    # Color scheme
+    rule_color = '#3498db'  # Blue
+    rl_color = '#2ecc71'     # Green
+    
+    # 1. Total Return Comparison
+    ax1 = fig.add_subplot(gs[0, 0])
+    bars1_rule = ax1.bar(x_pos - width/2, rule_returns, width, label='Rule-Based', 
+                        color=rule_color, alpha=0.8)
+    bars1_rl = ax1.bar(x_pos + width/2, rl_returns, width, label='RL Agent', 
+                      color=rl_color, alpha=0.8)
+    ax1.set_xlabel('Ticker', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Total Return', fontsize=11, fontweight='bold')
+    ax1.set_title('Total Return Comparison', fontsize=12, fontweight='bold')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(tickers, rotation=45, ha='right')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # Add value labels on bars
+    for bars in [bars1_rule, bars1_rl]:
+        for bar in bars:
+            height = bar.get_height()
+            if height != 0:
+                ax1.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}',
+                        ha='center', va='bottom', fontsize=8, rotation=90)
+    
+    # 2. Sharpe Ratio Comparison
+    ax2 = fig.add_subplot(gs[0, 1])
+    bars2_rule = ax2.bar(x_pos - width/2, rule_sharpe, width, label='Rule-Based', 
+                        color=rule_color, alpha=0.8)
+    bars2_rl = ax2.bar(x_pos + width/2, rl_sharpe, width, label='RL Agent', 
+                      color=rl_color, alpha=0.8)
+    ax2.set_xlabel('Ticker', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('Sharpe Ratio', fontsize=11, fontweight='bold')
+    ax2.set_title('Sharpe Ratio Comparison', fontsize=12, fontweight='bold')
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(tickers, rotation=45, ha='right')
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3, axis='y')
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # Add value labels on bars
+    for bars in [bars2_rule, bars2_rl]:
+        for bar in bars:
+            height = bar.get_height()
+            if height != 0:
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}',
+                        ha='center', va='bottom', fontsize=8)
+    
+    # 3. Max Drawdown Comparison (lower is better, so we'll show as positive values)
+    ax3 = fig.add_subplot(gs[0, 2])
+    bars3_rule = ax3.bar(x_pos - width/2, [-d for d in rule_drawdown], width, 
+                         label='Rule-Based', color=rule_color, alpha=0.8)
+    bars3_rl = ax3.bar(x_pos + width/2, [-d for d in rl_drawdown], width, 
+                      label='RL Agent', color=rl_color, alpha=0.8)
+    ax3.set_xlabel('Ticker', fontsize=11, fontweight='bold')
+    ax3.set_ylabel('Max Drawdown (negative)', fontsize=11, fontweight='bold')
+    ax3.set_title('Max Drawdown Comparison (Lower is Better)', fontsize=12, fontweight='bold')
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(tickers, rotation=45, ha='right')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3, axis='y')
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # Add value labels on bars
+    for bars in [bars3_rule, bars3_rl]:
+        for bar in bars:
+            height = bar.get_height()
+            if height != 0:
+                ax3.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{abs(height):.3f}',
+                        ha='center', va='top' if height < 0 else 'bottom', fontsize=8)
+    
+    # 4. Win Rate Comparison
+    ax4 = fig.add_subplot(gs[1, 0])
+    bars4_rule = ax4.bar(x_pos - width/2, rule_winrate, width, label='Rule-Based', 
+                        color=rule_color, alpha=0.8)
+    bars4_rl = ax4.bar(x_pos + width/2, rl_winrate, width, label='RL Agent', 
+                      color=rl_color, alpha=0.8)
+    ax4.set_xlabel('Ticker', fontsize=11, fontweight='bold')
+    ax4.set_ylabel('Win Rate', fontsize=11, fontweight='bold')
+    ax4.set_title('Win Rate Comparison', fontsize=12, fontweight='bold')
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(tickers, rotation=45, ha='right')
+    ax4.set_ylim([0, 1])
+    ax4.legend(fontsize=10)
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bars in [bars4_rule, bars4_rl]:
+        for bar in bars:
+            height = bar.get_height()
+            if height != 0:
+                ax4.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2%}',
+                        ha='center', va='bottom', fontsize=8)
+    
+    # 5. Improvement Percentage (Total Return)
+    ax5 = fig.add_subplot(gs[1, 1])
+    improvements = [(rl - rule) / abs(rule) * 100 if rule != 0 else 0 
+                    for rule, rl in zip(rule_returns, rl_returns)]
+    colors = [rl_color if imp > 0 else rule_color for imp in improvements]
+    bars5 = ax5.bar(x_pos, improvements, width=0.6, color=colors, alpha=0.8)
+    ax5.set_xlabel('Ticker', fontsize=11, fontweight='bold')
+    ax5.set_ylabel('Improvement (%)', fontsize=11, fontweight='bold')
+    ax5.set_title('RL Agent Improvement Over Rule-Based', fontsize=12, fontweight='bold')
+    ax5.set_xticks(x_pos)
+    ax5.set_xticklabels(tickers, rotation=45, ha='right')
+    ax5.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax5.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar, imp in zip(bars5, improvements):
+        height = bar.get_height()
+        ax5.text(bar.get_x() + bar.get_width()/2., height,
+                f'{imp:+.1f}%',
+                ha='center', va='bottom' if height > 0 else 'top', fontsize=9, fontweight='bold')
+    
+    # 6. Summary Statistics Table
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis('off')
+    
+    # Create summary table
+    summary_data = []
+    for ticker, rule_ret, rl_ret, rule_sh, rl_sh, rule_dd, rl_dd, rule_wr, rl_wr in zip(
+        tickers, rule_returns, rl_returns, rule_sharpe, rl_sharpe,
+        rule_drawdown, rl_drawdown, rule_winrate, rl_winrate
+    ):
+        improvement = ((rl_ret - rule_ret) / abs(rule_ret) * 100) if rule_ret != 0 else 0
+        summary_data.append([
+            ticker,
+            f'{rule_ret:.1f}%',
+            f'{rl_ret:.1f}%',
+            f'{improvement:+.1f}%',
+            f'{rule_sh:.2f}',
+            f'{rl_sh:.2f}',
+            f'{rule_dd:.2%}',
+            f'{rl_dd:.2%}'
+        ])
+    
+    table = ax6.table(
+        cellText=summary_data,
+        colLabels=['Ticker', 'Rule Ret', 'RL Ret', 'Improve', 'Rule Sharpe', 'RL Sharpe', 
+                   'Rule DD', 'RL DD'],
+        cellLoc='center',
+        loc='center',
+        bbox=[0, 0, 1, 1]
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.5)
+    
+    # Style header row
+    for i in range(8):
+        table[(0, i)].set_facecolor('#34495e')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Style data rows
+    for i in range(1, len(summary_data) + 1):
+        for j in range(8):
+            if j == 3:  # Improvement column
+                if float(summary_data[i-1][3].replace('%', '').replace('+', '')) > 0:
+                    table[(i, j)].set_facecolor('#d5f4e6')
+                else:
+                    table[(i, j)].set_facecolor('#fadbd8')
+            else:
+                table[(i, j)].set_facecolor('#ecf0f1')
+    
+    ax6.set_title('Summary Statistics', fontsize=12, fontweight='bold', pad=20)
+    
+    # Main title
+    fig.suptitle('Comprehensive Performance Comparison: Rule-Based vs RL Agent\nAcross All Cryptocurrencies', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save the chart
+    comparison_plot = output_dir / "all_tickers_comparison.png"
+    fig.savefig(comparison_plot, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Comprehensive comparison chart saved: {comparison_plot}")
+    
+    return comparison_plot
+
+
 def main(
     eval_start_date: Optional[str] = None,
     eval_end_date: Optional[str] = None
@@ -496,6 +726,14 @@ def main(
             summary_df.to_csv(summary_file, index=False)
             logger.info(f"\n{summary_df.to_string()}")
             logger.info(f"\nSummary saved: {summary_file}")
+        
+        # Create comprehensive comparison chart for all tickers
+        try:
+            plot_all_tickers_comparison(all_results, RL_RESULTS_DIR)
+        except Exception as e:
+            logger.error(f"Error creating comprehensive comparison chart: {e}")
+            import traceback
+            traceback.print_exc()
     
     logger.info("="*60)
     logger.info("Evaluation complete!")
