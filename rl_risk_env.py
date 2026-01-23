@@ -110,20 +110,23 @@ class RiskManagementEnv(gym.Env):
         # Action space: 0 = Hold, 1 = Close (take profit), 2 = Close (stop loss)
         self.action_space = spaces.Discrete(3)
         
-        # Observation space: 127 features
+        # Observation space: 12 features
         # 1. Current account balance (normalized)
-        # 2. Current price change % (since entry)
-        # 3. Position unrealized P&L %
-        # 4. Periods held (normalized)
-        # 5-64. Price change history (last 60 periods)
-        # 65-124. Balance change history (last 60 periods)
-        # 125. Current price position relative to entry (normalized)
-        # 126. Recent volatility (rolling std of returns)
-        # 127. Current drawdown from peak
+        # 2. Position unrealized P&L %
+        # 3. Periods held (normalized)
+        # 4. Max price change in percentage (since entry)
+        # 5. Min price change in percentage (since entry)
+        # 6. Current price change in percentage (since entry)
+        # 7. Max Balance change in percentage (since entry)
+        # 8. Min Balance change in percentage (since entry)
+        # 9. Current Balance change in percentage (since entry)
+        # 10. Current price position relative to entry (normalized)
+        # 11. Recent volatility (rolling std of returns)
+        # 12. Current drawdown from peak
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(127,),
+            shape=(12,),
             dtype=np.float32
         )
         
@@ -147,7 +150,7 @@ class RiskManagementEnv(gym.Env):
         Construct observation vector from current state.
         
         Returns:
-            Observation array of 127 features
+            Observation array of 12 features
         """
         # Ensure environment is initialized (should have been reset)
         if self.price_window is None or self.balance_window is None:
@@ -172,7 +175,7 @@ class RiskManagementEnv(gym.Env):
         current_price = float(self.price_window.iloc[self.current_idx])
         current_balance = float(self.balance_window.iloc[self.current_idx])
         
-        # Current price change %
+        # Current price change % (since entry)
         price_change_pct = (current_price - self.entry_price) / self.entry_price
         
         # Position unrealized P&L % (accounting for fees if we exit now)
@@ -182,46 +185,64 @@ class RiskManagementEnv(gym.Env):
         # Periods held (normalized by max steps)
         periods_held = self.current_idx / max(self.max_steps, 1)
         
-        # Price change history (last 60 periods)
-        price_history = []
-        for i in range(self.history_length):
-            hist_idx = self.current_idx - (self.history_length - 1 - i)
-            if hist_idx < 0:
-                # Pad with entry price change if before episode start
-                if self.data_start_idx + hist_idx >= 0:
-                    hist_price = float(self.price_data.iloc[self.data_start_idx + hist_idx])
-                    price_change = (hist_price - self.entry_price) / self.entry_price
-                else:
-                    price_change = 0.0  # Before entry
-            else:
-                hist_price = float(self.price_window.iloc[hist_idx])
-                price_change = (hist_price - self.entry_price) / self.entry_price
-            price_history.append(price_change)
-        
-        # Balance change history (last 60 periods)
-        balance_history = []
+        # Calculate price change statistics (max, min, current) since entry
+        # Get all price changes from entry point to current position
+        price_changes = []
         initial_balance_value = float(self.balance_data.iloc[max(0, self.data_start_idx)])
-        for i in range(self.history_length):
-            hist_idx = self.current_idx - (self.history_length - 1 - i)
-            if hist_idx < 0:
-                if self.data_start_idx + hist_idx >= 0:
-                    hist_balance = float(self.balance_data.iloc[self.data_start_idx + hist_idx])
-                    balance_change = (hist_balance - initial_balance_value) / initial_balance_value
-                else:
-                    balance_change = 0.0
-            else:
-                hist_balance = float(self.balance_window.iloc[hist_idx])
+        
+        # Entry point relative to window start
+        entry_idx_in_window = self.entry_idx - self.data_start_idx if self.data_start_idx > 0 else self.entry_idx
+        entry_idx_in_window = max(0, entry_idx_in_window)
+        
+        # Calculate price changes from entry point to current position
+        for i in range(entry_idx_in_window, self.current_idx + 1):
+            if i < len(self.price_window):
+                hist_price = float(self.price_window.iloc[i])
+                price_change = (hist_price - self.entry_price) / self.entry_price
+                price_changes.append(price_change)
+        
+        # Calculate max, min, and current price change
+        if len(price_changes) > 0:
+            max_price_change = max(price_changes)
+            min_price_change = min(price_changes)
+            current_price_change = price_change_pct
+        else:
+            # Fallback if no history yet (shouldn't happen, but safe)
+            max_price_change = price_change_pct
+            min_price_change = price_change_pct
+            current_price_change = price_change_pct
+        
+        # Calculate balance change statistics (max, min, current) since entry
+        # Get all balance changes from entry point to current position
+        balance_changes = []
+        
+        # Calculate balance changes from entry point to current position
+        for i in range(entry_idx_in_window, self.current_idx + 1):
+            if i < len(self.balance_window):
+                hist_balance = float(self.balance_window.iloc[i])
                 balance_change = (hist_balance - initial_balance_value) / initial_balance_value
-            balance_history.append(balance_change)
+                balance_changes.append(balance_change)
+        
+        # Calculate max, min, and current balance change
+        if len(balance_changes) > 0:
+            max_balance_change = max(balance_changes)
+            min_balance_change = min(balance_changes)
+            current_balance_change = (current_balance - initial_balance_value) / initial_balance_value
+        else:
+            # Fallback if no history yet
+            current_balance_change = (current_balance - initial_balance_value) / initial_balance_value
+            max_balance_change = current_balance_change
+            min_balance_change = current_balance_change
         
         # Current price position relative to entry (normalized)
         # Use a simple normalization: clip to [-2, 2] range and normalize
         price_relative = np.clip(price_change_pct, -0.5, 0.5) / 0.5  # Normalize to [-1, 1]
         
-        # Recent volatility (rolling std of returns over last 60 periods)
+        # Recent volatility (rolling std of returns over last 30 periods)
         if self.current_idx >= 1:
+            lookback = min(self.current_idx + 1, 30)  # Use last 30 periods
             recent_prices = [float(self.price_window.iloc[max(0, self.current_idx - i)]) 
-                           for i in range(min(self.current_idx + 1, self.history_length))]
+                           for i in range(lookback)]
             if len(recent_prices) > 1:
                 returns = np.diff(recent_prices) / recent_prices[:-1]
                 volatility = np.std(returns) if len(returns) > 0 else 0.0
@@ -240,17 +261,20 @@ class RiskManagementEnv(gym.Env):
         # Normalize account balance (relative to initial balance)
         normalized_balance = (current_balance - self.initial_balance) / self.initial_balance
         
-        # Construct observation vector
+        # Construct observation vector (12 features)
         observation = np.array([
             normalized_balance,          # 0: Current account balance (normalized)
-            price_change_pct,            # 1: Current price change %
-            unrealized_pnl_pct,          # 2: Position unrealized P&L %
-            periods_held,                # 3: Periods held (normalized)
-            *price_history,              # 4-63: Price change history (60 values)
-            *balance_history,            # 64-123: Balance change history (60 values)
-            price_relative,              # 124: Current price relative to entry
-            volatility,                  # 125: Recent volatility
-            current_drawdown             # 126: Current drawdown
+            unrealized_pnl_pct,          # 1: Position unrealized P&L %
+            periods_held,                # 2: Periods held (normalized)
+            max_price_change,            # 3: Max price change in percentage
+            min_price_change,            # 4: Min price change in percentage
+            current_price_change,        # 5: Current price change in percentage
+            max_balance_change,          # 6: Max Balance change in percentage
+            min_balance_change,          # 7: Min Balance change in percentage
+            current_balance_change,      # 8: Current Balance change in percentage
+            price_relative,              # 9: Current price relative to entry
+            volatility,                  # 10: Recent volatility
+            current_drawdown             # 11: Current drawdown
         ], dtype=np.float32)
         
         return observation
