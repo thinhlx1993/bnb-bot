@@ -7,7 +7,7 @@ echo "Note: RSA authentication does NOT require an API secret!"
 echo ""
 
 # Set your API key (from Binance testnet - this is all you need!)
-export BINANCE_API_KEY="moS2Jvm6IdrFnPLxANFEs9BQJaY6rBlgu4NA58ehXD6sCbGkAbxamn5zNTLUmZxz"
+export BINANCE_API_KEY=""
 
 # Set path to private key (should be in current directory)
 export BINANCE_PRIVATE_KEY_PATH="test-prv-key.pem"
