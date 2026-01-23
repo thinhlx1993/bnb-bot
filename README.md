@@ -79,6 +79,12 @@ The RL agent was evaluated on **6 major cryptocurrencies** over **36,384 periods
 - **Sortino Ratio**: Average improvement of **+36.6%**
 - **Win Rate**: Improved on 5 out of 6 assets
 
+### Comprehensive Performance Comparison
+
+The following chart provides a comprehensive overview comparing the RL Agent against the Rule-Based strategy across all cryptocurrencies:
+
+![Comprehensive Performance Comparison](results/rl_agent/all_tickers_comparison.png)
+
 ### Visual Results
 
 #### BTCUSDT Performance Comparison
