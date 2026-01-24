@@ -48,7 +48,7 @@ class RiskManagementEnv(gym.Env):
         Initialize the risk management environment.
         
         Args:
-            all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for all tickers
+            all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series, 'entry_signals': Series (optional)}}
             price_data: Price series (legacy - used if all_tickers_data not provided)
             balance_data: Account balance series (legacy - used if all_tickers_data not provided)
             entry_price: Entry price (legacy - will be set on reset if all_tickers_data provided)
@@ -74,10 +74,28 @@ class RiskManagementEnv(gym.Env):
             self.entry_price = None
             self.entry_idx = None
             self.exit_idx = None
+            
+            # Pre-calculate entry signal indices for each ticker
+            self._entry_signal_indices = {}
+            for ticker in self.tickers_list:
+                ticker_data = all_tickers_data[ticker]
+                if 'entry_signals' in ticker_data and ticker_data['entry_signals'] is not None:
+                    # Get indices where entry signals are True
+                    signals = ticker_data['entry_signals']
+                    signal_indices = np.where(signals.values)[0]
+                    # Filter to valid range (need history before and space after)
+                    valid_indices = signal_indices[
+                        (signal_indices >= history_length) & 
+                        (signal_indices < len(signals) - 50)  # At least 50 steps after
+                    ]
+                    self._entry_signal_indices[ticker] = valid_indices if len(valid_indices) > 0 else None
+                else:
+                    self._entry_signal_indices[ticker] = None
         else:
             # Legacy approach: single episode data
             self.all_tickers_data = None
             self.use_all_tickers = False
+            self._entry_signal_indices = {}
             self.price_data = price_data
             self.balance_data = balance_data
             self.entry_price = entry_price
@@ -524,19 +542,26 @@ class RiskManagementEnv(gym.Env):
                 # Create default balance series
                 balance_series = pd.Series(self.initial_balance, index=price_series.index)
             
-            # Randomly select entry point (must have enough history and future)
-            min_entry_idx = self.history_length
-            max_entry_idx = len(price_series) - self.max_steps - 1
+            # Select entry point from technical signals if available, otherwise random
+            signal_indices = self._entry_signal_indices.get(self.current_ticker)
             
-            if max_entry_idx <= min_entry_idx:
-                # Not enough data, use available range
-                min_entry_idx = 0
-                max_entry_idx = max(0, len(price_series) - 10)
-            
-            if max_entry_idx > min_entry_idx:
-                entry_idx = np.random.randint(min_entry_idx, max_entry_idx)
+            if signal_indices is not None and len(signal_indices) > 0:
+                # Use technical signal as entry point
+                entry_idx = int(np.random.choice(signal_indices))
             else:
-                entry_idx = min_entry_idx if min_entry_idx < len(price_series) else 0
+                # Fallback: randomly select entry point (must have enough history and future)
+                min_entry_idx = self.history_length
+                max_entry_idx = len(price_series) - self.max_steps - 1
+                
+                if max_entry_idx <= min_entry_idx:
+                    # Not enough data, use available range
+                    min_entry_idx = 0
+                    max_entry_idx = max(0, len(price_series) - 10)
+                
+                if max_entry_idx > min_entry_idx:
+                    entry_idx = np.random.randint(min_entry_idx, max_entry_idx)
+                else:
+                    entry_idx = min_entry_idx if min_entry_idx < len(price_series) else 0
             
             # Set exit index (end of available data or max_steps ahead)
             exit_idx = min(entry_idx + self.max_steps, len(price_series) - 1)

@@ -11,6 +11,7 @@ This strategy spots trend reversals using MACD Divergence detection:
 
 import sys
 import os
+import argparse
 from pathlib import Path
 
 # Add FinRL-Meta to sys.path
@@ -1282,11 +1283,48 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
     return fig, fig2, fig_balance
 
 
-def main():
-    """Main execution function."""
+def main(download_only: bool = False):
+    """
+    Main execution function.
+    
+    Args:
+        download_only: If True, only download data and save to dataset.csv
+    """
     logger.info("="*60)
-    logger.info("Multi-Strategy Trading System using VectorBT")
+    if download_only:
+        logger.info("Data Download Mode")
+    else:
+        logger.info("Multi-Strategy Trading System using VectorBT")
     logger.info("="*60)
+    
+    # Fetch data
+    df = fetch_binance_data(TICKER_LIST, START_DATE, END_DATE, TIME_INTERVAL)
+    
+    if df.empty:
+        logger.error("Error: No data fetched. Please check your ticker list and date range.")
+        return
+    
+    logger.info(f"Data shape: {df.shape}")
+    logger.info(f"Date range: {df['time'].min()} to {df['time'].max()}")
+    
+    # Save dataset to data/dataset.csv for RL training
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+    dataset_path = data_dir / "dataset.csv"
+    df.to_csv(dataset_path, index=False)
+    logger.info(f"Dataset saved to {dataset_path} ({len(df)} rows)")
+    
+    # If download only mode, exit here
+    if download_only:
+        logger.info("="*60)
+        logger.info("Data download complete!")
+        logger.info(f"Dataset: {dataset_path}")
+        logger.info(f"Tickers: {TICKER_LIST}")
+        logger.info(f"Date range: {START_DATE} to {END_DATE}")
+        logger.info(f"Interval: {TIME_INTERVAL}")
+        logger.info("="*60)
+        logger.info("\nNext: python train_rl_agent.py")
+        return
     
     # Log enabled strategies
     enabled_strategies = []
@@ -1305,16 +1343,6 @@ def main():
     if not enabled_strategies:
         logger.warning("  ⚠️  No strategies enabled! Please enable at least one strategy.")
         return
-    
-    # Fetch data
-    df = fetch_binance_data(TICKER_LIST, START_DATE, END_DATE, TIME_INTERVAL)
-    
-    if df.empty:
-        logger.error("Error: No data fetched. Please check your ticker list and date range.")
-        return
-    
-    logger.info(f"Data shape: {df.shape}")
-    logger.info(f"Date range: {df['time'].min()} to {df['time'].max()}")
     
     # Process each ticker
     all_strategy_results = {}  # Store results for each strategy separately
@@ -1663,4 +1691,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Backtest trading strategies or download data")
+    parser.add_argument('-d', '--download-only', action='store_true',
+                       help='Only download data to data/dataset.csv, skip backtesting')
+    args = parser.parse_args()
+    main(download_only=args.download_only)

@@ -55,7 +55,7 @@ TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"
 INITIAL_BALANCE = 1000.0  # Default initial balance
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
+TOTAL_TIMESTEPS = 5e10  # Total training steps (use early stopping)
 LEARNING_RATE = 2e-4  # Learning rate (slightly increased - value function needs more learning)
 BATCH_SIZE = 256  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
@@ -79,14 +79,140 @@ EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
 
 # Early stopping configuration
-ENABLE_EARLY_STOPPING = False  # Enable early stopping
+ENABLE_EARLY_STOPPING = True  # Enable early stopping
 EARLY_STOPPING_PATIENCE = 50  # Number of evaluations without improvement before stopping
 EARLY_STOPPING_MIN_DELTA = 0.0  # Minimum change to qualify as improvement
-EARLY_STOPPING_MONITOR = 'mean_reward'  # Metric to monitor: 'mean_reward', 'mean_ep_length', or 'loss'
+EARLY_STOPPING_MONITOR = 'mean_total_reward'  # Metric to monitor: 'mean_reward', 'mean_total_reward', 'mean_ep_length', or 'loss'
 EARLY_STOPPING_MODE = 'max'  # 'max' for reward/ep_length (higher is better), 'min' for loss (lower is better)
 
-# Training/Validation split
-TRAIN_SPLIT = 0.9  # 90% training, 10% validation
+# Training/Validation split (used if date ranges not specified)
+TRAIN_SPLIT = 0.7  # 70% training, 30% validation
+
+# ============== Date Range Configuration ==============
+# Set to None to use all available data, or specify date range (YYYY-MM-DD format)
+# Time-series split: TRAIN -> VALIDATION -> EVAL (chronological order)
+
+# Training data date range  # YYYY-MM-DD format, or None for all data
+TRAIN_START_DATE = "2017-01-01"  # Start date for training data (None = beginning of data)
+TRAIN_END_DATE = "2024-01-01"    # End date for training data (None = use TRAIN_SPLIT)
+
+# Validation data date range (for evaluation during training)
+VAL_START_DATE = "2024-01-01"    # Start date for validation data (None = after TRAIN_END_DATE)
+VAL_END_DATE = "2024-12-31"      # End date for validation data (None = end of data)
+
+# Evaluation data date range (for final evaluation after training)
+EVAL_START_DATE = "2025-01-01"   # Start date for evaluation (None = use VAL dates)
+EVAL_END_DATE = "2026-01-24"              # End date for evaluation (None = end of data)
+
+# Technical indicator settings for entry signal generation
+USE_TECHNICAL_SIGNALS = True  # Use technical signals for entry points (if False, random entry)
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+
+
+# ============== Technical Indicator Functions ==============
+
+def calculate_macd(df: pd.DataFrame, fast: int = MACD_FAST, slow: int = MACD_SLOW, signal: int = MACD_SIGNAL):
+    """Calculate MACD, Signal, and Histogram."""
+    close = df['close'] if 'close' in df.columns else df
+    exp1 = close.ewm(span=fast, adjust=False).mean()
+    exp2 = close.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
+
+
+def calculate_rsi(price: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    """Calculate RSI (Relative Strength Index)."""
+    delta = price.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, np.finfo(float).eps)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def identify_macd_signals(price: pd.Series, macd: pd.Series, signal: pd.Series, histogram: pd.Series) -> pd.Series:
+    """
+    Identify MACD-based entry signals (bullish divergence / crossover).
+    
+    Returns:
+        Boolean series where True indicates a buy signal
+    """
+    entries = pd.Series(False, index=price.index)
+    
+    # MACD line crosses above signal line (bullish crossover)
+    macd_cross_up = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+    
+    # Histogram turns positive (momentum shift)
+    hist_positive = (histogram > 0) & (histogram.shift(1) <= 0)
+    
+    # Combine signals
+    entries = macd_cross_up | hist_positive
+    
+    return entries.fillna(False)
+
+
+def identify_rsi_signals(price: pd.Series, rsi: pd.Series) -> pd.Series:
+    """
+    Identify RSI-based entry signals (oversold bounce).
+    
+    Returns:
+        Boolean series where True indicates a buy signal
+    """
+    entries = pd.Series(False, index=price.index)
+    
+    # RSI crosses above oversold level (30) - potential reversal
+    rsi_cross_up = (rsi > RSI_OVERSOLD) & (rsi.shift(1) <= RSI_OVERSOLD)
+    
+    # RSI was oversold and now rising
+    rsi_rising = (rsi < 50) & (rsi > rsi.shift(1)) & (rsi.shift(1) < RSI_OVERSOLD + 10)
+    
+    # Combine signals
+    entries = rsi_cross_up | rsi_rising
+    
+    return entries.fillna(False)
+
+
+def generate_entry_signals(ticker_df: pd.DataFrame, price: pd.Series) -> pd.Series:
+    """
+    Generate combined entry signals from multiple technical indicators.
+    
+    Args:
+        ticker_df: DataFrame with OHLCV data
+        price: Close price series
+    
+    Returns:
+        Boolean series where True indicates a buy signal
+    """
+    entries = pd.Series(False, index=price.index)
+    
+    try:
+        # MACD signals
+        macd, signal, histogram = calculate_macd(ticker_df)
+        macd_entries = identify_macd_signals(price, macd, signal, histogram)
+        entries = entries | macd_entries
+        
+        # RSI signals
+        rsi = calculate_rsi(price)
+        rsi_entries = identify_rsi_signals(price, rsi)
+        entries = entries | rsi_entries
+        
+    except Exception as e:
+        logger.warning(f"Error generating entry signals: {e}")
+        # Return empty signals on error
+        return pd.Series(False, index=price.index)
+    
+    return entries.fillna(False)
 
 
 class DynamicEvalCallback(BaseCallback):
@@ -98,6 +224,7 @@ class DynamicEvalCallback(BaseCallback):
     def __init__(
         self,
         val_episodes: List[Dict],
+        all_tickers_data: Dict[str, Dict[str, pd.Series]],
         eval_freq: int,
         n_eval_episodes: int,
         model_save_dir: Path,
@@ -107,13 +234,17 @@ class DynamicEvalCallback(BaseCallback):
     ):
         super().__init__(verbose=verbose)
         self.val_episodes = val_episodes
+        self.all_tickers_data = all_tickers_data  # Fallback when no val_episodes
         self.eval_freq = eval_freq
         self.n_eval_episodes = n_eval_episodes
         self.model_save_dir = model_save_dir
         self.log_path = log_path
         self.deterministic = deterministic
         self.last_mean_reward = None
+        self.last_mean_total_reward = None  # Total reward (not normalized by episode length)
         self.last_mean_ep_length = None
+        self.last_win_rate = None  # Win rate (positive rewards / total episodes)
+        self.last_avg_holding_time = None  # Average holding time per episode
         self.best_mean_reward = float('-inf')
         self.eval_count = 0
         
@@ -121,9 +252,15 @@ class DynamicEvalCallback(BaseCallback):
         
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            # Recreate evaluation environments with random episodes
-            eval_env_factory = create_eval_env_factory(self.val_episodes, seed=123 + self.eval_count)
-            n_eval_envs = min(self.n_eval_episodes, len(self.val_episodes), 10)
+            # Use validation episodes if available, otherwise use all_tickers_data
+            if len(self.val_episodes) > 0:
+                eval_env_factory = create_eval_env_factory(self.val_episodes, seed=123 + self.eval_count)
+                n_eval_envs = min(self.n_eval_episodes, len(self.val_episodes), 10)
+            else:
+                # Fallback: use all_tickers_data with technical signals
+                eval_env_factory = create_env_factory(self.all_tickers_data, seed=123 + self.eval_count)
+                n_eval_envs = min(self.n_eval_episodes, 10)
+            
             eval_env = make_vec_env(
                 eval_env_factory,
                 n_envs=n_eval_envs,
@@ -149,17 +286,35 @@ class DynamicEvalCallback(BaseCallback):
                 # Also keep total reward for reference
                 mean_total_reward = np.mean(episode_rewards)
                 std_total_reward = np.std(episode_rewards)
+                
+                # Calculate win rate (positive rewards = wins)
+                wins = sum(1 for r in episode_rewards if r > 0)
+                win_rate = wins / len(episode_rewards)
+                
+                # Calculate holding time statistics
+                avg_holding_time = np.mean(episode_lengths)
+                std_holding_time = np.std(episode_lengths)
+                min_holding_time = np.min(episode_lengths)
+                max_holding_time = np.max(episode_lengths)
             else:
                 mean_reward = 0.0
                 std_reward = 0.0
                 mean_total_reward = 0.0
                 std_total_reward = 0.0
+                win_rate = 0.0
+                avg_holding_time = 0.0
+                std_holding_time = 0.0
+                min_holding_time = 0.0
+                max_holding_time = 0.0
             
             mean_ep_length = np.mean(episode_lengths) if episode_lengths else 0.0
             
-            # Store normalized reward (per step) for early stopping comparison
+            # Store metrics for early stopping comparison
             self.last_mean_reward = mean_reward
+            self.last_mean_total_reward = mean_total_reward  # Total reward (not normalized)
             self.last_mean_ep_length = mean_ep_length
+            self.last_win_rate = win_rate
+            self.last_avg_holding_time = avg_holding_time
             self.eval_count += 1
             
             # Log to TensorBoard (same format as EvalCallback)
@@ -168,6 +323,14 @@ class DynamicEvalCallback(BaseCallback):
             self.logger.record("eval/std_reward", std_reward)
             self.logger.record("eval/mean_total_reward", mean_total_reward)
             self.logger.record("eval/std_total_reward", std_total_reward)
+            
+            # New metrics: win rate and holding time
+            self.logger.record("eval/win_rate", win_rate)
+            self.logger.record("eval/avg_holding_time", avg_holding_time)
+            self.logger.record("eval/std_holding_time", std_holding_time)
+            self.logger.record("eval/min_holding_time", min_holding_time)
+            self.logger.record("eval/max_holding_time", max_holding_time)
+            
             self.logger.dump(step=self.num_timesteps)
             
             # Log results (show both normalized and total for reference)
@@ -175,7 +338,9 @@ class DynamicEvalCallback(BaseCallback):
                 logger.info(f"Eval num_timesteps={self.num_timesteps}, "
                           f"episode_reward_per_step={mean_reward:.2f} +/- {std_reward:.2f} "
                           f"(total: {mean_total_reward:.2f} +/- {std_total_reward:.2f})")
-                logger.info(f"Episode length: {mean_ep_length:.2f}")
+                logger.info(f"Episode length: {mean_ep_length:.2f}, Win rate: {win_rate:.1%}")
+                logger.info(f"Holding time: avg={avg_holding_time:.1f}, std={std_holding_time:.1f}, "
+                          f"min={min_holding_time:.0f}, max={max_holding_time:.0f}")
             
             # Save best model
             if mean_reward > self.best_mean_reward:
@@ -213,8 +378,13 @@ class EarlyStoppingCallback(BaseCallback):
             eval_callback: EvalCallback or DynamicEvalCallback instance to monitor
             patience: Number of evaluations without improvement before stopping
             min_delta: Minimum change to qualify as improvement
-            monitor: Metric to monitor ('mean_reward', 'mean_ep_length', or 'loss')
-            mode: 'max' for reward/ep_length, 'min' for loss
+            monitor: Metric to monitor:
+                - 'mean_reward': reward per step (normalized by episode length)
+                - 'mean_total_reward': total episode reward (not normalized)
+                - 'mean_ep_length': average episode length
+                - 'win_rate': win rate (positive rewards / total episodes)
+                - 'loss': negative mean reward (for minimization)
+            mode: 'max' for reward/ep_length/win_rate, 'min' for loss
             verbose: Verbosity level
         """
         super().__init__(verbose=verbose)
@@ -277,6 +447,34 @@ class EarlyStoppingCallback(BaseCallback):
             if not hasattr(self.eval_callback, 'last_mean_ep_length'):
                 return True
             current_value = self.eval_callback.last_mean_ep_length
+            if current_value is None:
+                return True
+            try:
+                current_value = float(current_value)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True  # Skip if NaN or Inf
+            except (TypeError, ValueError):
+                return True  # Skip if not numeric
+        
+        elif self.monitor == 'mean_total_reward':
+            # Total reward (not normalized by episode length)
+            if not hasattr(self.eval_callback, 'last_mean_total_reward'):
+                return True
+            current_value = self.eval_callback.last_mean_total_reward
+            if current_value is None:
+                return True
+            try:
+                current_value = float(current_value)
+                if np.isnan(current_value) or np.isinf(current_value):
+                    return True  # Skip if NaN or Inf
+            except (TypeError, ValueError):
+                return True  # Skip if not numeric
+        
+        elif self.monitor == 'win_rate':
+            # Win rate (positive rewards / total episodes)
+            if not hasattr(self.eval_callback, 'last_win_rate'):
+                return True
+            current_value = self.eval_callback.last_win_rate
             if current_value is None:
                 return True
             try:
@@ -352,19 +550,59 @@ class EarlyStoppingCallback(BaseCallback):
         return True  # Continue training
 
 
-def load_all_tickers_data(tickers_list: List[str], results_dir: Path = Path("results"), strategy: str = "Combined") -> Dict[str, Dict[str, pd.Series]]:
+def filter_data_by_date(
+    data: pd.Series,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> pd.Series:
     """
-    Load price and balance data for all tickers.
+    Filter time-series data by date range.
+    
+    Args:
+        data: Series with datetime index
+        start_date: Start date (YYYY-MM-DD format, or None)
+        end_date: End date (YYYY-MM-DD format, or None)
+    
+    Returns:
+        Filtered series
+    """
+    filtered = data.copy()
+    
+    if start_date is not None:
+        start_dt = pd.to_datetime(start_date)
+        filtered = filtered[filtered.index >= start_dt]
+    
+    if end_date is not None:
+        end_dt = pd.to_datetime(end_date)
+        filtered = filtered[filtered.index <= end_dt]
+    
+    return filtered
+
+
+def load_all_tickers_data(
+    tickers_list: List[str],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    results_dir: Path = Path("results"),
+    strategy: str = "Combined"
+) -> Dict[str, Dict[str, pd.Series]]:
+    """
+    Load price, balance, and entry signal data for all tickers.
     
     Args:
         tickers_list: List of ticker symbols
+        start_date: Start date for filtering (YYYY-MM-DD format, or None)
+        end_date: End date for filtering (YYYY-MM-DD format, or None)
         results_dir: Results directory containing balance data
         strategy: Strategy name for balance data
     
     Returns:
-        Dict of {ticker: {'price': Series, 'balance': Series}}
+        Dict of {ticker: {'price': Series, 'balance': Series, 'entry_signals': Series}}
     """
-    logger.info(f"Loading data for {len(tickers_list)} tickers...")
+    date_range_str = ""
+    if start_date or end_date:
+        date_range_str = f" ({start_date or 'start'} to {end_date or 'end'})"
+    logger.info(f"Loading data for {len(tickers_list)} tickers{date_range_str}...")
     
     all_tickers_data = {}
     data_dir = Path("data")
@@ -381,39 +619,46 @@ def load_all_tickers_data(tickers_list: List[str], results_dir: Path = Path("res
                 for ticker in tickers_list:
                     ticker_df = df[df['tic'] == ticker].copy()
                     if len(ticker_df) > 0:
+                        # Filter by date range
+                        if start_date is not None:
+                            start_dt = pd.to_datetime(start_date)
+                            ticker_df = ticker_df[ticker_df.index >= start_dt]
+                        if end_date is not None:
+                            end_dt = pd.to_datetime(end_date)
+                            ticker_df = ticker_df[ticker_df.index <= end_dt]
+                        
+                        if len(ticker_df) == 0:
+                            logger.warning(f"  No data for {ticker} in date range {start_date} to {end_date}")
+                            continue
+                        
                         price_series = ticker_df['close']
                         
-                        # Load balance data
-                        balance_file = results_dir / strategy / f"{ticker}_account_balance.csv"
-                        balance_series = None
-                        if balance_file.exists():
-                            try:
-                                balance_df = pd.read_csv(balance_file)
-                                balance_df['Date'] = pd.to_datetime(balance_df['Date'])
-                                balance_df = balance_df.set_index('Date').sort_index()
-                                balance_series = balance_df['Balance']
-                                
-                                # Align balance with price timestamps
-                                balance_series = balance_series.reindex(price_series.index, method='ffill')
-                                balance_series = balance_series.fillna(INITIAL_BALANCE)
-                            except Exception as e:
-                                logger.warning(f"Could not load balance for {ticker}: {e}")
-                                balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
+                        # Create default balance series
+                        balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
+                        
+                        # Generate entry signals from technical indicators
+                        entry_signals = None
+                        if USE_TECHNICAL_SIGNALS:
+                            entry_signals = generate_entry_signals(ticker_df, price_series)
+                            num_signals = entry_signals.sum()
+                            logger.info(f"  {ticker}: {len(price_series)} price points, {num_signals} entry signals")
                         else:
-                            # Create default balance series
-                            balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
+                            logger.info(f"  {ticker}: {len(price_series)} price points (random entry)")
                         
                         all_tickers_data[ticker] = {
                             'price': price_series,
-                            'balance': balance_series
+                            'balance': balance_series,
+                            'entry_signals': entry_signals
                         }
-                        logger.info(f"  Loaded {ticker}: {len(price_series)} price points, {len(balance_series)} balance points")
                     else:
                         logger.warning(f"  No data found for {ticker}")
         except Exception as e:
             logger.error(f"Error loading dataset: {e}")
             import traceback
             traceback.print_exc()
+    else:
+        logger.error(f"Dataset file not found: {dataset_file}")
+        logger.error("Please run: python backtest.py --download-only")
     
     if len(all_tickers_data) == 0:
         logger.error("No ticker data loaded!")
@@ -575,19 +820,24 @@ def train_ppo_agent(
     model_save_dir: Path,
     tensorboard_log_dir: Path,
     total_timesteps: int = TOTAL_TIMESTEPS,
-    n_envs: int = 32
+    n_envs: int = 32,
+    val_tickers_data: Optional[Dict[str, Dict[str, pd.Series]]] = None
 ):
     """
     Train PPO agent on all tickers' data.
     
     Args:
-        all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for all tickers
-        val_episodes: Validation episodes (for evaluation)
+        all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for training
+        val_episodes: Validation episodes (for evaluation, legacy)
         model_save_dir: Directory to save models
         tensorboard_log_dir: Directory for TensorBoard logs
         total_timesteps: Total training steps
         n_envs: Number of parallel environments
+        val_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for validation/evaluation
     """
+    # Use validation tickers data if provided, otherwise use training data
+    if val_tickers_data is None:
+        val_tickers_data = all_tickers_data
     logger.info("="*60)
     logger.info("Training PPO Agent")
     logger.info("="*60)
@@ -615,9 +865,17 @@ def train_ppo_agent(
         logger.info("VecNormalize enabled: rewards will be normalized (observations already normalized in env)")
     
     # Create evaluation environment
-    # Use multiple environments to evaluate different episodes in parallel
-    eval_env_factory = create_eval_env_factory(val_episodes, seed=123)
-    n_eval_envs = min(EVAL_EPISODES, len(val_episodes), 10)  # Use up to 10 parallel envs
+    # Use validation episodes if available, otherwise use val_tickers_data with technical signals
+    if len(val_episodes) > 0:
+        eval_env_factory = create_eval_env_factory(val_episodes, seed=123)
+        n_eval_envs = min(EVAL_EPISODES, len(val_episodes), 10)
+        logger.info(f"Evaluation using {len(val_episodes)} validation episodes")
+    else:
+        # No validation episodes - use val_tickers_data with technical signals
+        eval_env_factory = create_env_factory(val_tickers_data, seed=123)
+        n_eval_envs = min(EVAL_EPISODES, 10)
+        logger.info(f"Evaluation using validation data with technical signals ({VAL_START_DATE} to {VAL_END_DATE})")
+    
     eval_env = make_vec_env(
         eval_env_factory,
         n_envs=n_eval_envs,
@@ -707,6 +965,7 @@ def train_ppo_agent(
     # Evaluation callback - use custom callback that recreates environments each time
     eval_callback = DynamicEvalCallback(
         val_episodes=val_episodes,
+        all_tickers_data=val_tickers_data,  # Use validation data for evaluation
         eval_freq=EVAL_FREQ,
         n_eval_episodes=EVAL_EPISODES,
         model_save_dir=model_save_dir,
@@ -778,51 +1037,254 @@ def train_ppo_agent(
     return model
 
 
+def evaluate_on_test_data(
+    model,
+    test_tickers_data: Dict[str, Dict[str, pd.Series]]
+) -> Dict:
+    """
+    Evaluate the trained model on ALL entry signals in test data.
+    
+    Args:
+        model: Trained PPO model
+        test_tickers_data: Test data for each ticker (with entry_signals)
+    
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    logger.info("\n" + "="*60)
+    logger.info("EVALUATING ON TEST DATA")
+    logger.info("="*60)
+    
+    if len(test_tickers_data) == 0:
+        logger.warning("No test data available for evaluation!")
+        return {}
+    
+    # Count total entry signals in test data
+    total_signals = 0
+    for ticker, data in test_tickers_data.items():
+        if data['entry_signals'] is not None:
+            signals = data['entry_signals'].sum()
+            total_signals += signals
+            logger.info(f"  {ticker}: {signals} entry signals")
+    
+    if total_signals == 0:
+        logger.warning("No entry signals found in test data!")
+        return {}
+    
+    logger.info(f"  Total entry signals to evaluate: {total_signals}")
+    
+    # Use all entry signals for evaluation
+    n_episodes = total_signals
+    
+    # Create test environment
+    test_env_factory = create_env_factory(test_tickers_data, seed=456)
+    n_test_envs = min(n_episodes, 32)  # Use up to 32 parallel envs for speed
+    test_env = make_vec_env(
+        test_env_factory,
+        n_envs=n_test_envs,
+        vec_env_cls=DummyVecEnv
+    )
+    
+    # Run evaluation on ALL entry signals
+    logger.info(f"\nRunning evaluation on ALL {n_episodes} entry signals...")
+    episode_rewards, episode_lengths = evaluate_policy(
+        model,
+        test_env,
+        n_eval_episodes=n_episodes,
+        deterministic=True,
+        return_episode_rewards=True
+    )
+    
+    # Calculate metrics
+    mean_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    mean_length = np.mean(episode_lengths)
+    
+    # Calculate reward per step (normalized)
+    rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
+    mean_reward_per_step = np.mean(rewards_per_step)
+    
+    # Calculate win rate (positive reward = win)
+    wins = sum(1 for r in episode_rewards if r > 0)
+    win_rate = wins / len(episode_rewards) if episode_rewards else 0
+    
+    # Calculate total return proxy (sum of all rewards)
+    total_reward = sum(episode_rewards)
+    
+    # Calculate holding time statistics
+    avg_holding_time = np.mean(episode_lengths)
+    std_holding_time = np.std(episode_lengths)
+    min_holding_time = np.min(episode_lengths)
+    max_holding_time = np.max(episode_lengths)
+    
+    # Log results
+    logger.info("\n" + "-"*40)
+    logger.info("TEST DATA EVALUATION RESULTS")
+    logger.info("-"*40)
+    logger.info(f"  Episodes evaluated: {len(episode_rewards)}")
+    logger.info(f"  Mean total reward:  {mean_reward:.2f} +/- {std_reward:.2f}")
+    logger.info(f"  Mean reward/step:   {mean_reward_per_step:.4f}")
+    logger.info(f"  Win rate:           {win_rate:.1%} ({wins}/{len(episode_rewards)})")
+    logger.info(f"  Holding time:       avg={avg_holding_time:.1f}, std={std_holding_time:.1f}")
+    logger.info(f"                      min={min_holding_time:.0f}, max={max_holding_time:.0f} steps")
+    logger.info(f"  Total reward (sum): {total_reward:.2f}")
+    logger.info("-"*40)
+    
+    # Clean up
+    test_env.close()
+    
+    return {
+        'mean_reward': mean_reward,
+        'std_reward': std_reward,
+        'mean_reward_per_step': mean_reward_per_step,
+        'mean_episode_length': mean_length,
+        'win_rate': win_rate,
+        'total_reward': total_reward,
+        'n_episodes': len(episode_rewards),
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+        # Holding time statistics
+        'avg_holding_time': avg_holding_time,
+        'std_holding_time': std_holding_time,
+        'min_holding_time': min_holding_time,
+        'max_holding_time': max_holding_time
+    }
+
+
 def main():
     """Main execution function."""
     logger.info("="*60)
     logger.info("RL Risk Management Agent Training")
     logger.info("="*60)
     
-    # Load all tickers' data
-    logger.info("Loading all tickers' data...")
-    all_tickers_data = load_all_tickers_data(TICKER_LIST)
+    # Log date range configuration
+    logger.info("\nDate Range Configuration:")
+    logger.info(f"  Training:   {TRAIN_START_DATE or 'start'} to {TRAIN_END_DATE or 'end'}")
+    logger.info(f"  Validation: {VAL_START_DATE or 'start'} to {VAL_END_DATE or 'end'}")
+    logger.info(f"  Evaluation: {EVAL_START_DATE or 'start'} to {EVAL_END_DATE or 'end'}")
     
-    if len(all_tickers_data) == 0:
-        logger.error("No ticker data loaded! Please ensure dataset.csv exists and contains ticker data.")
+    # Load TRAINING data
+    logger.info("\n--- Loading TRAINING Data ---")
+    train_tickers_data = load_all_tickers_data(
+        TICKER_LIST,
+        start_date=TRAIN_START_DATE,
+        end_date=TRAIN_END_DATE
+    )
+    
+    if len(train_tickers_data) == 0:
+        logger.error("No training data loaded! Please ensure dataset.csv exists and contains ticker data.")
         return
     
-    # Print statistics
-    logger.info(f"\nTicker Data Statistics:")
-    for ticker, data in all_tickers_data.items():
+    # Print training data statistics
+    logger.info(f"\nTraining Data Statistics:")
+    for ticker, data in train_tickers_data.items():
         price_len = len(data['price'])
-        balance_len = len(data['balance'])
-        logger.info(f"  {ticker}: {price_len} price points, {balance_len} balance points")
+        start_dt = data['price'].index.min()
+        end_dt = data['price'].index.max()
+        num_signals = data['entry_signals'].sum() if data['entry_signals'] is not None else 0
+        logger.info(f"  {ticker}: {price_len} points, {num_signals} signals | {start_dt} to {end_dt}")
     
-    total_timesteps_available = sum(len(data['price']) for data in all_tickers_data.values())
-    logger.info(f"  Total timesteps across all tickers: {total_timesteps_available}")
+    total_train_timesteps = sum(len(data['price']) for data in train_tickers_data.values())
+    logger.info(f"  Total training timesteps: {total_train_timesteps}")
     
-    # Load validation episodes (for evaluation only)
-    episodes = load_episodes(TRAINING_DATA_DIR)
+    # Load VALIDATION data
+    logger.info("\n--- Loading VALIDATION Data ---")
+    val_tickers_data = load_all_tickers_data(
+        TICKER_LIST,
+        start_date=VAL_START_DATE,
+        end_date=VAL_END_DATE
+    )
+    
+    if len(val_tickers_data) == 0:
+        logger.warning("No validation data loaded! Evaluation will use training data range.")
+        val_tickers_data = train_tickers_data
+    else:
+        # Print validation data statistics
+        logger.info(f"\nValidation Data Statistics:")
+        for ticker, data in val_tickers_data.items():
+            price_len = len(data['price'])
+            start_dt = data['price'].index.min()
+            end_dt = data['price'].index.max()
+            num_signals = data['entry_signals'].sum() if data['entry_signals'] is not None else 0
+            logger.info(f"  {ticker}: {price_len} points, {num_signals} signals | {start_dt} to {end_dt}")
+        
+        total_val_timesteps = sum(len(data['price']) for data in val_tickers_data.values())
+        logger.info(f"  Total validation timesteps: {total_val_timesteps}")
+    
+    # Load validation episodes from file (legacy support)
     val_episodes = []
+    episodes = load_episodes(TRAINING_DATA_DIR)
     if len(episodes) > 0:
         _, val_episodes = split_episodes(episodes, TRAIN_SPLIT)
-        logger.info(f"\nValidation Episodes: {len(val_episodes)} (for evaluation)")
+        logger.info(f"\nLoaded {len(val_episodes)} validation episodes from file")
+    
+    # Load TEST data (for final evaluation after training)
+    logger.info("\n--- Loading TEST Data ---")
+    test_tickers_data = load_all_tickers_data(
+        TICKER_LIST,
+        start_date=EVAL_START_DATE,
+        end_date=EVAL_END_DATE
+    )
+    
+    if len(test_tickers_data) > 0:
+        logger.info(f"\nTest Data Statistics:")
+        for ticker, data in test_tickers_data.items():
+            price_len = len(data['price'])
+            start_dt = data['price'].index.min()
+            end_dt = data['price'].index.max()
+            num_signals = data['entry_signals'].sum() if data['entry_signals'] is not None else 0
+            logger.info(f"  {ticker}: {price_len} points, {num_signals} signals | {start_dt} to {end_dt}")
+        
+        total_test_timesteps = sum(len(data['price']) for data in test_tickers_data.values())
+        logger.info(f"  Total test timesteps: {total_test_timesteps}")
     else:
-        logger.warning("No validation episodes found. Evaluation will use random ticker selection.")
+        logger.warning("No test data available in the specified date range!")
     
     # Train model
     model = train_ppo_agent(
-        all_tickers_data,
+        train_tickers_data,
         val_episodes,
         MODEL_SAVE_DIR,
         TENSORBOARD_LOG_DIR,
         total_timesteps=TOTAL_TIMESTEPS,
-        n_envs=16  # Number of parallel environments
+        n_envs=16,
+        val_tickers_data=val_tickers_data  # Pass validation data for evaluation
     )
     
     logger.info("\nTraining pipeline complete!")
     logger.info(f"To view TensorBoard: tensorboard --logdir {TENSORBOARD_LOG_DIR}")
+    
+    # Evaluate on TEST data after training (using ALL entry signals)
+    if len(test_tickers_data) > 0 and model is not None:
+        test_results = evaluate_on_test_data(
+            model,
+            test_tickers_data
+        )
+        
+        # Save test results
+        if test_results:
+            results_file = MODEL_SAVE_DIR / "test_evaluation_results.txt"
+            with open(results_file, 'w') as f:
+                f.write("TEST DATA EVALUATION RESULTS\n")
+                f.write("="*40 + "\n")
+                f.write(f"Test date range: {EVAL_START_DATE} to {EVAL_END_DATE}\n")
+                f.write(f"Entry signals evaluated: {test_results['n_episodes']} (ALL signals in test period)\n")
+                f.write(f"Mean total reward: {test_results['mean_reward']:.2f} +/- {test_results['std_reward']:.2f}\n")
+                f.write(f"Mean reward/step: {test_results['mean_reward_per_step']:.4f}\n")
+                f.write(f"Win rate: {test_results['win_rate']:.1%}\n")
+                f.write(f"\nHolding Time Statistics:\n")
+                f.write(f"  Average holding time: {test_results['avg_holding_time']:.1f} steps\n")
+                f.write(f"  Std holding time: {test_results['std_holding_time']:.1f} steps\n")
+                f.write(f"  Min holding time: {test_results['min_holding_time']:.0f} steps\n")
+                f.write(f"  Max holding time: {test_results['max_holding_time']:.0f} steps\n")
+                f.write(f"\nTotal reward (sum): {test_results['total_reward']:.2f}\n")
+            logger.info(f"\nTest results saved to: {results_file}")
+    else:
+        logger.warning("Skipping test evaluation (no test data or model not trained)")
+    
+    logger.info("\n" + "="*60)
+    logger.info("ALL DONE!")
+    logger.info("="*60)
 
 
 if __name__ == "__main__":
