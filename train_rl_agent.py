@@ -56,7 +56,9 @@ INITIAL_BALANCE = 1000.0  # Default initial balance
 
 # Training hyperparameters
 TOTAL_TIMESTEPS = 5e10  # Total training steps (use early stopping)
-LEARNING_RATE = 2e-4  # Learning rate (slightly increased - value function needs more learning)
+LEARNING_RATE = 2e-4  # Initial learning rate
+LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
+USE_LR_SCHEDULE = True  # Enable learning rate scheduling
 BATCH_SIZE = 256  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
 N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
@@ -112,6 +114,28 @@ MACD_SIGNAL = 9
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
+
+
+# ============== Learning Rate Schedule Functions ==============
+
+def linear_schedule(initial_lr: float, final_lr: float = 0.0) -> callable:
+    """
+    Linear learning rate schedule.
+    
+    Args:
+        initial_lr: Initial learning rate
+        final_lr: Final learning rate (default 0.0)
+    
+    Returns:
+        Schedule function that takes progress_remaining (1.0 -> 0.0) and returns LR
+    """
+    def schedule(progress_remaining: float) -> float:
+        """
+        Progress remaining goes from 1.0 (start) to 0.0 (end of training).
+        """
+        return final_lr + progress_remaining * (initial_lr - final_lr)
+    
+    return schedule
 
 
 # ============== Technical Indicator Functions ==============
@@ -915,10 +939,18 @@ def train_ppo_agent(
     else:
         logger.info("Using CPU (consider using GPU for faster training with complex architecture)")
     
+    # Set up learning rate (constant or scheduled)
+    if USE_LR_SCHEDULE:
+        lr_schedule = linear_schedule(LEARNING_RATE, LEARNING_RATE_END)
+        logger.info(f"Using linear LR schedule: {LEARNING_RATE} -> {LEARNING_RATE_END}")
+    else:
+        lr_schedule = LEARNING_RATE
+        logger.info(f"Using constant LR: {LEARNING_RATE}")
+    
     model = PPO(
         "MlpPolicy",
         train_env,
-        learning_rate=LEARNING_RATE,
+        learning_rate=lr_schedule,
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
@@ -943,7 +975,10 @@ def train_ppo_agent(
     vf_params = sum(VALUE_LAYERS[i] * VALUE_LAYERS[i+1] for i in range(len(VALUE_LAYERS)-1))
     total_params = (pi_params + vf_params) + sum(POLICY_LAYERS) + sum(VALUE_LAYERS)  # Approximate
     logger.info(f"  Estimated parameters: ~{total_params // 1000}K")
-    logger.info(f"  Learning rate: {LEARNING_RATE}")
+    if USE_LR_SCHEDULE:
+        logger.info(f"  Learning rate: {LEARNING_RATE} -> {LEARNING_RATE_END} (linear decay)")
+    else:
+        logger.info(f"  Learning rate: {LEARNING_RATE} (constant)")
     logger.info(f"  Batch size: {BATCH_SIZE}")
     logger.info(f"  Steps per update: {N_STEPS}")
     logger.info(f"  Epochs per update: {N_EPOCHS}")

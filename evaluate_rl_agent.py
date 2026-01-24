@@ -50,8 +50,8 @@ DEFAULT_MODEL_NAME = "best_model"
 
 # Evaluation date range configuration
 # Set to None to use all available data, or specify date range for evaluation
-EVAL_START_DATE = "2025-01-01"  # YYYY-MM-DD format, or None for all data
-EVAL_END_DATE = "2026-01-21"    # YYYY-MM-DD format, or None for all data
+EVAL_START_DATE = "2024-01-01"  # YYYY-MM-DD format, or None for all data
+EVAL_END_DATE = "2025-01-21"    # YYYY-MM-DD format, or None for all data
 
 # Test configuration
 USE_RL_RISK_MANAGEMENT = True  # Enable RL risk management
