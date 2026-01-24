@@ -304,7 +304,7 @@ def evaluate_rl_agent(
     return results
 
 
-def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_dir: Path):
+def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_dir: Path, price: Optional[pd.Series] = None):
     """
     Compare and visualize results between rule-based and RL agent.
     
@@ -313,6 +313,7 @@ def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_di
         results_rl: RL agent results
         ticker: Ticker symbol
         output_dir: Output directory
+        price: Price series for plotting close price (optional)
     """
     logger.info(f"Comparing results for {ticker}...")
     
@@ -353,30 +354,66 @@ def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_di
     comparison_df.to_csv(comparison_file, index=False)
     logger.info(f"Comparison saved: {comparison_file}")
     
-    # Plot equity curves comparison
-    fig, ax = plt.subplots(figsize=(16, 8))
+    # Plot equity curves comparison with close price below
+    if price is not None:
+        # Create two subplots: equity curves on top, close price below
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), height_ratios=[2, 1], sharex=True)
+    else:
+        # Single plot if no price data
+        fig, ax1 = plt.subplots(figsize=(16, 8))
+        ax2 = None
     
     portfolio_rule = results_rule.get('portfolio')
     portfolio_rl = results_rl.get('portfolio')
     
+    # Plot equity curves on top subplot
     if portfolio_rule:
         equity_rule = portfolio_rule.value()
-        ax.plot(equity_rule.index, equity_rule.values, 
+        ax1.plot(equity_rule.index, equity_rule.values, 
                linewidth=2, label='Rule-Based', color='blue', alpha=0.8)
     
     if portfolio_rl:
         equity_rl = portfolio_rl.value()
-        ax.plot(equity_rl.index, equity_rl.values, 
+        ax1.plot(equity_rl.index, equity_rl.values, 
                linewidth=2, label='RL Agent', color='green', alpha=0.8)
     
-    ax.axhline(y=INITIAL_BALANCE, color='gray', linestyle='--', 
+    ax1.axhline(y=INITIAL_BALANCE, color='gray', linestyle='--', 
                linewidth=1, alpha=0.5, label='Initial Balance')
-    ax.set_title(f'{ticker} - Rule-Based vs RL Agent Comparison', 
+    ax1.set_title(f'{ticker} - Rule-Based vs RL Agent Comparison', 
                 fontsize=14, fontweight='bold')
-    ax.set_xlabel('Date', fontsize=12)
-    ax.set_ylabel('Portfolio Value', fontsize=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    ax1.set_ylabel('Portfolio Value', fontsize=12)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot close price on bottom subplot
+    if ax2 is not None and price is not None:
+        # Align price index with equity curves if possible
+        price_to_plot = price.copy()
+        
+        # Try to filter price to match equity curve time range
+        if portfolio_rl:
+            equity_rl = portfolio_rl.value()
+            # Get the intersection of price and equity indices
+            common_index = price.index.intersection(equity_rl.index)
+            if len(common_index) > 0:
+                price_to_plot = price.loc[common_index]
+        elif portfolio_rule:
+            equity_rule = portfolio_rule.value()
+            common_index = price.index.intersection(equity_rule.index)
+            if len(common_index) > 0:
+                price_to_plot = price.loc[common_index]
+        
+        if len(price_to_plot) > 0:
+            ax2.plot(price_to_plot.index, price_to_plot.values, 
+                    linewidth=1.5, label='Close Price', color='black', alpha=0.7)
+        
+        ax2.set_xlabel('Date', fontsize=12)
+        ax2.set_ylabel('Close Price', fontsize=12)
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+    else:
+        # If no price data, set xlabel on top plot
+        ax1.set_xlabel('Date', fontsize=12)
     
     plt.tight_layout()
     
@@ -686,7 +723,7 @@ def main(
             # Compare results
             if results_rule and results_rl:
                 comparison = compare_results(
-                    results_rule, results_rl, ticker, RL_RESULTS_DIR
+                    results_rule, results_rl, ticker, RL_RESULTS_DIR, price=price
                 )
                 all_results[ticker] = {
                     'rule_based': results_rule,

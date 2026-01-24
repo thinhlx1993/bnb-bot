@@ -39,8 +39,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-START_DATE = "2023-01-01" # YYYY-MM-DD
-END_DATE = "2025-01-01" # YYYY-MM-DD
+START_DATE = "2017-01-01" # YYYY-MM-DD
+END_DATE = "2026-01-23" # YYYY-MM-DD
 TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
 TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # You can add more cryptocurrencies
 
@@ -699,13 +699,6 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
                         return_col = col
                         break
                 
-                # Try to find duration column
-                duration_col = None
-                for col in ['Duration', 'Exit Timestamp', 'Entry Timestamp']:
-                    if col in available_cols:
-                        duration_col = col
-                        break
-                
                 logger.info(f"INDIVIDUAL TRADE ANALYSIS:")
                 logger.info(f"  (Note: Individual trade returns are relative to entry price,")
                 logger.info(f"   not portfolio value. Small per-trade returns can compound to larger total returns.)")
@@ -733,9 +726,50 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
                     avg_price_change = ((trades['Exit Price'].mean() - trades['Entry Price'].mean()) / trades['Entry Price'].mean()) * 100
                     logger.info(f"    Average Price Change: {avg_price_change:.2f}%")
                 
-                if duration_col:
-                    avg_duration = trades[duration_col].mean()
-                    logger.info(f"  Average Trade Duration: {avg_duration}")
+                # Calculate average trade duration
+                avg_duration = None
+                if 'Duration' in available_cols:
+                    # Use Duration column if available (should be in time delta format)
+                    avg_duration = trades['Duration'].mean()
+                elif 'Entry Timestamp' in available_cols and 'Exit Timestamp' in available_cols:
+                    # Calculate duration from timestamps
+                    try:
+                        entry_times = pd.to_datetime(trades['Entry Timestamp'])
+                        exit_times = pd.to_datetime(trades['Exit Timestamp'])
+                        durations = exit_times - entry_times
+                        avg_duration = durations.mean()
+                    except Exception as e:
+                        logger.warning(f"  Could not calculate duration from timestamps: {e}")
+                
+                if avg_duration is not None:
+                    # Format duration properly
+                    if isinstance(avg_duration, pd.Timedelta):
+                        total_seconds = avg_duration.total_seconds()
+                        days = int(total_seconds // 86400)
+                        hours = int((total_seconds % 86400) // 3600)
+                        minutes = int((total_seconds % 3600) // 60)
+                        if days > 0:
+                            duration_str = f"{days} days, {hours} hours, {minutes} minutes"
+                        elif hours > 0:
+                            duration_str = f"{hours} hours, {minutes} minutes"
+                        else:
+                            duration_str = f"{minutes} minutes"
+                        logger.info(f"  Average Trade Duration: {duration_str}")
+                    elif isinstance(avg_duration, (int, float)):
+                        # Assume it's in seconds or some numeric format
+                        if avg_duration > 86400:
+                            days = avg_duration / 86400
+                            logger.info(f"  Average Trade Duration: {days:.2f} days")
+                        elif avg_duration > 3600:
+                            hours = avg_duration / 3600
+                            logger.info(f"  Average Trade Duration: {hours:.2f} hours")
+                        elif avg_duration > 60:
+                            minutes = avg_duration / 60
+                            logger.info(f"  Average Trade Duration: {minutes:.2f} minutes")
+                        else:
+                            logger.info(f"  Average Trade Duration: {avg_duration:.2f} seconds")
+                    else:
+                        logger.info(f"  Average Trade Duration: {avg_duration}")
                 
                 # Explain the compounding effect
                 if num_trades > 1:
