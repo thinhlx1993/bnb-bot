@@ -55,9 +55,9 @@ TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"
 INITIAL_BALANCE = 1000.0  # Default initial balance
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 5e10  # Total training steps (use early stopping)
-LEARNING_RATE = 2e-4  # Initial learning rate
-LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
+TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
+LEARNING_RATE = 3e-4  # Initial learning rate
+LEARNING_RATE_END = 1e-4  # Final learning rate (for linear decay)
 USE_LR_SCHEDULE = True  # Enable learning rate scheduling
 BATCH_SIZE = 256  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
@@ -81,7 +81,7 @@ EVAL_FREQ = 5000  # Evaluate every N steps
 EVAL_EPISODES = 10  # Number of episodes for evaluation
 
 # Early stopping configuration
-ENABLE_EARLY_STOPPING = True  # Enable early stopping
+ENABLE_EARLY_STOPPING = False  # Enable early stopping
 EARLY_STOPPING_PATIENCE = 50  # Number of evaluations without improvement before stopping
 EARLY_STOPPING_MIN_DELTA = 0.0  # Minimum change to qualify as improvement
 EARLY_STOPPING_MONITOR = 'mean_total_reward'  # Metric to monitor: 'mean_reward', 'mean_total_reward', 'mean_ep_length', or 'loss'
@@ -107,7 +107,7 @@ EVAL_START_DATE = "2025-01-01"   # Start date for evaluation (None = use VAL dat
 EVAL_END_DATE = "2026-01-24"              # End date for evaluation (None = end of data)
 
 # Technical indicator settings for entry signal generation
-USE_TECHNICAL_SIGNALS = True  # Use technical signals for entry points (if False, random entry)
+USE_TECHNICAL_SIGNALS = False  # Use technical signals for entry points (if False, random entry)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
@@ -367,12 +367,12 @@ class DynamicEvalCallback(BaseCallback):
                           f"min={min_holding_time:.0f}, max={max_holding_time:.0f}")
             
             # Save best model
-            if mean_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_reward
+            if mean_total_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_total_reward
                 best_model_path = self.model_save_dir / "best_model.zip"
                 self.model.save(str(best_model_path))
                 if self.verbose >= 1:
-                    logger.info(f"New best model saved with mean reward: {mean_reward:.2f}")
+                    logger.info(f"New best model saved with mean total reward: {mean_total_reward:.2f}")
             
             # Clean up
             eval_env.close()

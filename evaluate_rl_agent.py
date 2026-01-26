@@ -50,8 +50,8 @@ DEFAULT_MODEL_NAME = "best_model"
 
 # Evaluation date range configuration
 # Set to None to use all available data, or specify date range for evaluation
-EVAL_START_DATE = "2024-01-01"  # YYYY-MM-DD format, or None for all data
-EVAL_END_DATE = "2025-01-21"    # YYYY-MM-DD format, or None for all data
+EVAL_START_DATE = "2025-01-01"  # YYYY-MM-DD format, or None for all data
+EVAL_END_DATE = "2026-01-24"    # YYYY-MM-DD format, or None for all data
 
 # Test configuration
 USE_RL_RISK_MANAGEMENT = True  # Enable RL risk management
@@ -249,7 +249,8 @@ def evaluate_rl_agent(
     exits: pd.Series,
     strategy: str = "Combined",
     model_path: Optional[Path] = None,
-    model_name: str = DEFAULT_MODEL_NAME
+    model_name: str = DEFAULT_MODEL_NAME,
+    rl_manager: Optional[RLRiskManager] = None
 ) -> Dict:
     """
     Evaluate RL agent.
@@ -263,30 +264,32 @@ def evaluate_rl_agent(
         strategy: Strategy name
         model_path: Path to model
         model_name: Model filename
+        rl_manager: Pre-loaded RLRiskManager instance (for reuse across tickers)
     
     Returns:
         Results dictionary
     """
     logger.info(f"Evaluating RL agent for {ticker}...")
     
-    # Load RL risk manager
-    try:
-        manager = RLRiskManager(
-            model_path=model_path,
-            model_name=model_name,
-            initial_balance=INITIAL_BALANCE
-        )
-    except Exception as e:
-        logger.error(f"Error loading RL model: {e}")
-        logger.error("Falling back to rule-based baseline")
-        return evaluate_rule_based_baseline(ticker, ticker_df, price, entries, exits, strategy)
+    # Use provided manager or load a new one
+    if rl_manager is None:
+        try:
+            rl_manager = RLRiskManager(
+                model_path=model_path,
+                model_name=model_name,
+                initial_balance=INITIAL_BALANCE
+            )
+        except Exception as e:
+            logger.error(f"Error loading RL model: {e}")
+            logger.error("Falling back to rule-based baseline")
+            return evaluate_rule_based_baseline(ticker, ticker_df, price, entries, exits, strategy)
     
     # Apply RL risk management
     # First, get initial balance progression (simulate it)
     balance = pd.Series(INITIAL_BALANCE, index=price.index)
     
     # Apply RL risk management
-    exits_rl = manager.apply_rl_risk_management(entries, exits.copy(), price, balance)
+    exits_rl = rl_manager.apply_rl_risk_management(entries, exits.copy(), price, balance)
     
     # Backtest
     portfolio_rl = backtest_strategy(price, entries, exits_rl, ticker)
@@ -679,6 +682,22 @@ def main(
     else:
         logger.info("Using all available data (no date filtering)")
     
+    # Load RL model ONCE and reuse for all tickers
+    rl_manager = None
+    if USE_RL_RISK_MANAGEMENT:
+        try:
+            logger.info("Loading RL model (will be reused for all tickers)...")
+            rl_manager = RLRiskManager(
+                model_path=MODEL_LOAD_DIR,
+                model_name=DEFAULT_MODEL_NAME,
+                initial_balance=INITIAL_BALANCE
+            )
+            logger.info("RL model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading RL model: {e}")
+            logger.error("RL evaluation will be skipped")
+            rl_manager = None
+    
     # Test on all tickers
     all_results = {}
     
@@ -712,12 +731,13 @@ def main(
                     ticker, ticker_df, price, entries, exits, strategy="Combined"
                 )
             
-            if USE_RL_RISK_MANAGEMENT:
+            if USE_RL_RISK_MANAGEMENT and rl_manager is not None:
                 results_rl = evaluate_rl_agent(
                     ticker, ticker_df, price, entries, exits, 
                     strategy="Combined",
                     model_path=MODEL_LOAD_DIR,
-                    model_name=DEFAULT_MODEL_NAME
+                    model_name=DEFAULT_MODEL_NAME,
+                    rl_manager=rl_manager
                 )
             
             # Compare results
