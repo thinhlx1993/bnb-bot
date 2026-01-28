@@ -78,7 +78,7 @@ VALUE_LAYERS = [256, 256]   # Value network hidden layers
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 5000  # Evaluate every N steps
-EVAL_EPISODES = 10  # Number of episodes for evaluation
+EVAL_EPISODES = 1000  # Number of episodes for evaluation
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -107,7 +107,7 @@ EVAL_START_DATE = "2025-01-01"   # Start date for evaluation (None = use VAL dat
 EVAL_END_DATE = "2026-01-24"              # End date for evaluation (None = end of data)
 
 # Technical indicator settings for entry signal generation
-USE_TECHNICAL_SIGNALS = False  # Use technical signals for entry points (if False, random entry)
+USE_TECHNICAL_SIGNALS = True  # Use technical signals for entry points (if False, random entry)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9

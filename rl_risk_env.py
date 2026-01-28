@@ -305,6 +305,7 @@ class RiskManagementEnv(gym.Env):
         - Positive returns get positive rewards
         - Negative returns get negative rewards (penalties)
         - Reward is proportional to the return magnitude
+        - Keep-going bonus: reward for holding (not closing too soon); penalty for very early close
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         price_change_pct = (current_price - self.entry_price) / self.entry_price
@@ -332,6 +333,21 @@ class RiskManagementEnv(gym.Env):
         # Use a reasonable scale factor to provide meaningful signal
         scale_factor = 10.0  # Multiply return by this factor
         reward = position_return * scale_factor
+
+        # ========== KEEP GOING BONUS (discourage closing too soon) ==========
+        if not is_closing:
+            # Reward holding: small bonus per step so agent prefers to keep going
+            # Reduce bonus when in large loss so we don't reward holding sinking positions
+            if position_return > -0.02:
+                reward += 0.08  # Strong bonus for holding when not in big loss
+            elif position_return > -0.05:
+                reward += 0.03  # Smaller bonus when slightly negative
+            # No bonus when position_return <= -0.05 (large loss)
+        else:
+            # Penalty for closing very early (encourage giving the trade time to develop)
+            if periods_held < 96: 
+                early_close_penalty = (96 - periods_held) * 0.15
+                reward -= early_close_penalty
         
         # Clip reward to prevent extreme values that cause training instability
         # Set reasonable bounds based on typical return range
@@ -351,6 +367,7 @@ class RiskManagementEnv(gym.Env):
         3. Win rate: Higher reward for profitable exits
         4. Annualized return: Reward higher returns per time period
         5. Drawdown minimization: Penalty for drawdowns
+        6. Keep going: Reward for holding (not closing too soon); penalty for early close
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         price_change_pct = (current_price - self.entry_price) / self.entry_price
@@ -455,28 +472,35 @@ class RiskManagementEnv(gym.Env):
         drawdown_weight = 1.0  # Reduced from 10.0 to prevent high value loss
         reward -= self.max_drawdown * drawdown_weight
         
-        # ========== TIME-BASED OPTIMIZATION ==========
-        # Balance between holding for profits vs. efficient time usage
+        # ========== TIME-BASED OPTIMIZATION (keep going vs close too soon) ==========
+        # Reward keeping the position open; penalize closing too soon
         if is_closing:
-            # Prevent immediate closure bug
-            if periods_held < 3:
-                early_close_penalty = (3 - periods_held) * 0.2  # Reduced from 2.0
+            # Penalty for closing too early (encourage giving the trade time to develop)
+            if periods_held < 96:
+                early_close_penalty = (96 - periods_held) * 0.25  # Stronger penalty for very early close
+                reward -= early_close_penalty
+            elif periods_held < 10 and position_return > -0.01:
+                # Small penalty for closing a flat/slightly profitable position very quickly
+                early_close_penalty = 0.1
                 reward -= early_close_penalty
         else:
-            # Holding action: encourage holding profitable positions, penalize holding losses
+            # Holding action: reward for keeping going instead of closing too soon
+            hold_step_bonus = 0.0
             if periods_held < 3:
-                # Prevent immediate closure
-                reward += 0.03
+                # Strong bonus to prevent immediate closure
+                hold_step_bonus = 0.08
             elif position_return > 0.01:  # Profitable position
                 # Reward holding profitable positions (scaled by profit size)
-                if periods_held < 30:
-                    # More reward for larger unrealized profits
-                    holding_bonus = position_return * 3.0  # Reward proportional to profit
-                    reward += holding_bonus
-            elif position_return < -0.05:  # Large loss
+                hold_step_bonus = 0.06 + position_return * 3.0  # Base + proportional to profit
+            elif position_return > -0.03:  # Flat or small loss - still reward holding (give trade time)
+                hold_step_bonus = 0.05  # Encourage not closing at first small dip
+            elif position_return > -0.06:  # Moderate loss
+                hold_step_bonus = 0.02  # Small bonus (might recover)
+            # position_return <= -0.06: no hold bonus (avoid rewarding holding large losses)
+            reward += hold_step_bonus
+            if position_return < -0.05 and periods_held > 10:
                 # Penalty for holding large losses too long
-                if periods_held > 10:
-                    reward -= abs(position_return) * 0.3
+                reward -= abs(position_return) * 0.3
         
         # ========== ACTION-SPECIFIC GUIDANCE ==========
         if action == 1:  # Close (take profit)
