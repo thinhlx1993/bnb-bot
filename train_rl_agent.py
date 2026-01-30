@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 import pickle
+import multiprocessing
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
@@ -77,12 +78,10 @@ POLICY_LAYERS = [256, 256]  # Policy network hidden layers
 VALUE_LAYERS = [256, 256]   # Value network hidden layers
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
-EVAL_FREQ = 10000  # Evaluate every N steps
-EVAL_EPISODES = 50  # Episodes for quick validation (logging, early stopping; keep low for speed)
-# Best model selection: use full validation data for reliable pick (None = all validation episodes)
-BEST_MODEL_EVAL_EPISODES = 1000  # None = use all val episodes; or set int (e.g. 500) to cap
-BEST_MODEL_EVAL_INTERVAL = 10  # Run full eval for best-model every N evaluations (1 = every time)
-N_EVAL_ENVS = 64  # Parallel eval envs (higher = faster full validation)
+EVAL_FREQ = 10000  # Evaluate every N steps (single run: all val episodes, N_VAL_WORKERS)
+N_VAL_WORKERS = 16  # Workers: episodes split across workers; use fewer (e.g. 8) if EVAL_WORKER_DEVICE='cuda'
+EVAL_WORKER_DEVICE = 'cuda'  # Device in each worker: 'cpu' or 'cuda' (spawn loads checkpoint per worker)
+EVAL_EPISODES_FALLBACK = 50  # Episodes when no val_episodes (e.g. val_tickers_data only)
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -272,8 +271,8 @@ def _compute_eval_metrics(episode_rewards: List[float], episode_lengths: List[in
 
 class DynamicEvalCallback(BaseCallback):
     """
-    Two-tier evaluation: quick eval for logging (fast), full validation for best-model selection.
-    Best model is chosen by performance on all (or many) validation episodes, not a small sample.
+    Single evaluation every eval_freq: all validation episodes split across n_val_workers.
+    One run for logging, early stopping, and best-model selection.
     """
     
     def __init__(
@@ -281,26 +280,24 @@ class DynamicEvalCallback(BaseCallback):
         val_episodes: List[Dict],
         all_tickers_data: Dict[str, Dict[str, pd.Series]],
         eval_freq: int,
-        n_eval_episodes: int,
         model_save_dir: Path,
         log_path: Path,
         deterministic: bool = True,
         verbose: int = 1,
-        n_best_model_eval_episodes: Optional[int] = None,
-        best_model_eval_interval: int = 1,
-        n_eval_envs: int = 16,
+        n_val_workers: int = 64,
+        n_eval_episodes_fallback: int = 50,
+        eval_worker_device: str = 'cpu',
     ):
         super().__init__(verbose=verbose)
         self.val_episodes = val_episodes
         self.all_tickers_data = all_tickers_data
         self.eval_freq = eval_freq
-        self.n_eval_episodes = n_eval_episodes
         self.model_save_dir = model_save_dir
         self.log_path = log_path
         self.deterministic = deterministic
-        self.n_best_model_eval_episodes = n_best_model_eval_episodes  # None = all val episodes
-        self.best_model_eval_interval = best_model_eval_interval
-        self.n_eval_envs = n_eval_envs
+        self.n_val_workers = n_val_workers
+        self.n_eval_episodes_fallback = n_eval_episodes_fallback
+        self.eval_worker_device = eval_worker_device
         self.last_mean_reward = None
         self.last_mean_total_reward = None
         self.last_mean_ep_length = None
@@ -311,14 +308,10 @@ class DynamicEvalCallback(BaseCallback):
         
         log_path.mkdir(parents=True, exist_ok=True)
     
-    def _run_eval(self, n_episodes: int, seed_offset: int) -> Tuple[List[float], List[int]]:
-        """Run evaluate_policy for n_episodes; return episode_rewards, episode_lengths."""
-        n_envs = min(self.n_eval_envs, n_episodes)
-        if len(self.val_episodes) > 0:
-            factory = create_eval_env_factory(self.val_episodes, seed=123 + seed_offset)
-            n_envs = min(n_envs, len(self.val_episodes))
-        else:
-            factory = create_env_factory(self.all_tickers_data, seed=123 + seed_offset)
+    def _run_eval_fallback(self, n_episodes: int, seed_offset: int) -> Tuple[List[float], List[int]]:
+        """Fallback when no val_episodes: run evaluate_policy with all_tickers_data."""
+        n_envs = min(16, n_episodes)
+        factory = create_env_factory(self.all_tickers_data, seed=123 + seed_offset)
         env = make_vec_env(factory, n_envs=n_envs, vec_env_cls=DummyVecEnv)
         try:
             rewards, lengths = evaluate_policy(
@@ -331,21 +324,45 @@ class DynamicEvalCallback(BaseCallback):
             return rewards, lengths
         finally:
             env.close()
-        
+    
     def _on_step(self) -> bool:
         if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
             return True
         
-        # 1) Quick eval for logging and early stopping (small episode count)
-        episode_rewards, episode_lengths = self._run_eval(self.n_eval_episodes, self.eval_count)
+        # Single evaluation: all val episodes (64 workers) or fallback (no val_episodes)
+        if len(self.val_episodes) > 0:
+            n_full = len(self.val_episodes)
+            n_workers = max(1, min(self.n_val_workers, n_full))
+            if self.verbose >= 1:
+                logger.info(f"Eval num_timesteps={self.num_timesteps} ({n_full} episodes, {n_workers} workers, device={self.eval_worker_device})...")
+            # Checkpoint for workers: each worker loads this and runs its chunk (spawn avoids CUDA fork issues)
+            temp_path = self.model_save_dir / "_eval_temp.zip"
+            self.model.save(str(temp_path))
+            try:
+                chunks = np.array_split(self.val_episodes, n_workers)
+                arg_tuples = [(list(chunk), str(temp_path), self.deterministic, self.eval_worker_device) for chunk in chunks]
+                ctx = multiprocessing.get_context('spawn')
+                with ctx.Pool(n_workers) as pool:
+                    results = pool.map(_parallel_eval_worker, arg_tuples)
+                all_rewards = [r for res in results for r in res[0]]
+                all_lengths = [l for res in results for l in res[1]]
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+            episode_rewards, episode_lengths = all_rewards, all_lengths
+        else:
+            episode_rewards, episode_lengths = self._run_eval_fallback(
+                self.n_eval_episodes_fallback, self.eval_count
+            )
+        
         metrics = _compute_eval_metrics(episode_rewards, episode_lengths)
+        self.eval_count += 1
         
         self.last_mean_reward = metrics["mean_reward"]
         self.last_mean_total_reward = metrics["mean_total_reward"]
         self.last_mean_ep_length = metrics["mean_ep_length"]
         self.last_win_rate = metrics["win_rate"]
         self.last_avg_holding_time = metrics["avg_holding_time"]
-        self.eval_count += 1
         
         # Log to TensorBoard
         self.logger.record("eval/mean_reward", metrics["mean_reward"])
@@ -362,7 +379,7 @@ class DynamicEvalCallback(BaseCallback):
         
         if self.verbose >= 1:
             logger.info(
-                f"Eval (quick) num_timesteps={self.num_timesteps}, "
+                f"Eval num_timesteps={self.num_timesteps}, "
                 f"episode_reward_per_step={metrics['mean_reward']:.2f} +/- {metrics['std_reward']:.2f} "
                 f"(total: {metrics['mean_total_reward']:.2f} +/- {metrics['std_total_reward']:.2f})"
             )
@@ -371,41 +388,12 @@ class DynamicEvalCallback(BaseCallback):
                 f"Holding: avg={metrics['avg_holding_time']:.1f}, min={metrics['min_holding_time']:.0f}, max={metrics['max_holding_time']:.0f}"
             )
         
-        # 2) Full validation for best-model selection (all or many episodes), every best_model_eval_interval evals
-        run_full_eval = (
-            self.best_model_eval_interval > 0
-            and (self.eval_count - 1) % self.best_model_eval_interval == 0
-        )
-        if run_full_eval and len(self.val_episodes) > 0:
-            n_full = (
-                len(self.val_episodes)
-                if self.n_best_model_eval_episodes is None
-                else min(self.n_best_model_eval_episodes, len(self.val_episodes))
-            )
+        # Best model from same run
+        if metrics["mean_total_reward"] > self.best_mean_reward:
+            self.best_mean_reward = metrics["mean_total_reward"]
+            self.model.save(str(self.model_save_dir / "best_model.zip"))
             if self.verbose >= 1:
-                logger.info(f"Running full validation for best model ({n_full} episodes)...")
-            full_rewards, full_lengths = self._run_eval(n_full, self.eval_count + 10000)
-            full_metrics = _compute_eval_metrics(full_rewards, full_lengths)
-            mean_total_reward_full = full_metrics["mean_total_reward"]
-            if self.verbose >= 1:
-                logger.info(
-                    f"Full validation: mean_total_reward={mean_total_reward_full:.2f}, "
-                    f"win_rate={full_metrics['win_rate']:.1%} (n={n_full})"
-                )
-            if mean_total_reward_full > self.best_mean_reward:
-                self.best_mean_reward = mean_total_reward_full
-                best_model_path = self.model_save_dir / "best_model.zip"
-                self.model.save(str(best_model_path))
-                if self.verbose >= 1:
-                    logger.info(f"New best model saved (full validation reward: {mean_total_reward_full:.2f})")
-        elif run_full_eval and len(self.val_episodes) == 0:
-            # No val_episodes: use quick eval result for best model
-            if metrics["mean_total_reward"] > self.best_mean_reward:
-                self.best_mean_reward = metrics["mean_total_reward"]
-                self.model.save(str(self.model_save_dir / "best_model.zip"))
-                if self.verbose >= 1:
-                    logger.info(f"New best model saved (reward: {self.best_mean_reward:.2f})")
-        # When not run_full_eval: best model is only updated on full validation runs
+                logger.info(f"New best model saved (mean total reward: {self.best_mean_reward:.2f})")
         
         return True
 
@@ -794,7 +782,7 @@ def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
             exit_idx=episode['exit_idx'] - episode['entry_idx'],
             initial_balance=episode['initial_balance'],
             history_length=60,
-            max_steps=min(episode['episode_length'] + 100, 1000),
+            max_steps=min(episode['episode_length'] + 100, 5000),
             fee_rate=0.001
         )
         # Wrap with Monitor for statistics
@@ -802,6 +790,38 @@ def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
         env.reset(seed=seed + rank)
         return env
     return _init
+
+
+def _parallel_eval_worker(args: Tuple) -> Tuple[List[float], List[int]]:
+    """
+    Run evaluation on a chunk of episodes; used by multiprocessing.Pool (spawn).
+    At validation start a checkpoint is saved; each worker loads that checkpoint and runs its chunk.
+    args: (chunk_episodes, model_path, deterministic) or (..., device). device defaults to 'cpu'.
+    """
+    if len(args) == 4:
+        chunk_episodes, model_path, deterministic, device = args
+    else:
+        chunk_episodes, model_path, deterministic = args
+        device = 'cpu'
+    if not chunk_episodes:
+        return [], []
+    model = PPO.load(model_path, device=device)
+    rewards, lengths = [], []
+    for ep in chunk_episodes:
+        env = make_env(ep, rank=0, seed=0)()
+        obs, _ = env.reset()
+        done = False
+        total_reward = 0.0
+        steps = 0
+        while not done:
+            action, _ = model.predict(obs, deterministic=deterministic)
+            obs, reward, term, trunc, _ = env.step(action)
+            total_reward += reward
+            steps += 1
+            done = term or trunc
+        rewards.append(total_reward)
+        lengths.append(steps)
+    return rewards, lengths
 
 
 def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: int = 42) -> callable:
@@ -825,7 +845,7 @@ def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: 
             all_tickers_data=all_tickers_data,
             initial_balance=INITIAL_BALANCE,
             history_length=60,
-            max_steps=1000,
+            max_steps=5000,
             fee_rate=0.001
         )
         # Wrap with Monitor for statistics
@@ -922,20 +942,19 @@ def train_ppo_agent(
     # Use validation episodes if available, otherwise use val_tickers_data with technical signals
     if len(val_episodes) > 0:
         eval_env_factory = create_eval_env_factory(val_episodes, seed=123)
-        n_eval_envs = min(EVAL_EPISODES, len(val_episodes), 10)
-        logger.info(f"Evaluation using {len(val_episodes)} validation episodes")
+        n_eval_envs = min(EVAL_EPISODES_FALLBACK, len(val_episodes), 10)
+        logger.info(f"Evaluation using {len(val_episodes)} validation episodes ({N_VAL_WORKERS} workers)")
     else:
-        # No validation episodes - use val_tickers_data with technical signals
         eval_env_factory = create_env_factory(val_tickers_data, seed=123)
-        n_eval_envs = min(EVAL_EPISODES, 10)
-        logger.info(f"Evaluation using validation data with technical signals ({VAL_START_DATE} to {VAL_END_DATE})")
+        n_eval_envs = min(EVAL_EPISODES_FALLBACK, 10)
+        logger.info(f"Evaluation using validation data ({VAL_START_DATE} to {VAL_END_DATE})")
     
     eval_env = make_vec_env(
         eval_env_factory,
         n_envs=n_eval_envs,
         vec_env_cls=DummyVecEnv
     )
-    logger.info(f"Created {n_eval_envs} evaluation environments for {EVAL_EPISODES} episodes")
+    logger.info("Eval callback will run full validation (all episodes, parallel workers) every eval")
     
     # Create PPO model with more complex architecture
     logger.info("Creating PPO model with complex architecture...")
@@ -1032,14 +1051,13 @@ def train_ppo_agent(
         val_episodes=val_episodes,
         all_tickers_data=val_tickers_data,
         eval_freq=EVAL_FREQ,
-        n_eval_episodes=EVAL_EPISODES,
         model_save_dir=model_save_dir,
         log_path=model_save_dir / "eval_logs",
         deterministic=True,
         verbose=1,
-        n_best_model_eval_episodes=BEST_MODEL_EVAL_EPISODES,
-        best_model_eval_interval=BEST_MODEL_EVAL_INTERVAL,
-        n_eval_envs=N_EVAL_ENVS,
+        n_val_workers=N_VAL_WORKERS,
+        n_eval_episodes_fallback=EVAL_EPISODES_FALLBACK,
+        eval_worker_device=EVAL_WORKER_DEVICE,
     )
     callbacks.append(eval_callback)
     

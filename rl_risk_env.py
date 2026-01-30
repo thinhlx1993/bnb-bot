@@ -40,7 +40,7 @@ class RiskManagementEnv(gym.Env):
         exit_idx: Optional[int] = None,
         initial_balance: float = 100.0,
         history_length: int = 60,
-        max_steps: int = 1000,
+        max_steps: int = 5000,
         fee_rate: float = 0.001,
         render_mode: Optional[str] = None
     ):
