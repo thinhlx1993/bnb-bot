@@ -57,14 +57,14 @@ INITIAL_BALANCE = 1000.0  # Default initial balance
 # Training hyperparameters
 TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
 LEARNING_RATE = 3e-4  # Initial learning rate
-LEARNING_RATE_END = 1e-4  # Final learning rate (for linear decay)
+LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
 USE_LR_SCHEDULE = True  # Enable learning rate scheduling
 BATCH_SIZE = 256  # Batch size for stable training
 N_STEPS = 2048  # Steps per update
 N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # GAE lambda
-ENT_COEF = 0.1  # Entropy coefficient (exploration) - increased to prevent premature convergence
+ENT_COEF = 0.01  # Entropy coefficient (exploration) - increased to prevent premature convergence
 VF_COEF = 0.25  # Value function coefficient (further reduced to prevent value loss from dominating)
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
 CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conservative)
@@ -77,8 +77,12 @@ POLICY_LAYERS = [256, 256]  # Policy network hidden layers
 VALUE_LAYERS = [256, 256]   # Value network hidden layers
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
-EVAL_FREQ = 5000  # Evaluate every N steps
-EVAL_EPISODES = 1000  # Number of episodes for evaluation
+EVAL_FREQ = 10000  # Evaluate every N steps
+EVAL_EPISODES = 50  # Episodes for quick validation (logging, early stopping; keep low for speed)
+# Best model selection: use full validation data for reliable pick (None = all validation episodes)
+BEST_MODEL_EVAL_EPISODES = 1000  # None = use all val episodes; or set int (e.g. 500) to cap
+BEST_MODEL_EVAL_INTERVAL = 10  # Run full eval for best-model every N evaluations (1 = every time)
+N_EVAL_ENVS = 64  # Parallel eval envs (higher = faster full validation)
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -239,10 +243,37 @@ def generate_entry_signals(ticker_df: pd.DataFrame, price: pd.Series) -> pd.Seri
     return entries.fillna(False)
 
 
+def _compute_eval_metrics(episode_rewards: List[float], episode_lengths: List[int]) -> Dict[str, float]:
+    """Compute mean/std reward, win rate, holding time from episode results."""
+    if episode_rewards and episode_lengths:
+        rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
+        mean_reward = np.mean(rewards_per_step)
+        std_reward = np.std(rewards_per_step)
+        mean_total_reward = np.mean(episode_rewards)
+        std_total_reward = np.std(episode_rewards)
+        wins = sum(1 for r in episode_rewards if r > 0)
+        win_rate = wins / len(episode_rewards)
+        avg_holding_time = np.mean(episode_lengths)
+        std_holding_time = np.std(episode_lengths)
+        min_holding_time = np.min(episode_lengths)
+        max_holding_time = np.max(episode_lengths)
+        mean_ep_length = np.mean(episode_lengths)
+    else:
+        mean_reward = std_reward = mean_total_reward = std_total_reward = 0.0
+        win_rate = avg_holding_time = std_holding_time = min_holding_time = max_holding_time = mean_ep_length = 0.0
+    return {
+        "mean_reward": mean_reward, "std_reward": std_reward,
+        "mean_total_reward": mean_total_reward, "std_total_reward": std_total_reward,
+        "win_rate": win_rate, "mean_ep_length": mean_ep_length,
+        "avg_holding_time": avg_holding_time, "std_holding_time": std_holding_time,
+        "min_holding_time": min_holding_time, "max_holding_time": max_holding_time,
+    }
+
+
 class DynamicEvalCallback(BaseCallback):
     """
-    Custom evaluation callback that recreates environments with different episodes each evaluation.
-    This ensures evaluation uses diverse episodes and reflects actual learning progress.
+    Two-tier evaluation: quick eval for logging (fast), full validation for best-model selection.
+    Best model is chosen by performance on all (or many) validation episodes, not a small sample.
     """
     
     def __init__(
@@ -254,129 +285,128 @@ class DynamicEvalCallback(BaseCallback):
         model_save_dir: Path,
         log_path: Path,
         deterministic: bool = True,
-        verbose: int = 1
+        verbose: int = 1,
+        n_best_model_eval_episodes: Optional[int] = None,
+        best_model_eval_interval: int = 1,
+        n_eval_envs: int = 16,
     ):
         super().__init__(verbose=verbose)
         self.val_episodes = val_episodes
-        self.all_tickers_data = all_tickers_data  # Fallback when no val_episodes
+        self.all_tickers_data = all_tickers_data
         self.eval_freq = eval_freq
         self.n_eval_episodes = n_eval_episodes
         self.model_save_dir = model_save_dir
         self.log_path = log_path
         self.deterministic = deterministic
+        self.n_best_model_eval_episodes = n_best_model_eval_episodes  # None = all val episodes
+        self.best_model_eval_interval = best_model_eval_interval
+        self.n_eval_envs = n_eval_envs
         self.last_mean_reward = None
-        self.last_mean_total_reward = None  # Total reward (not normalized by episode length)
+        self.last_mean_total_reward = None
         self.last_mean_ep_length = None
-        self.last_win_rate = None  # Win rate (positive rewards / total episodes)
-        self.last_avg_holding_time = None  # Average holding time per episode
+        self.last_win_rate = None
+        self.last_avg_holding_time = None
         self.best_mean_reward = float('-inf')
         self.eval_count = 0
         
         log_path.mkdir(parents=True, exist_ok=True)
+    
+    def _run_eval(self, n_episodes: int, seed_offset: int) -> Tuple[List[float], List[int]]:
+        """Run evaluate_policy for n_episodes; return episode_rewards, episode_lengths."""
+        n_envs = min(self.n_eval_envs, n_episodes)
+        if len(self.val_episodes) > 0:
+            factory = create_eval_env_factory(self.val_episodes, seed=123 + seed_offset)
+            n_envs = min(n_envs, len(self.val_episodes))
+        else:
+            factory = create_env_factory(self.all_tickers_data, seed=123 + seed_offset)
+        env = make_vec_env(factory, n_envs=n_envs, vec_env_cls=DummyVecEnv)
+        try:
+            rewards, lengths = evaluate_policy(
+                self.model,
+                env,
+                n_eval_episodes=n_episodes,
+                deterministic=self.deterministic,
+                return_episode_rewards=True,
+            )
+            return rewards, lengths
+        finally:
+            env.close()
         
     def _on_step(self) -> bool:
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            # Use validation episodes if available, otherwise use all_tickers_data
-            if len(self.val_episodes) > 0:
-                eval_env_factory = create_eval_env_factory(self.val_episodes, seed=123 + self.eval_count)
-                n_eval_envs = min(self.n_eval_episodes, len(self.val_episodes), 10)
-            else:
-                # Fallback: use all_tickers_data with technical signals
-                eval_env_factory = create_env_factory(self.all_tickers_data, seed=123 + self.eval_count)
-                n_eval_envs = min(self.n_eval_episodes, 10)
-            
-            eval_env = make_vec_env(
-                eval_env_factory,
-                n_envs=n_eval_envs,
-                vec_env_cls=DummyVecEnv
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+        
+        # 1) Quick eval for logging and early stopping (small episode count)
+        episode_rewards, episode_lengths = self._run_eval(self.n_eval_episodes, self.eval_count)
+        metrics = _compute_eval_metrics(episode_rewards, episode_lengths)
+        
+        self.last_mean_reward = metrics["mean_reward"]
+        self.last_mean_total_reward = metrics["mean_total_reward"]
+        self.last_mean_ep_length = metrics["mean_ep_length"]
+        self.last_win_rate = metrics["win_rate"]
+        self.last_avg_holding_time = metrics["avg_holding_time"]
+        self.eval_count += 1
+        
+        # Log to TensorBoard
+        self.logger.record("eval/mean_reward", metrics["mean_reward"])
+        self.logger.record("eval/mean_ep_length", metrics["mean_ep_length"])
+        self.logger.record("eval/std_reward", metrics["std_reward"])
+        self.logger.record("eval/mean_total_reward", metrics["mean_total_reward"])
+        self.logger.record("eval/std_total_reward", metrics["std_total_reward"])
+        self.logger.record("eval/win_rate", metrics["win_rate"])
+        self.logger.record("eval/avg_holding_time", metrics["avg_holding_time"])
+        self.logger.record("eval/std_holding_time", metrics["std_holding_time"])
+        self.logger.record("eval/min_holding_time", metrics["min_holding_time"])
+        self.logger.record("eval/max_holding_time", metrics["max_holding_time"])
+        self.logger.dump(step=self.num_timesteps)
+        
+        if self.verbose >= 1:
+            logger.info(
+                f"Eval (quick) num_timesteps={self.num_timesteps}, "
+                f"episode_reward_per_step={metrics['mean_reward']:.2f} +/- {metrics['std_reward']:.2f} "
+                f"(total: {metrics['mean_total_reward']:.2f} +/- {metrics['std_total_reward']:.2f})"
             )
-            
-            # Evaluate current model and get episode rewards/lengths
-            episode_rewards, episode_lengths = evaluate_policy(
-                self.model,
-                eval_env,
-                n_eval_episodes=self.n_eval_episodes,
-                deterministic=self.deterministic,
-                return_episode_rewards=True
+            logger.info(
+                f"Episode length: {metrics['mean_ep_length']:.2f}, Win rate: {metrics['win_rate']:.1%}, "
+                f"Holding: avg={metrics['avg_holding_time']:.1f}, min={metrics['min_holding_time']:.0f}, max={metrics['max_holding_time']:.0f}"
             )
-            
-            # Normalize rewards by episode length to make them comparable to training
-            # Training episodes are shorter, so we normalize to reward per step
-            if episode_rewards and episode_lengths:
-                # Calculate reward per step for each episode
-                rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
-                mean_reward = np.mean(rewards_per_step)
-                std_reward = np.std(rewards_per_step)
-                # Also keep total reward for reference
-                mean_total_reward = np.mean(episode_rewards)
-                std_total_reward = np.std(episode_rewards)
-                
-                # Calculate win rate (positive rewards = wins)
-                wins = sum(1 for r in episode_rewards if r > 0)
-                win_rate = wins / len(episode_rewards)
-                
-                # Calculate holding time statistics
-                avg_holding_time = np.mean(episode_lengths)
-                std_holding_time = np.std(episode_lengths)
-                min_holding_time = np.min(episode_lengths)
-                max_holding_time = np.max(episode_lengths)
-            else:
-                mean_reward = 0.0
-                std_reward = 0.0
-                mean_total_reward = 0.0
-                std_total_reward = 0.0
-                win_rate = 0.0
-                avg_holding_time = 0.0
-                std_holding_time = 0.0
-                min_holding_time = 0.0
-                max_holding_time = 0.0
-            
-            mean_ep_length = np.mean(episode_lengths) if episode_lengths else 0.0
-            
-            # Store metrics for early stopping comparison
-            self.last_mean_reward = mean_reward
-            self.last_mean_total_reward = mean_total_reward  # Total reward (not normalized)
-            self.last_mean_ep_length = mean_ep_length
-            self.last_win_rate = win_rate
-            self.last_avg_holding_time = avg_holding_time
-            self.eval_count += 1
-            
-            # Log to TensorBoard (same format as EvalCallback)
-            self.logger.record("eval/mean_reward", mean_reward)
-            self.logger.record("eval/mean_ep_length", mean_ep_length)
-            self.logger.record("eval/std_reward", std_reward)
-            self.logger.record("eval/mean_total_reward", mean_total_reward)
-            self.logger.record("eval/std_total_reward", std_total_reward)
-            
-            # New metrics: win rate and holding time
-            self.logger.record("eval/win_rate", win_rate)
-            self.logger.record("eval/avg_holding_time", avg_holding_time)
-            self.logger.record("eval/std_holding_time", std_holding_time)
-            self.logger.record("eval/min_holding_time", min_holding_time)
-            self.logger.record("eval/max_holding_time", max_holding_time)
-            
-            self.logger.dump(step=self.num_timesteps)
-            
-            # Log results (show both normalized and total for reference)
+        
+        # 2) Full validation for best-model selection (all or many episodes), every best_model_eval_interval evals
+        run_full_eval = (
+            self.best_model_eval_interval > 0
+            and (self.eval_count - 1) % self.best_model_eval_interval == 0
+        )
+        if run_full_eval and len(self.val_episodes) > 0:
+            n_full = (
+                len(self.val_episodes)
+                if self.n_best_model_eval_episodes is None
+                else min(self.n_best_model_eval_episodes, len(self.val_episodes))
+            )
             if self.verbose >= 1:
-                logger.info(f"Eval num_timesteps={self.num_timesteps}, "
-                          f"episode_reward_per_step={mean_reward:.2f} +/- {std_reward:.2f} "
-                          f"(total: {mean_total_reward:.2f} +/- {std_total_reward:.2f})")
-                logger.info(f"Episode length: {mean_ep_length:.2f}, Win rate: {win_rate:.1%}")
-                logger.info(f"Holding time: avg={avg_holding_time:.1f}, std={std_holding_time:.1f}, "
-                          f"min={min_holding_time:.0f}, max={max_holding_time:.0f}")
-            
-            # Save best model
-            if mean_total_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_total_reward
+                logger.info(f"Running full validation for best model ({n_full} episodes)...")
+            full_rewards, full_lengths = self._run_eval(n_full, self.eval_count + 10000)
+            full_metrics = _compute_eval_metrics(full_rewards, full_lengths)
+            mean_total_reward_full = full_metrics["mean_total_reward"]
+            if self.verbose >= 1:
+                logger.info(
+                    f"Full validation: mean_total_reward={mean_total_reward_full:.2f}, "
+                    f"win_rate={full_metrics['win_rate']:.1%} (n={n_full})"
+                )
+            if mean_total_reward_full > self.best_mean_reward:
+                self.best_mean_reward = mean_total_reward_full
                 best_model_path = self.model_save_dir / "best_model.zip"
                 self.model.save(str(best_model_path))
                 if self.verbose >= 1:
-                    logger.info(f"New best model saved with mean total reward: {mean_total_reward:.2f}")
-            
-            # Clean up
-            eval_env.close()
-            
+                    logger.info(f"New best model saved (full validation reward: {mean_total_reward_full:.2f})")
+        elif run_full_eval and len(self.val_episodes) == 0:
+            # No val_episodes: use quick eval result for best model
+            if metrics["mean_total_reward"] > self.best_mean_reward:
+                self.best_mean_reward = metrics["mean_total_reward"]
+                self.model.save(str(self.model_save_dir / "best_model.zip"))
+                if self.verbose >= 1:
+                    logger.info(f"New best model saved (reward: {self.best_mean_reward:.2f})")
+        # When not run_full_eval: best model is only updated on full validation runs
+        
         return True
 
 
@@ -1000,13 +1030,16 @@ def train_ppo_agent(
     # Evaluation callback - use custom callback that recreates environments each time
     eval_callback = DynamicEvalCallback(
         val_episodes=val_episodes,
-        all_tickers_data=val_tickers_data,  # Use validation data for evaluation
+        all_tickers_data=val_tickers_data,
         eval_freq=EVAL_FREQ,
         n_eval_episodes=EVAL_EPISODES,
         model_save_dir=model_save_dir,
         log_path=model_save_dir / "eval_logs",
         deterministic=True,
-        verbose=1
+        verbose=1,
+        n_best_model_eval_episodes=BEST_MODEL_EVAL_EPISODES,
+        best_model_eval_interval=BEST_MODEL_EVAL_INTERVAL,
+        n_eval_envs=N_EVAL_ENVS,
     )
     callbacks.append(eval_callback)
     
