@@ -304,6 +304,7 @@ class DynamicEvalCallback(BaseCallback):
         self.last_win_rate = None
         self.last_avg_holding_time = None
         self.best_mean_reward = float('-inf')
+        self.best_win_rate = float('-inf')
         self.eval_count = 0
         
         log_path.mkdir(parents=True, exist_ok=True)
@@ -388,13 +389,20 @@ class DynamicEvalCallback(BaseCallback):
                 f"Holding: avg={metrics['avg_holding_time']:.1f}, min={metrics['min_holding_time']:.0f}, max={metrics['max_holding_time']:.0f}"
             )
         
-        # Best model from same run
+        # Best model by mean_total_reward
         if metrics["mean_total_reward"] > self.best_mean_reward:
             self.best_mean_reward = metrics["mean_total_reward"]
             self.model.save(str(self.model_save_dir / "best_model.zip"))
             if self.verbose >= 1:
                 logger.info(f"New best model saved (mean total reward: {self.best_mean_reward:.2f})")
-        
+
+        # Best model by win_rate
+        if metrics["win_rate"] > self.best_win_rate:
+            self.best_win_rate = metrics["win_rate"]
+            self.model.save(str(self.model_save_dir / "best_model_win_rate.zip"))
+            if self.verbose >= 1:
+                logger.info(f"New best win-rate model saved (win rate: {self.best_win_rate:.1%})")
+
         return True
 
 
