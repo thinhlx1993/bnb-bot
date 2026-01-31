@@ -7,15 +7,12 @@ import sys
 from pathlib import Path
 import pickle
 import multiprocessing
-import numpy as np
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime
-import warnings
-warnings.filterwarnings('ignore')
 
-# RL imports
+# RL imports (Gym deprecation warnings are filtered by FilteredStderr)
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
@@ -72,6 +69,21 @@ CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conserv
 
 # Reward normalization settings
 USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stable training
+
+# Parallel training configuration (inspired by ElegantRL's multiprocessing approach)
+USE_PARALLEL_ENVS = True  # Use SubprocVecEnv for true parallel training (like ElegantRL)
+# When True: Uses multiprocessing to run environments in parallel processes
+# When False: Uses DummyVecEnv for sequential execution (slower but simpler)
+N_ENVS = None  # Number of parallel environments (None = auto-detect CPU count, or set to specific number)
+# Note: SubprocVecEnv uses multiprocessing, so each env runs in a separate process
+# Recommended: Set to CPU count or slightly less (e.g., cpu_count() - 1 to leave one core free)
+# Auto-detection happens in train_ppo_agent() function
+# Performance: Parallel training can significantly speed up data collection by utilizing multiple CPU cores
+
+# Multiprocessing start method (like ElegantRL)
+# 'spawn' for Windows, 'forkserver' for Linux (more stable than 'fork' with CUDA)
+# ElegantRL uses 'spawn' on Windows and 'forkserver' on Linux to avoid CUDA fork issues
+MULTIPROCESSING_START_METHOD = 'forkserver' if os.name != 'nt' else 'spawn'
 
 # Model architecture configuration
 POLICY_LAYERS = [256, 256]  # Policy network hidden layers
@@ -902,11 +914,11 @@ def train_ppo_agent(
     model_save_dir: Path,
     tensorboard_log_dir: Path,
     total_timesteps: int = TOTAL_TIMESTEPS,
-    n_envs: int = 32,
+    n_envs: Optional[int] = None,
     val_tickers_data: Optional[Dict[str, Dict[str, pd.Series]]] = None
 ):
     """
-    Train PPO agent on all tickers' data.
+    Train PPO agent on all tickers' data with parallel environment collection.
     
     Args:
         all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for training
@@ -914,23 +926,52 @@ def train_ppo_agent(
         model_save_dir: Directory to save models
         tensorboard_log_dir: Directory for TensorBoard logs
         total_timesteps: Total training steps
-        n_envs: Number of parallel environments
+        n_envs: Number of parallel environments (None = use N_ENVS from config)
         val_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for validation/evaluation
     """
     # Use validation tickers data if provided, otherwise use training data
     if val_tickers_data is None:
         val_tickers_data = all_tickers_data
+    
+    # Set number of environments (auto-detect if not set)
+    if n_envs is None:
+        if N_ENVS is None:
+            cpu_count = os.cpu_count() or 4  # Fallback to 4 if cpu_count() returns None
+            n_envs = max(1, cpu_count - 1)  # Use all but one CPU core by default
+            logger.info(f"Auto-detected CPU count: {cpu_count}, using {n_envs} parallel environments")
+        else:
+            n_envs = N_ENVS
+    
     logger.info("="*60)
     logger.info("Training PPO Agent")
     logger.info("="*60)
     
+    # Set multiprocessing start method (like ElegantRL)
+    # This must be done before creating SubprocVecEnv
+    try:
+        multiprocessing.set_start_method(MULTIPROCESSING_START_METHOD, force=True)
+        logger.info(f"Multiprocessing start method set to: {MULTIPROCESSING_START_METHOD}")
+    except RuntimeError as e:
+        # Start method already set, which is fine
+        logger.info(f"Multiprocessing start method already set: {multiprocessing.get_start_method()}")
+    
+    # Choose vectorized environment class based on configuration
+    if USE_PARALLEL_ENVS:
+        vec_env_cls = SubprocVecEnv
+        env_type = "parallel (SubprocVecEnv)"
+        logger.info(f"Using parallel training with {n_envs} environments (true multiprocessing)")
+    else:
+        vec_env_cls = DummyVecEnv
+        env_type = "sequential (DummyVecEnv)"
+        logger.info(f"Using sequential training with {n_envs} environments")
+    
     # Create vectorized environments
-    logger.info(f"Creating {n_envs} parallel environments...")
+    logger.info(f"Creating {n_envs} {env_type} environments...")
     train_env_factory = create_env_factory(all_tickers_data, seed=42)
     train_env = make_vec_env(
         train_env_factory,
         n_envs=n_envs,
-        vec_env_cls=DummyVecEnv  # Use DummyVecEnv for simplicity
+        vec_env_cls=vec_env_cls
     )
     
     # Apply reward and observation normalization for stable training
@@ -1095,9 +1136,13 @@ def train_ppo_agent(
     
     # Train model
     logger.info(f"\nStarting training for {total_timesteps} timesteps...")
+    logger.info(f"Parallel training: {USE_PARALLEL_ENVS} ({env_type})")
+    logger.info(f"Number of parallel environments: {n_envs}")
     logger.info(f"Checkpoints will be saved every {CHECKPOINT_FREQ} steps")
     logger.info(f"Evaluation every {EVAL_FREQ} steps")
     logger.info(f"TensorBoard logs: {tensorboard_log_dir}")
+    if USE_PARALLEL_ENVS:
+        logger.info(f"Performance tip: Parallel training should utilize {n_envs} CPU cores for faster data collection")
     
     try:
         model.learn(
@@ -1341,7 +1386,7 @@ def main():
         MODEL_SAVE_DIR,
         TENSORBOARD_LOG_DIR,
         total_timesteps=TOTAL_TIMESTEPS,
-        n_envs=16,
+        n_envs=None,  # Use N_ENVS from config (auto-detected or manually set)
         val_tickers_data=val_tickers_data  # Pass validation data for evaluation
     )
     
