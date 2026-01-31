@@ -56,6 +56,8 @@ EVAL_END_DATE = "2026-01-24"    # YYYY-MM-DD format, or None for all data
 # Test configuration
 USE_RL_RISK_MANAGEMENT = True  # Enable RL risk management
 USE_RULE_BASED_BASELINE = True  # Also test rule-based for comparison
+# Cap steps per position during evaluation (avoids ~5000 model.predict per entry)
+MAX_STEPS_PER_ENTRY_EVAL = 5000
 
 
 def load_test_data(
@@ -279,6 +281,7 @@ def evaluate_rl_agent(
                 model_name=model_name,
                 initial_balance=INITIAL_BALANCE
             )
+            logger.info(f"Using device: {rl_manager.model.device}")
         except Exception as e:
             logger.error(f"Error loading RL model: {e}")
             logger.error("Falling back to rule-based baseline")
@@ -289,7 +292,10 @@ def evaluate_rl_agent(
     balance = pd.Series(INITIAL_BALANCE, index=price.index)
     
     # Apply RL risk management
-    exits_rl = rl_manager.apply_rl_risk_management(entries, exits.copy(), price, balance)
+    exits_rl = rl_manager.apply_rl_risk_management(
+        entries, exits.copy(), price, balance,
+        max_steps_per_entry=MAX_STEPS_PER_ENTRY_EVAL
+    )
     
     # Backtest
     portfolio_rl = backtest_strategy(price, entries, exits_rl, ticker)
@@ -693,6 +699,7 @@ def main(
                 initial_balance=INITIAL_BALANCE
             )
             logger.info("RL model loaded successfully")
+            logger.info(f"Using device: {rl_manager.model.device}")
         except Exception as e:
             logger.error(f"Error loading RL model: {e}")
             logger.error("RL evaluation will be skipped")

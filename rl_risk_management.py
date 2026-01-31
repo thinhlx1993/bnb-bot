@@ -10,6 +10,7 @@ import pandas as pd
 from typing import Optional, Tuple, Dict, Any
 import logging
 from tqdm import tqdm
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -91,8 +92,9 @@ class RLRiskManager:
         
         logger.info(f"Loading RL model from: {model_file}")
         try:
-            self.model = PPO.load(str(model_file))
-            logger.info("RL model loaded successfully")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model = PPO.load(str(model_file), device=device)
+            logger.info(f"RL model loaded successfully (device={device})")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
