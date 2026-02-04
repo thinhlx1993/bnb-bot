@@ -1,6 +1,7 @@
 """
 RL Risk Management Integration
 Wrapper to integrate trained RL agent with existing backtest system.
+Uses SBX (Stable Baselines Jax) for faster inference.
 """
 
 import sys
@@ -10,8 +11,7 @@ import pandas as pd
 from typing import Optional, Tuple, Dict, Any
 import logging
 from tqdm import tqdm
-import torch
-from stable_baselines3 import PPO
+from sbx import PPO  # Using SBX (JAX-based) for faster inference
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 # Import custom environment
@@ -92,9 +92,9 @@ class RLRiskManager:
         
         logger.info(f"Loading RL model from: {model_file}")
         try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.model = PPO.load(str(model_file), device=device)
-            logger.info(f"RL model loaded successfully (device={device})")
+            # SBX (JAX-based) automatically handles device selection efficiently
+            self.model = PPO.load(str(model_file))
+            logger.info(f"RL model loaded successfully (SBX/JAX - automatic device selection)")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
@@ -209,43 +209,116 @@ class RLRiskManager:
             return exits_with_rl
         
         logger.info(f"Applying RL risk management: {n_entries} entries in {n_periods} periods")
+        logger.info(f"Using exit signals for episode boundaries (max_steps={self.max_steps} as safety limit only)")
         
         # Track RL decisions
         rl_exit_count = 0
         rl_hold_count = 0
+        rl_early_exits = 0  # Count exits that happen before original exit signal
+        rl_at_signal_exits = 0  # Count exits that happen at the same time as exit signal
+        
+        # Find exit signal indices upfront
+        exits_arr = exits.values
+        exit_indices = np.where(exits_arr)[0]
         
         # Process each entry point
-        pbar = tqdm(entry_indices, desc="Processing entries", unit="entry")
+        pbar = tqdm(entry_indices, desc="Processing entries", unit="entry", mininterval=1.0, maxinterval=5.0)
         for entry_idx in pbar:
             entry_price = float(price.iloc[entry_idx])
             
+            # Find next exit signal after this entry
+            exit_signal_idx = None
+            exits_after_entry = exit_indices[exit_indices > entry_idx]
+            if len(exits_after_entry) > 0:
+                exit_signal_idx = exits_after_entry[0]
+            
+            # Determine window end: use exit signal if available, otherwise use end of data
+            if exit_signal_idx is not None:
+                window_end = exit_signal_idx + 1  # Include exit signal
+            else:
+                window_end = n_periods  # End of data
+            
             # Create a mini-environment for this position
-            # Window: from (entry - history) to end of data (or max_steps ahead)
+            # Window: from (entry - history) to exit signal (or end of data)
             window_start = max(0, entry_idx - self.history_length)
-            window_end = min(entry_idx + self.max_steps + 100, n_periods)
+            window_end = min(window_end, n_periods)
             
             price_window = price.iloc[window_start:window_end].copy()
             balance_window = balance.iloc[window_start:window_end].copy()
             
+            # Create exit signals series for this window (if exit signal exists)
+            exit_signals_window = None
+            if exit_signal_idx is not None:
+                exit_signals_window = pd.Series(False, index=price_window.index)
+                # Set exit signal at the relative position in window
+                exit_idx_in_window = exit_signal_idx - window_start
+                if 0 <= exit_idx_in_window < len(exit_signals_window):
+                    exit_signals_window.iloc[exit_idx_in_window] = True
+            
             # Create environment for this position
+            # Use all_tickers_data mode to support exit signals
+            all_tickers_data = {
+                'single_ticker': {
+                    'price': price_window,
+                    'balance': balance_window,
+                    'entry_signals': pd.Series(False, index=price_window.index),  # Not used in legacy mode
+                    'exit_signals': exit_signals_window
+                }
+            }
+            
             env = RiskManagementEnv(
-                price_data=price_window,
-                balance_data=balance_window,
-                entry_price=entry_price,
-                entry_idx=entry_idx - window_start,  # Relative to window
-                exit_idx=len(price_window) - 1,  # End of window
+                all_tickers_data=all_tickers_data,
                 initial_balance=self.initial_balance,
                 history_length=self.history_length,
-                max_steps=self.max_steps,
+                max_steps=self.max_steps,  # Not used for termination, but kept for compatibility
                 fee_rate=self.fee_rate
             )
             
-            # Reset environment to get initial observation
-            obs, _ = env.reset()
+            # Manually set entry point (since we're using all_tickers_data mode)
+            env.current_ticker = 'single_ticker'
+            env.price_data = price_window
+            env.balance_data = balance_window
+            env.exit_signals = exit_signals_window
+            env.entry_price = entry_price
+            env.entry_idx = entry_idx - window_start  # Relative to window
+            env.exit_signal_idx = exit_signal_idx - window_start if exit_signal_idx is not None else None
             
-            # Run RL agent for this position until it decides to exit
+            # Set exit_idx
+            if exit_signal_idx is not None:
+                env.exit_idx = exit_signal_idx - window_start
+            else:
+                env.exit_idx = len(price_window) - 1
+            
+            # Set up episode windows
+            env.episode_start_idx = env.entry_idx
+            env.episode_end_idx = env.exit_idx
+            env.episode_length = env.exit_idx - env.entry_idx + 1
+            env.data_start_idx = max(0, env.entry_idx - env.history_length)
+            env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+            env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+            
+            # Reset episode tracking
+            env.current_step = 0
+            env.current_idx = 0
+            env.position_open = True
+            env.peak_balance = self.initial_balance
+            env.max_drawdown = 0.0
+            env.total_reward = 0.0
+            env.episode_return = 0.0
+            env.returns_history = []
+            env.wins = 0
+            env.total_trades = 0
+            env.entry_balance = self.initial_balance
+            env.episode_max_price = env.entry_price
+            env.episode_min_price = env.entry_price
+            
+            # Get initial observation
+            obs = env._get_observation()
+            
+            # Run RL agent for this position until it decides to exit or reaches exit signal
             done = False
             position_step = 0
+            update_interval = max(1, env.episode_length // 10) if env.episode_length > 0 else 10
             
             while not done:
                 # Query RL agent
@@ -256,11 +329,28 @@ class RLRiskManager:
                 done = terminated or truncated
                 position_step += 1
                 
-                if action in [1, 2]:  # Close actions
+                # Update progress periodically
+                if position_step % update_interval == 0:
+                    pbar.set_postfix({
+                        'entry': f"{pbar.n+1}/{n_entries}",
+                        'steps': position_step,
+                        'exits': rl_exit_count,
+                        'holds': rl_hold_count
+                    })
+                
+                if action == 1:  # Close action
                     # Calculate actual exit index in original price series
                     exit_idx = entry_idx + position_step
                     if exit_idx < n_periods:
+                        # Check if this exit is new (not in original exits)
+                        is_new_exit = not exits.iloc[exit_idx]
                         exits_with_rl.iloc[exit_idx] = True
+                        
+                        # Track if this is an early exit (before exit signal)
+                        if exit_signal_idx is not None and exit_idx < exit_signal_idx:
+                            rl_early_exits += 1
+                        elif exit_signal_idx is not None and exit_idx == exit_signal_idx:
+                            rl_at_signal_exits += 1
                     else:
                         exits_with_rl.iloc[n_periods - 1] = True
                     rl_exit_count += 1
@@ -268,14 +358,25 @@ class RLRiskManager:
                 else:  # Hold
                     rl_hold_count += 1
                 
-                # Safety: max steps reached
-                if position_step >= self.max_steps:
-                    exit_idx = min(entry_idx + position_step, n_periods - 1)
-                    exits_with_rl.iloc[exit_idx] = True
-                    rl_exit_count += 1
+                # Check if we've reached exit signal (episode will terminate via truncated)
+                if done and truncated and exit_signal_idx is not None:
+                    # Reached exit signal, use it as exit
+                    # This means agent held until exit signal (didn't close early)
+                    if exit_signal_idx < n_periods:
+                        # Check if this exit is new (not in original exits)
+                        is_new_exit = not exits.iloc[exit_signal_idx]
+                        exits_with_rl.iloc[exit_signal_idx] = True
+                        if is_new_exit:
+                            # This shouldn't happen often since exit signals come from original exits
+                            pass
+                    # Don't increment rl_exit_count here - this is the exit signal, not agent's decision
                     break
             
-            pbar.set_postfix({'exits': rl_exit_count, 'holds': rl_hold_count})
+            pbar.set_postfix({
+                'entry': f"{pbar.n+1}/{n_entries}",
+                'exits': rl_exit_count,
+                'holds': rl_hold_count
+            })
         
         pbar.close()
         
@@ -290,6 +391,9 @@ class RLRiskManager:
         logger.info(f"    RL-added exits: {rl_added_exits}")
         logger.info(f"    Total exits: {new_exits}")
         logger.info(f"    RL decisions - Hold: {rl_hold_count}, Close: {rl_exit_count}")
+        logger.info(f"    RL early exits (before signal): {rl_early_exits}")
+        logger.info(f"    RL exits at signal time: {rl_at_signal_exits}")
+        logger.info(f"    RL held until signal: {n_entries - rl_exit_count}")
         
         return exits_with_rl
     

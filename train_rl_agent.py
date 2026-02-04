@@ -1,9 +1,11 @@
 """
-Train RL Risk Management Agent using Stable-Baselines3 PPO
+Train RL Risk Management Agent using SBX (Stable Baselines Jax) PPO
+SBX provides faster training through JAX JIT compilation and efficient computation.
 """
 
 import os
 import sys
+import numpy as np
 from pathlib import Path
 import pickle
 import multiprocessing
@@ -12,8 +14,14 @@ from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime
 
-# RL imports (Gym deprecation warnings are filtered by FilteredStderr)
-from stable_baselines3 import PPO
+# Configure JAX before importing SBX
+# Set device priority: CUDA > CPU (skip TPU to avoid warnings)
+os.environ['JAX_PLATFORMS'] = 'cuda,cpu'  # Use CUDA if available, otherwise CPU (skip TPU)
+
+# RL imports - Using SBX (Stable Baselines Jax) for faster training
+import jax
+import jax.numpy as jnp
+from sbx import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
@@ -24,8 +32,6 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.evaluation import evaluate_policy
-import torch
-import torch.nn as nn
 
 # Custom environment
 from rl_risk_env import RiskManagementEnv
@@ -41,6 +47,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configure JAX device selection: CUDA > CPU (skip TPU)
+# This suppresses TPU warnings and sets device priority
+try:
+    # Try to use CUDA if available
+    cuda_devices = jax.devices('gpu')
+    if len(cuda_devices) > 0:
+        logger.info(f"JAX using CUDA: {len(cuda_devices)} GPU(s) available")
+        jax.config.update('jax_default_device', cuda_devices[0])
+    else:
+        logger.info("JAX using CPU (CUDA not available)")
+        jax.config.update('jax_default_device', jax.devices('cpu')[0])
+except Exception as e:
+    # Fallback to CPU if CUDA setup fails
+    logger.info(f"JAX using CPU (CUDA setup failed: {e})")
+    jax.config.update('jax_default_device', jax.devices('cpu')[0])
+
 # Configuration
 TRAINING_DATA_DIR = Path("rl_training_episodes")
 MODEL_SAVE_DIR = Path("models/rl_agent")
@@ -53,7 +75,7 @@ TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"
 INITIAL_BALANCE = 1000.0  # Default initial balance
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 5e6  # Total training steps (use early stopping)
+TOTAL_TIMESTEPS = 5e7  # Total training steps (use early stopping)
 LEARNING_RATE = 3e-4  # Initial learning rate
 LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
 USE_LR_SCHEDULE = True  # Enable learning rate scheduling
@@ -69,6 +91,12 @@ CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conserv
 
 # Reward normalization settings
 USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stable training
+
+# Device configuration
+# Note: SBX (JAX-based) automatically handles device selection efficiently
+# JAX can use CPU or GPU/TPU automatically based on availability
+# For MLP policies, both CPU and GPU work well with JAX's efficient computation
+USE_GPU = False  # SBX will use GPU if available and USE_GPU=True, otherwise CPU (both are efficient with JAX)
 
 # Parallel training configuration (inspired by ElegantRL's multiprocessing approach)
 USE_PARALLEL_ENVS = True  # Use SubprocVecEnv for true parallel training (like ElegantRL)
@@ -90,10 +118,7 @@ POLICY_LAYERS = [256, 256]  # Policy network hidden layers
 VALUE_LAYERS = [256, 256]   # Value network hidden layers
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
-EVAL_FREQ = 10000  # Evaluate every N steps (single run: all val episodes, N_VAL_WORKERS)
-N_VAL_WORKERS = 16  # Workers: episodes split across workers; use fewer (e.g. 8) if EVAL_WORKER_DEVICE='cuda'
-EVAL_WORKER_DEVICE = 'cuda'  # Device in each worker: 'cpu' or 'cuda' (spawn loads checkpoint per worker)
-EVAL_EPISODES_FALLBACK = 50  # Episodes when no val_episodes (e.g. val_tickers_data only)
+EVAL_FREQ = 50000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -123,6 +148,7 @@ EVAL_END_DATE = "2026-01-24"              # End date for evaluation (None = end 
 
 # Technical indicator settings for entry signal generation
 USE_TECHNICAL_SIGNALS = True  # Use technical signals for entry points (if False, random entry)
+USE_BACKTEST_SIGNALS = True   # Use shared entry_signal_generator (same as evaluate/live); if False, use in-file crossover signals
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
@@ -222,6 +248,48 @@ def identify_rsi_signals(price: pd.Series, rsi: pd.Series) -> pd.Series:
     return entries.fillna(False)
 
 
+def identify_macd_exit_signals(price: pd.Series, macd: pd.Series, signal: pd.Series, histogram: pd.Series) -> pd.Series:
+    """
+    Identify MACD-based exit signals (bearish divergence / crossover).
+    
+    Returns:
+        Boolean series where True indicates a sell signal
+    """
+    exits = pd.Series(False, index=price.index)
+    
+    # MACD line crosses below signal line (bearish crossover)
+    macd_cross_down = (macd < signal) & (macd.shift(1) >= signal.shift(1))
+    
+    # Histogram turns negative (momentum shift)
+    hist_negative = (histogram < 0) & (histogram.shift(1) >= 0)
+    
+    # Combine signals
+    exits = macd_cross_down | hist_negative
+    
+    return exits.fillna(False)
+
+
+def identify_rsi_exit_signals(price: pd.Series, rsi: pd.Series) -> pd.Series:
+    """
+    Identify RSI-based exit signals (overbought reversal).
+    
+    Returns:
+        Boolean series where True indicates a sell signal
+    """
+    exits = pd.Series(False, index=price.index)
+    
+    # RSI crosses below overbought level (70) - potential reversal
+    rsi_cross_down = (rsi < RSI_OVERBOUGHT) & (rsi.shift(1) >= RSI_OVERBOUGHT)
+    
+    # RSI was overbought and now falling
+    rsi_falling = (rsi > 50) & (rsi < rsi.shift(1)) & (rsi.shift(1) > RSI_OVERBOUGHT - 10)
+    
+    # Combine signals
+    exits = rsi_cross_down | rsi_falling
+    
+    return exits.fillna(False)
+
+
 def generate_entry_signals(ticker_df: pd.DataFrame, price: pd.Series) -> pd.Series:
     """
     Generate combined entry signals from multiple technical indicators.
@@ -254,16 +322,82 @@ def generate_entry_signals(ticker_df: pd.DataFrame, price: pd.Series) -> pd.Seri
     return entries.fillna(False)
 
 
-def _compute_eval_metrics(episode_rewards: List[float], episode_lengths: List[int]) -> Dict[str, float]:
-    """Compute mean/std reward, win rate, holding time from episode results."""
+def generate_exit_signals(ticker_df: pd.DataFrame, price: pd.Series) -> pd.Series:
+    """
+    Generate combined exit signals from multiple technical indicators.
+    
+    Args:
+        ticker_df: DataFrame with OHLCV data
+        price: Close price series
+    
+    Returns:
+        Boolean series where True indicates a sell signal
+    """
+    exits = pd.Series(False, index=price.index)
+    
+    try:
+        # MACD exit signals
+        macd, signal, histogram = calculate_macd(ticker_df)
+        macd_exits = identify_macd_exit_signals(price, macd, signal, histogram)
+        exits = exits | macd_exits
+        
+        # RSI exit signals
+        rsi = calculate_rsi(price)
+        rsi_exits = identify_rsi_exit_signals(price, rsi)
+        exits = exits | rsi_exits
+        
+    except Exception as e:
+        logger.warning(f"Error generating exit signals: {e}")
+        # Return empty signals on error
+        return pd.Series(False, index=price.index)
+    
+    return exits.fillna(False)
+
+
+def _win_rate_from_returns(episode_returns: List[float]) -> Tuple[float, int, int]:
+    """
+    Win rate = fraction of episodes with positive balance (positive realized return).
+    An episode is a win when episode_return > 0.
+    Returns (win_rate, wins, n_episodes).
+    """
+    if not episode_returns:
+        return 0.0, 0, 0
+    wins = sum(1 for r in episode_returns if r > 0)
+    return wins / len(episode_returns), wins, len(episode_returns)
+
+
+def _compute_eval_metrics(
+    episode_rewards: List[float],
+    episode_lengths: List[int],
+    episode_returns: Optional[List[float]] = None,
+    initial_balance: float = INITIAL_BALANCE,
+    failure_count: int = 0,
+) -> Dict[str, float]:
+    """
+    Compute mean/std reward, win rate, holding time, total balance, and failure count.
+    Win rate: fraction of completed episodes with positive balance (episode_return > 0).
+    Only completed episodes (that closed within max_steps) are included in metrics.
+    """
     if episode_rewards and episode_lengths:
         rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
         mean_reward = np.mean(rewards_per_step)
         std_reward = np.std(rewards_per_step)
         mean_total_reward = np.mean(episode_rewards)
         std_total_reward = np.std(episode_rewards)
-        wins = sum(1 for r in episode_rewards if r > 0)
-        win_rate = wins / len(episode_rewards)
+        
+        # Win rate = fraction of completed episodes with positive balance
+        if episode_returns is not None and len(episode_returns) == len(episode_rewards):
+            win_rate, _, _ = _win_rate_from_returns(episode_returns)
+        else:
+            win_rate = 0.0
+        
+        # Total balance: INITIAL_BALANCE + sum of all episode returns
+        # total_balance = INITIAL_BALANCE + sum(episode_returns) * INITIAL_BALANCE
+        if episode_returns is not None and len(episode_returns) > 0:
+            total_balance = initial_balance + sum(episode_returns) * initial_balance
+        else:
+            total_balance = initial_balance
+        
         avg_holding_time = np.mean(episode_lengths)
         std_holding_time = np.std(episode_lengths)
         min_holding_time = np.min(episode_lengths)
@@ -272,103 +406,289 @@ def _compute_eval_metrics(episode_rewards: List[float], episode_lengths: List[in
     else:
         mean_reward = std_reward = mean_total_reward = std_total_reward = 0.0
         win_rate = avg_holding_time = std_holding_time = min_holding_time = max_holding_time = mean_ep_length = 0.0
+        total_balance = initial_balance
     return {
         "mean_reward": mean_reward, "std_reward": std_reward,
         "mean_total_reward": mean_total_reward, "std_total_reward": std_total_reward,
         "win_rate": win_rate, "mean_ep_length": mean_ep_length,
         "avg_holding_time": avg_holding_time, "std_holding_time": std_holding_time,
         "min_holding_time": min_holding_time, "max_holding_time": max_holding_time,
+        "total_balance": total_balance,
+        "failure_count": failure_count,
     }
 
 
 class DynamicEvalCallback(BaseCallback):
     """
-    Single evaluation every eval_freq: all validation episodes split across n_val_workers.
-    One run for logging, early stopping, and best-model selection.
+    Single evaluation every eval_freq: all validation entry signals run sequentially
+    in one env (main process). Ensures metrics (balance, win rate, holding time)
+    are consistent and reflect the current model.
     """
     
     def __init__(
         self,
-        val_episodes: List[Dict],
         all_tickers_data: Dict[str, Dict[str, pd.Series]],
         eval_freq: int,
         model_save_dir: Path,
         log_path: Path,
         deterministic: bool = True,
         verbose: int = 1,
-        n_val_workers: int = 64,
-        n_eval_episodes_fallback: int = 50,
-        eval_worker_device: str = 'cpu',
     ):
         super().__init__(verbose=verbose)
-        self.val_episodes = val_episodes
         self.all_tickers_data = all_tickers_data
         self.eval_freq = eval_freq
         self.model_save_dir = model_save_dir
         self.log_path = log_path
         self.deterministic = deterministic
-        self.n_val_workers = n_val_workers
-        self.n_eval_episodes_fallback = n_eval_episodes_fallback
-        self.eval_worker_device = eval_worker_device
         self.last_mean_reward = None
         self.last_mean_total_reward = None
         self.last_mean_ep_length = None
         self.last_win_rate = None
         self.last_avg_holding_time = None
+        self.last_total_balance = None
         self.best_mean_reward = float('-inf')
         self.best_win_rate = float('-inf')
+        self.best_total_balance = float('-inf')
         self.eval_count = 0
         
         log_path.mkdir(parents=True, exist_ok=True)
     
-    def _run_eval_fallback(self, n_episodes: int, seed_offset: int) -> Tuple[List[float], List[int]]:
-        """Fallback when no val_episodes: run evaluate_policy with all_tickers_data."""
-        n_envs = min(16, n_episodes)
-        factory = create_env_factory(self.all_tickers_data, seed=123 + seed_offset)
-        env = make_vec_env(factory, n_envs=n_envs, vec_env_cls=DummyVecEnv)
+    def _run_eval_all_signals(self) -> Tuple[List[float], List[int], List[float], int, float, float]:
+        """
+        Run evaluation: one env reused for all entry signals.
+        Each entry signal = one episode. Max 1000 steps per episode.
+        Episodes that don't close within 1000 steps are marked as failures.
+        
+        Returns:
+            (episode_rewards, episode_lengths, episode_returns, failure_count, win_rate, final_balance)
+        """
+        if self.all_tickers_data is None or len(self.all_tickers_data) == 0:
+            logger.warning("No validation tickers data available for evaluation")
+            return [], [], [], 0
+        
+        # Collect all entry signals
+        all_entry_points = []
+        for ticker, ticker_data in self.all_tickers_data.items():
+            entry_signals = ticker_data.get('entry_signals')
+            if entry_signals is not None:
+                entry_indices = np.where(entry_signals.values)[0]
+                for entry_idx in entry_indices:
+                    all_entry_points.append({
+                        'ticker': ticker,
+                        'entry_idx': int(entry_idx),
+                    })
+        
+        if len(all_entry_points) == 0:
+            logger.warning("No entry signals found in validation data")
+            return [], [], [], 0
+        
+        logger.info(f"Evaluating {len(all_entry_points)} entry signals (single env, max 1000 steps per episode)...")
+        history_length = 60
+        max_steps_per_episode = 1000
+        
+        # Create ONE env that we'll reuse (will be reconfigured per episode)
+        env = RiskManagementEnv(
+            all_tickers_data={},
+            initial_balance=INITIAL_BALANCE,
+            history_length=history_length,
+            max_steps=max_steps_per_episode,
+            fee_rate=0.001
+        )
+        
+        all_rewards = []
+        all_lengths = []
+        all_episode_returns = []
+        all_episode_balances = []  # Track actual balance per episode
+        all_profits = []  # Track profit per trade (in absolute terms)
+        failure_count = 0
+        
+        # Track returns per ticker for scaling
+        ticker_returns = {}  # {ticker: [returns]}
+        ticker_completed = {}  # {ticker: count of completed episodes}
+        ticker_profits = {}  # {ticker: [profits]} - track profits per ticker
+        
         try:
-            rewards, lengths = evaluate_policy(
-                self.model,
-                env,
-                n_eval_episodes=n_episodes,
-                deterministic=self.deterministic,
-                return_episode_rewards=True,
-            )
-            return rewards, lengths
+            for ep_idx, entry_point in enumerate(all_entry_points):
+                ticker = entry_point['ticker']
+                entry_idx = entry_point['entry_idx']
+                ticker_data = self.all_tickers_data[ticker]
+                price = ticker_data['price']
+                balance = ticker_data['balance']
+                entry_price = float(price.iloc[entry_idx])
+                n_periods = len(price)
+                
+                # Window: from (entry - history) to end of data (no exit signal limit)
+                window_start = max(0, entry_idx - history_length)
+                window_end = n_periods
+                price_window = price.iloc[window_start:window_end].copy()
+                balance_window = balance.iloc[window_start:window_end].copy()
+                
+                # Configure env for this episode
+                env.use_all_tickers = False
+                env.current_ticker = ticker
+                env.price_data = price_window
+                env.balance_data = balance_window
+                env.exit_signals = None  # No exit signal, bot decides when to close
+                env.entry_price = entry_price
+                env.entry_idx = entry_idx - window_start
+                env.exit_signal_idx = None
+                env.exit_idx = len(price_window) - 1
+                env.episode_start_idx = env.entry_idx
+                env.episode_end_idx = env.exit_idx
+                env.episode_length = env.exit_idx - env.entry_idx + 1
+                env.data_start_idx = max(0, env.entry_idx - history_length)
+                env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+                env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+                env.current_step = 0
+                env.current_idx = env.entry_idx - env.data_start_idx
+                env.position_open = True
+                env.peak_balance = INITIAL_BALANCE  # Use initial balance for peak tracking
+                env.max_drawdown = 0.0
+                env.total_reward = 0.0
+                env.episode_return = 0.0
+                env.returns_history = []
+                env.wins = 0
+                env.total_trades = 0
+                env.entry_balance = INITIAL_BALANCE  # Use initial balance for each episode
+                env.episode_max_price = env.entry_price
+                env.episode_min_price = env.entry_price
+                
+                # Run episode: bot trades until it closes OR max_steps reached
+                obs = env._get_observation()
+                done = False
+                total_reward = 0.0
+                steps = 0
+                bot_closed = False
+                
+                while not done and steps < max_steps_per_episode:
+                    action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    total_reward += reward
+                    steps += 1
+                    done = terminated or truncated
+                    # Check if bot chose to close (action==1) - this means bot closed voluntarily
+                    if action == 1:
+                        bot_closed = True
+                        break  # Bot closed, episode ends
+                
+                if bot_closed:
+                    # Episode completed successfully (bot closed within max_steps)
+                    all_rewards.append(total_reward)
+                    all_lengths.append(steps)
+                    all_episode_returns.append(env.episode_return)
+                    
+                    # Calculate profit per trade: episode_return is a percentage (e.g., 0.01 = 1%)
+                    # Profit = INITIAL_BALANCE * episode_return
+                    profit_per_trade = INITIAL_BALANCE * env.episode_return
+                    all_profits.append(profit_per_trade)
+                    
+                    # Track returns per ticker for scaling
+                    if ticker not in ticker_returns:
+                        ticker_returns[ticker] = []
+                        ticker_completed[ticker] = 0
+                        ticker_profits[ticker] = []
+                    ticker_returns[ticker].append(env.episode_return)
+                    ticker_profits[ticker].append(profit_per_trade)
+                    ticker_completed[ticker] += 1
+                    
+                    # Calculate total balance: INITIAL_BALANCE + sum of all profits
+                    total_balance = INITIAL_BALANCE + sum(all_profits)
+                    all_episode_balances.append(total_balance)
+                else:
+                    # Episode failed: didn't close within max_steps (hit step limit)
+                    failure_count += 1
+                    # Don't update balance for failed episodes (position still open)
+                
+                if (ep_idx + 1) % 200 == 0 and self.verbose >= 1:
+                    completed = len(all_rewards)
+                    logger.info(f"  Progress: {ep_idx + 1}/{len(all_entry_points)} entries | Completed: {completed}, Failures: {failure_count}")
+        
         finally:
             env.close()
+        
+        self._last_episode_returns = all_episode_returns
+        self._last_episode_balances = all_episode_balances
+        
+        # Calculate total balance from profits: more reliable than using returns
+        # Total balance = INITIAL_BALANCE + sum of all profits
+        if all_profits:
+            final_balance = INITIAL_BALANCE + sum(all_profits)
+        else:
+            final_balance = INITIAL_BALANCE
+        
+        # Calculate scaled balance: normalize each ticker's contribution
+        # This ensures each ticker contributes equally regardless of trade count
+        # Method: Calculate average profit per ticker, then aggregate with equal weights
+        scaled_balance = INITIAL_BALANCE
+        if ticker_profits:
+            ticker_avg_profits = {}
+            for ticker, profits in ticker_profits.items():
+                if len(profits) > 0:
+                    ticker_avg_profits[ticker] = np.mean(profits)
+            
+            if ticker_avg_profits:
+                num_tickers = len(ticker_avg_profits)
+                # Equal weight per ticker: calculate average profit across all tickers
+                # Then scale by total number of trades to get realistic balance
+                avg_profit_per_ticker = np.mean(list(ticker_avg_profits.values()))
+                total_trades = len(all_profits)
+                
+                if total_trades > 0 and num_tickers > 0:
+                    # Each ticker contributes equally: avg_profit * total_trades
+                    scaled_total_profit = avg_profit_per_ticker * total_trades
+                    scaled_balance = INITIAL_BALANCE + scaled_total_profit
+                else:
+                    scaled_balance = INITIAL_BALANCE
+        
+        # Use scaled balance instead of final_balance for reporting
+        final_balance = scaled_balance
+        
+        # Calculate win rate: fraction of completed episodes with positive return (win)
+        win_rate, wins, n_completed = _win_rate_from_returns(all_episode_returns)
+        
+        # Note: Balance is computed from profits per trade (more reliable)
+        # episode_return = (current_price - entry_price) / entry_price - 2 * fee_rate (percentage)
+        # profit_per_trade = INITIAL_BALANCE * episode_return (absolute profit)
+        # Total balance = INITIAL_BALANCE + sum(all_profits)
+        # Scaled balance uses per-ticker scaling to prevent BTC from dominating
+        
+        # Log per-ticker statistics
+        if ticker_returns and self.verbose >= 1:
+            logger.info(f"Per-ticker statistics:")
+            for ticker, returns in ticker_returns.items():
+                ticker_win_rate, ticker_wins, ticker_n = _win_rate_from_returns(returns)
+                # Calculate ticker balance from profits (more reliable)
+                ticker_profits_list = ticker_profits.get(ticker, [])
+                if ticker_profits_list:
+                    ticker_balance = INITIAL_BALANCE + sum(ticker_profits_list)
+                else:
+                    ticker_balance = INITIAL_BALANCE + sum(returns) * INITIAL_BALANCE
+                logger.info(f"  {ticker}: {ticker_n} trades, win_rate={ticker_win_rate:.1%}, balance={ticker_balance:.2f}")
+        
+        logger.info(f"Validation complete: {len(all_rewards)} completed, {failure_count} failures (didn't close within {max_steps_per_episode} steps)")
+        logger.info(f"  Win rate: {win_rate:.1%} ({wins}/{n_completed} wins)")
+        logger.info(f"  Scaled balance (equal weight per ticker): {final_balance:.2f} (from {INITIAL_BALANCE:.2f})")
+        return all_rewards, all_lengths, all_episode_returns, failure_count, win_rate, final_balance
     
     def _on_step(self) -> bool:
         if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
             return True
         
-        # Single evaluation: all val episodes (64 workers) or fallback (no val_episodes)
-        if len(self.val_episodes) > 0:
-            n_full = len(self.val_episodes)
-            n_workers = max(1, min(self.n_val_workers, n_full))
-            if self.verbose >= 1:
-                logger.info(f"Eval num_timesteps={self.num_timesteps} ({n_full} episodes, {n_workers} workers, device={self.eval_worker_device})...")
-            # Checkpoint for workers: each worker loads this and runs its chunk (spawn avoids CUDA fork issues)
-            temp_path = self.model_save_dir / "_eval_temp.zip"
-            self.model.save(str(temp_path))
-            try:
-                chunks = np.array_split(self.val_episodes, n_workers)
-                arg_tuples = [(list(chunk), str(temp_path), self.deterministic, self.eval_worker_device) for chunk in chunks]
-                ctx = multiprocessing.get_context('spawn')
-                with ctx.Pool(n_workers) as pool:
-                    results = pool.map(_parallel_eval_worker, arg_tuples)
-                all_rewards = [r for res in results for r in res[0]]
-                all_lengths = [l for res in results for l in res[1]]
-            finally:
-                if temp_path.exists():
-                    temp_path.unlink()
-            episode_rewards, episode_lengths = all_rewards, all_lengths
-        else:
-            episode_rewards, episode_lengths = self._run_eval_fallback(
-                self.n_eval_episodes_fallback, self.eval_count
-            )
+        if self.verbose >= 1:
+            logger.info(f"Eval num_timesteps={self.num_timesteps} (evaluating all entry signals, single env)...")
         
-        metrics = _compute_eval_metrics(episode_rewards, episode_lengths)
+        # Run validation: one env, all entry signals, max 1000 steps per episode
+        episode_rewards, episode_lengths, episode_returns, failure_count, win_rate, final_balance = self._run_eval_all_signals()
+        
+        metrics = _compute_eval_metrics(
+            episode_rewards, episode_lengths, episode_returns,
+            initial_balance=INITIAL_BALANCE,
+            failure_count=failure_count,
+        )
+        
+        # Use win_rate and final_balance from validation (more accurate than recomputing)
+        metrics["win_rate"] = win_rate
+        metrics["total_balance"] = final_balance
         self.eval_count += 1
         
         self.last_mean_reward = metrics["mean_reward"]
@@ -376,6 +696,18 @@ class DynamicEvalCallback(BaseCallback):
         self.last_mean_ep_length = metrics["mean_ep_length"]
         self.last_win_rate = metrics["win_rate"]
         self.last_avg_holding_time = metrics["avg_holding_time"]
+        self.last_total_balance = metrics["total_balance"]
+        
+        # Debug: Log win rate calculation details
+        if episode_returns is not None and len(episode_returns) > 0:
+            wins_count = sum(1 for ret in episode_returns if ret > 0)
+            losses_count = len(episode_returns) - wins_count
+            avg_profit = np.mean([ret for ret in episode_returns if ret > 0]) if wins_count > 0 else 0.0
+            avg_loss = np.mean([ret for ret in episode_returns if ret <= 0]) if losses_count > 0 else 0.0
+            if self.verbose >= 1:
+                logger.info(f"Win rate (positive balance): {wins_count} wins, {losses_count} losses")
+                logger.info(f"  Avg profit: {avg_profit:.4f}, Avg loss: {avg_loss:.4f}")
+                logger.info(f"  Win rate: {metrics['win_rate']:.1%} ({wins_count}/{len(episode_returns)})")
         
         # Log to TensorBoard
         self.logger.record("eval/mean_reward", metrics["mean_reward"])
@@ -385,9 +717,12 @@ class DynamicEvalCallback(BaseCallback):
         self.logger.record("eval/std_total_reward", metrics["std_total_reward"])
         self.logger.record("eval/win_rate", metrics["win_rate"])
         self.logger.record("eval/avg_holding_time", metrics["avg_holding_time"])
+        self.logger.record("eval/mean_holding_time", metrics["avg_holding_time"])  # Same as avg for consistency
         self.logger.record("eval/std_holding_time", metrics["std_holding_time"])
         self.logger.record("eval/min_holding_time", metrics["min_holding_time"])
         self.logger.record("eval/max_holding_time", metrics["max_holding_time"])
+        self.logger.record("eval/total_balance", metrics["total_balance"])
+        self.logger.record("eval/failure_count", metrics["failure_count"])
         self.logger.dump(step=self.num_timesteps)
         
         if self.verbose >= 1:
@@ -398,15 +733,36 @@ class DynamicEvalCallback(BaseCallback):
             )
             logger.info(
                 f"Episode length: {metrics['mean_ep_length']:.2f}, Win rate: {metrics['win_rate']:.1%}, "
+                f"Total balance: {metrics['total_balance']:.2f}, Failures: {metrics['failure_count']}, "
                 f"Holding: avg={metrics['avg_holding_time']:.1f}, min={metrics['min_holding_time']:.0f}, max={metrics['max_holding_time']:.0f}"
             )
+            
+            # Additional debug info for win rate
+            if episode_returns is not None and len(episode_returns) > 0:
+                wins_count = sum(1 for ret in episode_returns if ret > 0)
+                losses_count = len(episode_returns) - wins_count
+                avg_profit = np.mean([ret for ret in episode_returns if ret > 0]) if wins_count > 0 else 0.0
+                avg_loss = np.mean([ret for ret in episode_returns if ret <= 0]) if losses_count > 0 else 0.0
+                total_profit = sum([ret for ret in episode_returns if ret > 0])
+                total_loss = sum([ret for ret in episode_returns if ret <= 0])
+                logger.info(
+                    f"Trade breakdown (win=positive balance): {wins_count} wins ({avg_profit:.4f} avg, {total_profit:.4f} total), "
+                    f"{losses_count} losses ({avg_loss:.4f} avg, {total_loss:.4f} total)"
+                )
         
-        # Best model by mean_total_reward
-        if metrics["mean_total_reward"] > self.best_mean_reward:
-            self.best_mean_reward = metrics["mean_total_reward"]
+        # Best model by total_balance (highest validation balance)
+        if metrics["total_balance"] > self.best_total_balance:
+            self.best_total_balance = metrics["total_balance"]
             self.model.save(str(self.model_save_dir / "best_model.zip"))
             if self.verbose >= 1:
-                logger.info(f"New best model saved (mean total reward: {self.best_mean_reward:.2f})")
+                logger.info(f"New best model saved (total balance: {self.best_total_balance:.2f})")
+
+        # Best model by mean_total_reward (for comparison)
+        if metrics["mean_total_reward"] > self.best_mean_reward:
+            self.best_mean_reward = metrics["mean_total_reward"]
+            self.model.save(str(self.model_save_dir / "best_model_reward.zip"))
+            if self.verbose >= 1:
+                logger.info(f"New best reward model saved (mean total reward: {self.best_mean_reward:.2f})")
 
         # Best model by win_rate
         if metrics["win_rate"] > self.best_win_rate:
@@ -416,6 +772,40 @@ class DynamicEvalCallback(BaseCallback):
                 logger.info(f"New best win-rate model saved (win rate: {self.best_win_rate:.1%})")
 
         return True
+
+    
+    def _on_rollout_end(self) -> None:
+        """
+        Called at the end of each rollout. Extract holding times from episode infos.
+        This is called after each rollout collection, so we can access episode information here.
+        """
+        # Try to extract holding times from Monitor wrapper stats (episode length = holding time)
+        # Monitor tracks episode lengths, which equals holding time in our case
+        if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+            for env in self.training_env.envs:
+                # Unwrap VecNormalize if present
+                unwrapped_env = env
+                if hasattr(env, 'venv'):
+                    unwrapped_env = env.venv
+                if hasattr(unwrapped_env, 'envs') and len(unwrapped_env.envs) > 0:
+                    unwrapped_env = unwrapped_env.envs[0]
+                
+                # Check if this is a Monitor wrapper
+                if hasattr(unwrapped_env, 'episode_lengths'):
+                    try:
+                        episode_lengths = unwrapped_env.episode_lengths
+                        if episode_lengths:
+                            # Get new episodes since last check
+                            if not hasattr(self, '_last_episode_count'):
+                                self._last_episode_count = 0
+                            
+                            if len(episode_lengths) > self._last_episode_count:
+                                new_episodes = episode_lengths[self._last_episode_count:]
+                                if new_episodes:
+                                    self.holding_times.extend([float(l) for l in new_episodes])
+                                    self._last_episode_count = len(episode_lengths)
+                    except Exception:
+                        pass  # Monitor might not be accessible this way
 
 
 class EarlyStoppingCallback(BaseCallback):
@@ -641,6 +1031,57 @@ def filter_data_by_date(
     return filtered
 
 
+# Cache for entry/exit signals to avoid recomputing on every run
+SIGNALS_CACHE_DIR = Path("data/signals_cache")
+
+
+def _signals_cache_path(ticker: str, start_date: Optional[str], end_date: Optional[str], strategy: str, use_backtest: bool) -> Path:
+    """Path to cache file for one ticker's signals."""
+    safe_strategy = (strategy or "Combined").replace("/", "_").replace("\\", "_")
+    name = f"{ticker}_{start_date or 'none'}_{end_date or 'none'}_{safe_strategy}_{use_backtest}.parquet"
+    return SIGNALS_CACHE_DIR / name
+
+
+def _load_signals_cache(cache_path: Path, price_index: pd.Index) -> Optional[Tuple[pd.Series, pd.Series]]:
+    """Load entry/exit signals from cache if file exists and index matches price_series.index."""
+    if not cache_path.exists():
+        return None
+    try:
+        cached = pd.read_parquet(cache_path)
+        if len(cached.index) != len(price_index) or not cached.index.equals(price_index):
+            return None
+        entry_signals = cached["entry_signals"].astype(bool)
+        exit_signals = cached["exit_signals"].astype(bool)
+        return (entry_signals, exit_signals)
+    except Exception as e:
+        logger.debug(f"Cache read failed {cache_path}: {e}")
+        return None
+
+
+def _save_signals_cache(cache_path: Path, entry_signals: pd.Series, exit_signals: pd.Series) -> None:
+    """Save entry/exit signals to cache."""
+    try:
+        if entry_signals is None or exit_signals is None:
+            logger.warning(f"Cannot save cache: signals are None for {cache_path}")
+            return
+        if len(entry_signals) == 0 or len(exit_signals) == 0:
+            logger.warning(f"Cannot save cache: signals are empty for {cache_path}")
+            return
+        if not entry_signals.index.equals(exit_signals.index):
+            logger.warning(f"Cannot save cache: signal indices don't match for {cache_path}")
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({"entry_signals": entry_signals, "exit_signals": exit_signals})
+        df.to_parquet(cache_path, index=True)
+        logger.info(f"Cache saved: {cache_path.name}")
+    except ImportError as e:
+        logger.warning(f"Cache write failed: parquet library not available. Install pyarrow or fastparquet: {e}")
+    except Exception as e:
+        logger.warning(f"Cache write failed {cache_path}: {e}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+
+
 def load_all_tickers_data(
     tickers_list: List[str],
     start_date: Optional[str] = None,
@@ -650,6 +1091,7 @@ def load_all_tickers_data(
 ) -> Dict[str, Dict[str, pd.Series]]:
     """
     Load price, balance, and entry signal data for all tickers.
+    Entry/exit signals are cached under data/signals_cache to avoid recomputing.
     
     Args:
         tickers_list: List of ticker symbols
@@ -659,7 +1101,7 @@ def load_all_tickers_data(
         strategy: Strategy name for balance data
     
     Returns:
-        Dict of {ticker: {'price': Series, 'balance': Series, 'entry_signals': Series}}
+        Dict of {ticker: {'price': Series, 'balance': Series, 'entry_signals': Series, 'exit_signals': Series}}
     """
     date_range_str = ""
     if start_date or end_date:
@@ -698,19 +1140,43 @@ def load_all_tickers_data(
                         # Create default balance series
                         balance_series = pd.Series(INITIAL_BALANCE, index=price_series.index)
                         
-                        # Generate entry signals from technical indicators
+                        # Generate entry and exit signals (use cache when available)
                         entry_signals = None
+                        exit_signals = None
                         if USE_TECHNICAL_SIGNALS:
-                            entry_signals = generate_entry_signals(ticker_df, price_series)
-                            num_signals = entry_signals.sum()
-                            logger.info(f"  {ticker}: {len(price_series)} price points, {num_signals} entry signals")
+                            cache_path = _signals_cache_path(
+                                ticker, start_date, end_date, strategy, USE_BACKTEST_SIGNALS
+                            )
+                            cached = _load_signals_cache(cache_path, price_series.index)
+                            if cached is not None:
+                                entry_signals, exit_signals = cached
+                                num_entry_signals = entry_signals.sum()
+                                num_exit_signals = exit_signals.sum()
+                                logger.info(f"  {ticker}: {len(price_series)} price points, {num_entry_signals} entry, {num_exit_signals} exit signals (from cache)")
+                            else:
+                                if USE_BACKTEST_SIGNALS:
+                                    from entry_signal_generator import get_strategy_signals
+                                    try:
+                                        entry_signals, exit_signals = get_strategy_signals(ticker_df, price_series, strategy=strategy)
+                                    except Exception as e:
+                                        logger.warning(f"  entry_signal_generator failed for {ticker}: {e}, falling back to crossover signals")
+                                        entry_signals = generate_entry_signals(ticker_df, price_series)
+                                        exit_signals = generate_exit_signals(ticker_df, price_series)
+                                else:
+                                    entry_signals = generate_entry_signals(ticker_df, price_series)
+                                    exit_signals = generate_exit_signals(ticker_df, price_series)
+                                num_entry_signals = entry_signals.sum()
+                                num_exit_signals = exit_signals.sum()
+                                logger.info(f"  {ticker}: {len(price_series)} price points, {num_entry_signals} entry signals, {num_exit_signals} exit signals")
+                                _save_signals_cache(cache_path, entry_signals, exit_signals)
                         else:
                             logger.info(f"  {ticker}: {len(price_series)} price points (random entry)")
                         
                         all_tickers_data[ticker] = {
                             'price': price_series,
                             'balance': balance_series,
-                            'entry_signals': entry_signals
+                            'entry_signals': entry_signals,
+                            'exit_signals': exit_signals
                         }
                     else:
                         logger.warning(f"  No data found for {ticker}")
@@ -812,38 +1278,6 @@ def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
     return _init
 
 
-def _parallel_eval_worker(args: Tuple) -> Tuple[List[float], List[int]]:
-    """
-    Run evaluation on a chunk of episodes; used by multiprocessing.Pool (spawn).
-    At validation start a checkpoint is saved; each worker loads that checkpoint and runs its chunk.
-    args: (chunk_episodes, model_path, deterministic) or (..., device). device defaults to 'cpu'.
-    """
-    if len(args) == 4:
-        chunk_episodes, model_path, deterministic, device = args
-    else:
-        chunk_episodes, model_path, deterministic = args
-        device = 'cpu'
-    if not chunk_episodes:
-        return [], []
-    model = PPO.load(model_path, device=device)
-    rewards, lengths = [], []
-    for ep in chunk_episodes:
-        env = make_env(ep, rank=0, seed=0)()
-        obs, _ = env.reset()
-        done = False
-        total_reward = 0.0
-        steps = 0
-        while not done:
-            action, _ = model.predict(obs, deterministic=deterministic)
-            obs, reward, term, trunc, _ = env.step(action)
-            total_reward += reward
-            steps += 1
-            done = term or trunc
-        rewards.append(total_reward)
-        lengths.append(steps)
-    return rewards, lengths
-
-
 def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: int = 42) -> callable:
     """
     Create environment factory that uses all tickers' data.
@@ -876,41 +1310,8 @@ def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: 
     return _make_env
 
 
-def create_eval_env_factory(val_episodes: List[Dict], seed: int = 42) -> callable:
-    """
-    Create evaluation environment factory that randomly samples episodes.
-    
-    Args:
-        val_episodes: List of validation episodes
-        seed: Random seed
-    
-    Returns:
-        Function that returns an environment
-    """
-    # Store episodes list for random sampling
-    episodes_list = val_episodes
-    
-    def _make_env(rank: int = 0):
-        # Create a new random state for each environment creation
-        # This ensures different episodes are selected
-        local_rng = np.random.RandomState(seed + rank + int(np.random.random() * 1000000))
-        # Randomly sample a validation episode
-        episode_idx = local_rng.randint(0, len(episodes_list))
-        episode = episodes_list[episode_idx]
-        # Use different seed for each environment instance
-        env_seed = seed + rank + local_rng.randint(0, 10000)
-        env = make_env(episode, rank=rank, seed=env_seed)()
-        # Store episode list in env for later random resets
-        env._available_episodes = episodes_list
-        env._episode_rng = np.random.RandomState(env_seed)
-        return env
-    
-    return _make_env
-
-
 def train_ppo_agent(
     all_tickers_data: Dict[str, Dict[str, pd.Series]],
-    val_episodes: List[Dict],
     model_save_dir: Path,
     tensorboard_log_dir: Path,
     total_timesteps: int = TOTAL_TIMESTEPS,
@@ -922,7 +1323,6 @@ def train_ppo_agent(
     
     Args:
         all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series}} for training
-        val_episodes: Validation episodes (for evaluation, legacy)
         model_save_dir: Directory to save models
         tensorboard_log_dir: Directory for TensorBoard logs
         total_timesteps: Total training steps
@@ -987,55 +1387,44 @@ def train_ppo_agent(
         )
         logger.info("VecNormalize enabled: rewards will be normalized (observations already normalized in env)")
     
-    # Create evaluation environment
-    # Use validation episodes if available, otherwise use val_tickers_data with technical signals
-    if len(val_episodes) > 0:
-        eval_env_factory = create_eval_env_factory(val_episodes, seed=123)
-        n_eval_envs = min(EVAL_EPISODES_FALLBACK, len(val_episodes), 10)
-        logger.info(f"Evaluation using {len(val_episodes)} validation episodes ({N_VAL_WORKERS} workers)")
-    else:
-        eval_env_factory = create_env_factory(val_tickers_data, seed=123)
-        n_eval_envs = min(EVAL_EPISODES_FALLBACK, 10)
-        logger.info(f"Evaluation using validation data ({VAL_START_DATE} to {VAL_END_DATE})")
-    
-    eval_env = make_vec_env(
-        eval_env_factory,
-        n_envs=n_eval_envs,
-        vec_env_cls=DummyVecEnv
-    )
-    logger.info("Eval callback will run full validation (all episodes, parallel workers) every eval")
+    logger.info("Eval callback will run full validation (all entry signals, single env sequential) every eval")
     
     # Create PPO model with more complex architecture
-    logger.info("Creating PPO model with complex architecture...")
+    logger.info("Creating PPO model with complex architecture (SBX/JAX)...")
     
-    # Map activation function string to PyTorch activation
+    # SBX requires JAX activation functions (callables, not strings)
+    # Map string names to JAX activation functions
     activation_map = {
-        'tanh': torch.nn.Tanh,
-        'relu': torch.nn.ReLU,
-        'elu': torch.nn.ELU,
-        'leaky_relu': torch.nn.LeakyReLU
+        'tanh': jnp.tanh,
+        'relu': lambda x: jnp.maximum(x, 0),  # ReLU: max(x, 0)
+        'elu': lambda x: jnp.where(x > 0, x, jnp.exp(x) - 1),  # ELU
+        'leaky_relu': lambda x: jnp.maximum(0.01 * x, x)  # LeakyReLU with alpha=0.01
     }
-    activation_fn = activation_map.get(ACTIVATION_FN.lower(), torch.nn.Tanh)
+    
+    activation_fn_name = ACTIVATION_FN.lower()
+    if activation_fn_name not in activation_map:
+        logger.warning(f"Unknown activation function {activation_fn_name}, defaulting to 'tanh'")
+        activation_fn_name = 'tanh'
+    
+    activation_fn = activation_map[activation_fn_name]
     
     policy_kwargs = dict(
         # Deeper and wider network architecture
         # Separate networks for policy (pi) and value function (vf)
         # Policy network: Multiple hidden layers with decreasing width (bottleneck design)
         # Value network: Multiple hidden layers with decreasing width
-        net_arch=[
-            dict(pi=POLICY_LAYERS,  # Policy network layers
-                 vf=VALUE_LAYERS)   # Value network layers
-        ],
-        # Use activation function
+        # SBX format: direct dictionary (not list containing dict)
+        net_arch={
+            "pi": POLICY_LAYERS,  # Policy network layers
+            "vf": VALUE_LAYERS    # Value network layers
+        },
+        # Use activation function (SBX requires JAX callable functions)
         activation_fn=activation_fn
     )
     
-    # Determine device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        logger.info("Using CPU (consider using GPU for faster training with complex architecture)")
+    # SBX (JAX-based) automatically handles device selection efficiently
+    # JAX can use CPU, GPU, or TPU automatically
+    logger.info("SBX (JAX) will automatically select the best available device (CPU/GPU/TPU)")
     
     # Set up learning rate (constant or scheduled)
     if USE_LR_SCHEDULE:
@@ -1060,14 +1449,15 @@ def train_ppo_agent(
         clip_range=CLIP_RANGE,  # Explicit clip range for conservative policy updates
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(tensorboard_log_dir),
-        verbose=1,
-        device=device
+        verbose=0
+        # Note: SBX automatically handles device selection (no device parameter needed)
     )
     
-    logger.info(f"Model architecture:")
+    logger.info(f"Model architecture (SBX/JAX):")
     logger.info(f"  Policy network: {POLICY_LAYERS} ({len(POLICY_LAYERS)} hidden layers)")
     logger.info(f"  Value network: {VALUE_LAYERS} ({len(VALUE_LAYERS)} hidden layers)")
     logger.info(f"  Activation function: {ACTIVATION_FN}")
+    logger.info(f"  Framework: SBX (JAX-based) - faster training with JIT compilation")
     # Estimate parameters: sum of layer sizes squared
     pi_params = sum(POLICY_LAYERS[i] * POLICY_LAYERS[i+1] for i in range(len(POLICY_LAYERS)-1))
     vf_params = sum(VALUE_LAYERS[i] * VALUE_LAYERS[i+1] for i in range(len(VALUE_LAYERS)-1))
@@ -1084,7 +1474,7 @@ def train_ppo_agent(
     
     # Create callbacks
     callbacks = []
-    
+
     # Checkpoint callback
     checkpoint_callback = CheckpointCallback(
         save_freq=CHECKPOINT_FREQ,
@@ -1095,23 +1485,16 @@ def train_ppo_agent(
     )
     callbacks.append(checkpoint_callback)
     
-    # Evaluation callback - use custom callback that recreates environments each time
+    # Evaluation callback - single env, all entry signals, max 1000 steps per episode
     eval_callback = DynamicEvalCallback(
-        val_episodes=val_episodes,
         all_tickers_data=val_tickers_data,
         eval_freq=EVAL_FREQ,
         model_save_dir=model_save_dir,
         log_path=model_save_dir / "eval_logs",
         deterministic=True,
         verbose=1,
-        n_val_workers=N_VAL_WORKERS,
-        n_eval_episodes_fallback=EVAL_EPISODES_FALLBACK,
-        eval_worker_device=EVAL_WORKER_DEVICE,
     )
     callbacks.append(eval_callback)
-    
-    # Close the pre-created eval_env since we'll recreate it each time
-    eval_env.close()
     
     # Early stopping callback
     if ENABLE_EARLY_STOPPING:
@@ -1176,6 +1559,38 @@ def train_ppo_agent(
     return model
 
 
+def _evaluate_with_episode_returns(model, vec_env, n_eval_episodes: int, deterministic: bool = True):
+    """
+    Run evaluation and collect episode_rewards, episode_lengths, episode_returns.
+    Win rate is computed from episode_returns (positive balance = win).
+    Returns (episode_rewards, episode_lengths, episode_returns).
+    """
+    episode_rewards = []
+    episode_lengths = []
+    episode_returns = []
+    episode_starts = [True] * vec_env.num_envs
+    n_completed = 0
+    obs, _ = vec_env.reset()
+    step_count = np.zeros(vec_env.num_envs, dtype=int)
+    total_rewards = np.zeros(vec_env.num_envs)
+    while n_completed < n_eval_episodes:
+        actions, _ = model.predict(obs, deterministic=deterministic)
+        obs, rewards, dones, infos = vec_env.step(actions)
+        total_rewards += rewards
+        step_count += 1
+        for i in range(vec_env.num_envs):
+            if dones[i]:
+                episode_rewards.append(float(total_rewards[i]))
+                episode_lengths.append(int(step_count[i]))
+                episode_returns.append(float(infos[i].get("episode_return", 0.0)))
+                total_rewards[i] = 0.0
+                step_count[i] = 0
+                n_completed += 1
+        if n_completed >= n_eval_episodes:
+            break
+    return episode_rewards, episode_lengths, episode_returns
+
+
 def evaluate_on_test_data(
     model,
     test_tickers_data: Dict[str, Dict[str, pd.Series]]
@@ -1224,14 +1639,10 @@ def evaluate_on_test_data(
         vec_env_cls=DummyVecEnv
     )
     
-    # Run evaluation on ALL entry signals
+    # Run evaluation and collect episode returns (for win rate = positive balance)
     logger.info(f"\nRunning evaluation on ALL {n_episodes} entry signals...")
-    episode_rewards, episode_lengths = evaluate_policy(
-        model,
-        test_env,
-        n_eval_episodes=n_episodes,
-        deterministic=True,
-        return_episode_rewards=True
+    episode_rewards, episode_lengths, episode_returns = _evaluate_with_episode_returns(
+        model, test_env, n_eval_episodes=n_episodes, deterministic=True
     )
     
     # Calculate metrics
@@ -1243,9 +1654,8 @@ def evaluate_on_test_data(
     rewards_per_step = [r / max(l, 1) for r, l in zip(episode_rewards, episode_lengths)]
     mean_reward_per_step = np.mean(rewards_per_step)
     
-    # Calculate win rate (positive reward = win)
-    wins = sum(1 for r in episode_rewards if r > 0)
-    win_rate = wins / len(episode_rewards) if episode_rewards else 0
+    # Win rate = fraction of episodes with positive balance (episode_return > 0)
+    win_rate, wins, n_episodes_returns = _win_rate_from_returns(episode_returns)
     
     # Calculate total return proxy (sum of all rewards)
     total_reward = sum(episode_rewards)
@@ -1263,7 +1673,7 @@ def evaluate_on_test_data(
     logger.info(f"  Episodes evaluated: {len(episode_rewards)}")
     logger.info(f"  Mean total reward:  {mean_reward:.2f} +/- {std_reward:.2f}")
     logger.info(f"  Mean reward/step:   {mean_reward_per_step:.4f}")
-    logger.info(f"  Win rate:           {win_rate:.1%} ({wins}/{len(episode_rewards)})")
+    logger.info(f"  Win rate (positive balance): {win_rate:.1%} ({wins}/{n_episodes_returns})")
     logger.info(f"  Holding time:       avg={avg_holding_time:.1f}, std={std_holding_time:.1f}")
     logger.info(f"                      min={min_holding_time:.0f}, max={max_holding_time:.0f} steps")
     logger.info(f"  Total reward (sum): {total_reward:.2f}")
@@ -1286,7 +1696,8 @@ def evaluate_on_test_data(
         'avg_holding_time': avg_holding_time,
         'std_holding_time': std_holding_time,
         'min_holding_time': min_holding_time,
-        'max_holding_time': max_holding_time
+        'max_holding_time': max_holding_time,
+        'episode_returns': episode_returns,
     }
 
 
@@ -1382,7 +1793,6 @@ def main():
     # Train model
     model = train_ppo_agent(
         train_tickers_data,
-        val_episodes,
         MODEL_SAVE_DIR,
         TENSORBOARD_LOG_DIR,
         total_timesteps=TOTAL_TIMESTEPS,

@@ -30,6 +30,9 @@ from backtest import (
 # Import RL risk management
 from rl_risk_management import apply_rl_risk_management, RLRiskManager
 
+# Shared entry/exit signal generator (same logic as backtest divergence strategies)
+from entry_signal_generator import get_strategy_signals
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -50,14 +53,12 @@ DEFAULT_MODEL_NAME = "best_model"
 
 # Evaluation date range configuration
 # Set to None to use all available data, or specify date range for evaluation
-EVAL_START_DATE = "2025-01-01"  # YYYY-MM-DD format, or None for all data
-EVAL_END_DATE = "2026-01-24"    # YYYY-MM-DD format, or None for all data
+EVAL_START_DATE = "2024-01-01"  # YYYY-MM-DD format, or None for all data
+EVAL_END_DATE = "2025-01-24"    # YYYY-MM-DD format, or None for all data
 
 # Test configuration
 USE_RL_RISK_MANAGEMENT = True  # Enable RL risk management
 USE_RULE_BASED_BASELINE = True  # Also test rule-based for comparison
-# Cap steps per position during evaluation (avoids ~5000 model.predict per entry)
-MAX_STEPS_PER_ENTRY_EVAL = 5000
 
 
 def load_test_data(
@@ -145,56 +146,6 @@ def load_test_data(
     raise FileNotFoundError(f"Could not load test data for {ticker}")
 
 
-def get_strategy_signals(ticker_df: pd.Series, price: pd.Series, strategy: str = "Combined"):
-    """
-    Get entry and exit signals for a strategy.
-    
-    Args:
-        ticker_df: DataFrame with OHLCV data
-        price: Price series
-        strategy: Strategy name
-    
-    Returns:
-        entries, exits (boolean series)
-    """
-    from backtest import (
-        calculate_macd,
-        identify_trend_reversals,
-        calculate_rsi,
-        identify_rsi_trend_reversals,
-        identify_bullish_trend_confirmation,
-        ENABLE_MACD_TREND_REVERSAL,
-        ENABLE_RSI_TREND_REVERSAL,
-        ENABLE_BULLISH_CONFIRMATION
-    )
-    
-    # Generate signals based on strategy
-    entries = pd.Series(False, index=price.index)
-    exits = pd.Series(False, index=price.index)
-    
-    if strategy == "Combined" or strategy == "MACD_Trend_Reversal":
-        if ENABLE_MACD_TREND_REVERSAL:
-            macd, signal, histogram = calculate_macd(ticker_df)
-            macd_signals = identify_trend_reversals(price, macd, signal, histogram)
-            entries = entries | macd_signals.get('strong_bullish', pd.Series(False, index=price.index))
-            exits = exits | macd_signals.get('strong_bearish', pd.Series(False, index=price.index))
-    
-    if strategy == "Combined" or strategy == "RSI_Trend_Reversal":
-        if ENABLE_RSI_TREND_REVERSAL:
-            rsi = calculate_rsi(price)
-            rsi_signals = identify_rsi_trend_reversals(price, rsi)
-            entries = entries | rsi_signals.get('bullish_reversal', pd.Series(False, index=price.index))
-            exits = exits | rsi_signals.get('bearish_reversal', pd.Series(False, index=price.index))
-    
-    if strategy == "Combined" or strategy == "Bullish_Trend_Confirmation":
-        if ENABLE_BULLISH_CONFIRMATION:
-            bullish_signals = identify_bullish_trend_confirmation(price)
-            entries = entries | bullish_signals.get('bullish_reversal', pd.Series(False, index=price.index))
-            exits = exits | bullish_signals.get('bearish_reversal', pd.Series(False, index=price.index))
-    
-    return entries.fillna(False), exits.fillna(False)
-
-
 def evaluate_rule_based_baseline(
     ticker: str,
     ticker_df: pd.DataFrame,
@@ -276,10 +227,12 @@ def evaluate_rl_agent(
     # Use provided manager or load a new one
     if rl_manager is None:
         try:
+            # Use reduced max_steps for faster evaluation (2000 instead of 5000)
             rl_manager = RLRiskManager(
                 model_path=model_path,
                 model_name=model_name,
-                initial_balance=INITIAL_BALANCE
+                initial_balance=INITIAL_BALANCE,
+                max_steps=2000  # Reduced for faster evaluation
             )
             logger.info(f"Using device: {rl_manager.model.device}")
         except Exception as e:
@@ -293,8 +246,7 @@ def evaluate_rl_agent(
     
     # Apply RL risk management
     exits_rl = rl_manager.apply_rl_risk_management(
-        entries, exits.copy(), price, balance,
-        max_steps_per_entry=MAX_STEPS_PER_ENTRY_EVAL
+        entries, exits.copy(), price, balance
     )
     
     # Backtest
@@ -432,6 +384,279 @@ def compare_results(results_rule: Dict, results_rl: Dict, ticker: str, output_di
     logger.info(f"Comparison plot saved: {comparison_plot}")
     
     return comparison_df
+
+
+def plot_individual_trades(
+    portfolio_rl,
+    price: pd.Series,
+    ticker: str,
+    output_dir: Path,
+    portfolio_rule: Optional = None,
+    strategy: str = "Combined_rl_agent"
+):
+    """
+    Plot each trade individually on separate charts, showing both rule-based and RL exits.
+    Creates a folder for each ticker and cleans it before plotting.
+    
+    Args:
+        portfolio_rl: VectorBT portfolio object for RL agent
+        price: Price series
+        ticker: Ticker symbol
+        output_dir: Output directory
+        portfolio_rule: VectorBT portfolio object for rule-based (optional)
+        strategy: Strategy name
+    
+    Returns:
+        List of saved plot file paths
+    """
+    import shutil
+    
+    try:
+        # Create ticker-specific folder
+        ticker_dir = output_dir / ticker
+        ticker_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean the folder first (remove all existing files)
+        if ticker_dir.exists():
+            for file in ticker_dir.iterdir():
+                if file.is_file():
+                    file.unlink()
+                elif file.is_dir():
+                    shutil.rmtree(file)
+            logger.info(f"Cleaned folder: {ticker_dir}")
+        
+        # Get RL trade records
+        trades_rl = portfolio_rl.trades.records_readable
+        
+        # Get rule-based trade records if available
+        trades_rule = None
+        if portfolio_rule is not None:
+            try:
+                trades_rule = portfolio_rule.trades.records_readable
+                logger.info(f"Found {len(trades_rule)} rule-based trades for comparison")
+            except Exception as e:
+                logger.warning(f"Could not get rule-based trades: {e}")
+                trades_rule = None
+        
+        # Get trade records (use RL trades as primary)
+        trades = trades_rl
+        
+        if len(trades) == 0:
+            logger.info(f"No trades to plot for {ticker}")
+            return []
+        
+        logger.info(f"Plotting {len(trades)} individual trades for {ticker}...")
+        
+        # Create mapping of rule-based trades by entry time for quick lookup
+        rule_trade_map = {}
+        if trades_rule is not None and len(trades_rule) > 0:
+            for _, rule_trade in trades_rule.iterrows():
+                try:
+                    if 'Entry Timestamp' in rule_trade.index:
+                        entry_time_rule = pd.to_datetime(rule_trade['Entry Timestamp'])
+                    elif 'Entry Time' in rule_trade.index:
+                        entry_time_rule = pd.to_datetime(rule_trade['Entry Time'])
+                    else:
+                        continue
+                    # Use entry time as key (rounded to nearest minute for matching)
+                    entry_key = entry_time_rule.round('min')
+                    rule_trade_map[entry_key] = rule_trade
+                except Exception as e:
+                    continue
+        
+        saved_plots = []
+        
+        # Process each RL trade individually
+        for trade_idx, (idx, trade) in enumerate(trades.iterrows(), 1):
+            try:
+                # Get RL entry and exit timestamps
+                if 'Entry Timestamp' in trade.index:
+                    entry_time = pd.to_datetime(trade['Entry Timestamp'])
+                elif 'Entry Time' in trade.index:
+                    entry_time = pd.to_datetime(trade['Entry Time'])
+                else:
+                    logger.warning(f"Trade {trade_idx}: Missing entry timestamp")
+                    continue
+                
+                if 'Exit Timestamp' in trade.index:
+                    exit_time_rl = pd.to_datetime(trade['Exit Timestamp'])
+                elif 'Exit Time' in trade.index:
+                    exit_time_rl = pd.to_datetime(trade['Exit Time'])
+                else:
+                    logger.warning(f"Trade {trade_idx}: Missing exit timestamp")
+                    continue
+                
+                # Get RL entry and exit prices
+                if 'Entry Price' in trade.index:
+                    entry_price = float(trade['Entry Price'])
+                elif 'Avg Entry Price' in trade.index:
+                    entry_price = float(trade['Avg Entry Price'])
+                else:
+                    logger.warning(f"Trade {trade_idx}: Missing entry price")
+                    continue
+                
+                if 'Exit Price' in trade.index:
+                    exit_price_rl = float(trade['Exit Price'])
+                elif 'Avg Exit Price' in trade.index:
+                    exit_price_rl = float(trade['Avg Exit Price'])
+                else:
+                    logger.warning(f"Trade {trade_idx}: Missing exit price")
+                    continue
+                
+                # Get RL return and PnL for coloring and display
+                trade_return_rl = float(trade.get('Return', 0)) if 'Return' in trade.index else 0
+                trade_pnl_rl = float(trade.get('PnL', 0)) if 'PnL' in trade.index else 0
+                trade_duration_rl = trade.get('Duration', 'N/A') if 'Duration' in trade.index else 'N/A'
+                
+                # Get position ID if available
+                position_id = trade.get('Position Id', trade_idx) if 'Position Id' in trade.index else trade_idx
+                
+                # Try to find matching rule-based trade
+                exit_time_rule = None
+                exit_price_rule = None
+                trade_return_rule = None
+                trade_pnl_rule = None
+                trade_duration_rule = None
+                
+                entry_key = entry_time.round('min')
+                if entry_key in rule_trade_map:
+                    rule_trade = rule_trade_map[entry_key]
+                    try:
+                        if 'Exit Timestamp' in rule_trade.index:
+                            exit_time_rule = pd.to_datetime(rule_trade['Exit Timestamp'])
+                        elif 'Exit Time' in rule_trade.index:
+                            exit_time_rule = pd.to_datetime(rule_trade['Exit Time'])
+                        
+                        if 'Exit Price' in rule_trade.index:
+                            exit_price_rule = float(rule_trade['Exit Price'])
+                        elif 'Avg Exit Price' in rule_trade.index:
+                            exit_price_rule = float(rule_trade['Avg Exit Price'])
+                        
+                        trade_return_rule = float(rule_trade.get('Return', 0)) if 'Return' in rule_trade.index else 0
+                        trade_pnl_rule = float(rule_trade.get('PnL', 0)) if 'PnL' in rule_trade.index else 0
+                        trade_duration_rule = rule_trade.get('Duration', 'N/A') if 'Duration' in rule_trade.index else 'N/A'
+                    except Exception as e:
+                        logger.debug(f"Could not extract rule-based exit for trade {trade_idx}: {e}")
+                
+                # Determine time window for plotting (add some padding before and after)
+                time_padding = pd.Timedelta(days=2)  # 2 days padding
+                plot_start = entry_time - time_padding
+                # Use the later exit time for plot end
+                plot_end = max(exit_time_rl, exit_time_rule) if exit_time_rule else exit_time_rl
+                plot_end = plot_end + time_padding
+                
+                # Filter price data for this trade's time window
+                price_mask = (price.index >= plot_start) & (price.index <= plot_end)
+                price_window = price[price_mask]
+                
+                if len(price_window) == 0:
+                    logger.warning(f"Trade {trade_idx}: No price data in time window")
+                    continue
+                
+                # Create figure with price chart only
+                fig, ax1 = plt.subplots(figsize=(14, 8))
+                
+                # Plot price on top subplot
+                ax1.plot(price_window.index, price_window.values, linewidth=1.5, 
+                        label='Close Price', color='black', alpha=0.7)
+                
+                # Determine RL trade color
+                is_profitable_rl = trade_return_rl > 0
+                trade_color_rl = 'green' if is_profitable_rl else 'red'
+                
+                # Plot entry point (shared)
+                ax1.scatter(entry_time, entry_price, color='blue', marker='^', 
+                           s=250, label='Entry', zorder=6, alpha=0.9, 
+                           edgecolors='darkblue', linewidths=2.5)
+                
+                # Plot RL exit point
+                ax1.scatter(exit_time_rl, exit_price_rl, color=trade_color_rl, marker='v', 
+                           s=200, label=f'RL Exit ({trade_return_rl:.2%})', zorder=5, alpha=0.9,
+                           edgecolors='darkgreen' if is_profitable_rl else 'darkred', 
+                           linewidths=2)
+                
+                # Plot rule-based exit point if available
+                if exit_time_rule is not None and exit_price_rule is not None:
+                    is_profitable_rule = trade_return_rule > 0
+                    trade_color_rule = 'green' if is_profitable_rule else 'red'
+                    ax1.scatter(exit_time_rule, exit_price_rule, color=trade_color_rule, 
+                               marker='s', s=200, label=f'Rule Exit ({trade_return_rule:.2%})', 
+                               zorder=5, alpha=0.9,
+                               edgecolors='darkgreen' if is_profitable_rule else 'darkred', 
+                               linewidths=2)
+                    
+                    # Draw line connecting entry to rule-based exit
+                    ax1.plot([entry_time, exit_time_rule], [entry_price, exit_price_rule],
+                            color=trade_color_rule, alpha=0.4, linewidth=2, linestyle=':',
+                            label='Rule-Based Trade')
+                
+                # Draw line connecting entry to RL exit
+                ax1.plot([entry_time, exit_time_rl], [entry_price, exit_price_rl],
+                        color=trade_color_rl, alpha=0.6, linewidth=2.5, linestyle='--',
+                        label='RL Trade')
+                
+                # Add vertical lines at entry and exits
+                ax1.axvline(x=entry_time, color='blue', linestyle=':', 
+                          alpha=0.5, linewidth=1.5)
+                ax1.axvline(x=exit_time_rl, color=trade_color_rl, linestyle=':', 
+                          alpha=0.5, linewidth=1.5)
+                if exit_time_rule is not None:
+                    ax1.axvline(x=exit_time_rule, color=trade_color_rule, 
+                              linestyle=':', alpha=0.5, linewidth=1.5)
+                
+                # Format durations for display
+                def format_duration(dur):
+                    if isinstance(dur, str) and dur != 'N/A':
+                        return dur
+                    elif hasattr(dur, 'total_seconds'):
+                        days = dur.days
+                        hours = dur.seconds // 3600
+                        return f"{days}d {hours}h" if days > 0 else f"{hours}h"
+                    else:
+                        return str(dur)
+                
+                duration_str_rl = format_duration(trade_duration_rl)
+                duration_str_rule = format_duration(trade_duration_rule) if exit_time_rule else 'N/A'
+                
+                # Set title with trade information (escape $ signs for matplotlib)
+                profit_loss_rl = "Profit" if is_profitable_rl else "Loss"
+                title = f'{ticker} - Trade #{trade_idx} (Position ID: {position_id}) - RL: {profit_loss_rl}\n'
+                title += f'Entry: {entry_time.strftime("%Y-%m-%d %H:%M")} @ \\${entry_price:.4f}\n'
+                title += f'RL Exit: {exit_time_rl.strftime("%Y-%m-%d %H:%M")} @ \\${exit_price_rl:.4f} | Return: {trade_return_rl:.2%} | PnL: \\${trade_pnl_rl:.2f} | Duration: {duration_str_rl}'
+                if exit_time_rule:
+                    profit_loss_rule = "Profit" if is_profitable_rule else "Loss"
+                    title += f'\nRule Exit: {exit_time_rule.strftime("%Y-%m-%d %H:%M")} @ \\${exit_price_rule:.4f} | Return: {trade_return_rule:.2%} | PnL: \\${trade_pnl_rule:.2f} | Duration: {duration_str_rule}'
+                
+                ax1.set_title(title, fontsize=11, fontweight='bold')
+                ax1.set_xlabel('Date', fontsize=11)
+                ax1.set_ylabel('Price (USDT)', fontsize=11)
+                ax1.legend(loc='best', fontsize=8, ncol=2)
+                ax1.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                
+                # Save plot with zero-padded trade number
+                plot_filename = f"{ticker}_trade_{trade_idx:04d}_pos{position_id}.png"
+                plot_file = ticker_dir / plot_filename
+                fig.savefig(plot_file, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                
+                saved_plots.append(plot_file)
+                
+            except Exception as e:
+                logger.warning(f"Error plotting trade {trade_idx} for {ticker}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        logger.info(f"Saved {len(saved_plots)} individual trade plots to: {ticker_dir}")
+        return saved_plots
+        
+    except Exception as e:
+        logger.error(f"Error plotting individual trades for {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 
 def plot_all_tickers_comparison(all_results: Dict, output_dir: Path):
@@ -746,6 +971,24 @@ def main(
                     model_name=DEFAULT_MODEL_NAME,
                     rl_manager=rl_manager
                 )
+                
+                # Plot individual trades for RL agent (with rule-based comparison if available)
+                if results_rl and results_rl.get('portfolio') is not None:
+                    try:
+                        portfolio_rule_for_plot = None
+                        if results_rule and results_rule.get('portfolio') is not None:
+                            portfolio_rule_for_plot = results_rule['portfolio']
+                        
+                        plot_individual_trades(
+                            results_rl['portfolio'],
+                            price,
+                            ticker,
+                            RL_RESULTS_DIR,
+                            portfolio_rule=portfolio_rule_for_plot,
+                            strategy="Combined_rl_agent"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error plotting trades for {ticker}: {e}")
             
             # Compare results
             if results_rule and results_rl:

@@ -32,3 +32,4 @@ venv/
 .vscode/
 *.csv
 *.pkl
+ElegantRL/

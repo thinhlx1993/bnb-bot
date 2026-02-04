@@ -35,19 +35,21 @@ from binance.exceptions import BinanceAPIException
 from meta.data_processor import DataProcessor
 from meta.data_processors._base import DataSource
 
-# Import strategy functions from main.py
+# Import strategy functions from backtest (risk management, EMA, etc.)
 from backtest import (
-    calculate_macd, calculate_ema, calculate_rsi,
-    identify_trend_reversals, identify_rsi_trend_reversals,
-    identify_bullish_trend_confirmation, create_vectorbt_signals,
-    apply_risk_management,
-    ENABLE_MACD_TREND_REVERSAL, ENABLE_RSI_TREND_REVERSAL, ENABLE_BULLISH_CONFIRMATION,
+    calculate_ema, apply_risk_management,
     USE_MA99_FILTER, MA99_PERIOD, ENABLE_RISK_MANAGEMENT,
-    MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-    RSI_PERIOD, BULLISH_EMA_FAST, BULLISH_EMA_SLOW,
+    BULLISH_EMA_FAST, BULLISH_EMA_SLOW,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_HOLDING_PERIODS,
-    USE_STOP_LOSS, USE_TAKE_PROFIT, USE_MAX_HOLDING
+    USE_STOP_LOSS, USE_TAKE_PROFIT, USE_MAX_HOLDING,
+    INITIAL_BALANCE
 )
+# Shared entry/exit signal generator (same as evaluate and train when USE_BACKTEST_SIGNALS)
+from entry_signal_generator import get_strategy_signals
+
+# Import RL risk management
+from rl_risk_management import RLRiskManager
+from rl_risk_env import RiskManagementEnv
 
 # Configure logging
 logging.basicConfig(
@@ -583,6 +585,7 @@ class BinanceTrader:
     def check_risk_management(self, symbol: str) -> Optional[str]:
         """
         Check if risk management conditions are met for exiting a position.
+        Uses rule-based risk management as fallback.
         
         Returns:
             'STOP_LOSS', 'TAKE_PROFIT', 'MAX_HOLDING', or None
@@ -620,6 +623,152 @@ class BinanceTrader:
                 return 'MAX_HOLDING'
         
         return None
+    
+    def check_rl_agent_decision(
+        self, 
+        symbol: str, 
+        price_history: pd.Series,
+        balance_history: pd.Series,
+        rl_manager: Optional[RLRiskManager] = None
+    ) -> bool:
+        """
+        Query RL agent to decide whether to hold or close a position.
+        
+        Args:
+            symbol: Trading pair symbol
+            price_history: Historical price series (should include entry point and current)
+            balance_history: Historical balance series
+            rl_manager: RLRiskManager instance (if None, will use rule-based fallback)
+        
+        Returns:
+            True if RL agent wants to close, False if hold
+        """
+        if symbol not in self.positions:
+            return False
+        
+        if rl_manager is None:
+            # Fallback to rule-based risk management
+            return self.check_risk_management(symbol) is not None
+        
+        position = self.positions[symbol]
+        entry_price = position['entry_price']
+        entry_time = position['entry_time']
+        
+        # Find entry index in price_history
+        # We need to find where entry_time matches in price_history index
+        entry_idx = None
+        for idx, timestamp in enumerate(price_history.index):
+            if isinstance(timestamp, pd.Timestamp):
+                # Compare timestamps (allow some tolerance)
+                time_diff = abs((timestamp - entry_time).total_seconds())
+                if time_diff < 900:  # Within 15 minutes (one candle)
+                    entry_idx = idx
+                    break
+        
+        if entry_idx is None:
+            logger.warning(f"Could not find entry point in price history for {symbol}, using rule-based fallback")
+            return self.check_risk_management(symbol) is not None
+        
+        # Ensure we have enough data
+        history_length = rl_manager.history_length
+        current_idx = len(price_history) - 1
+        
+        if current_idx - entry_idx < 1:
+            logger.warning(f"Not enough price history for {symbol} (need at least 1 period after entry)")
+            return self.check_risk_management(symbol) is not None
+        
+        # Ensure we have enough history before entry
+        window_start = max(0, entry_idx - history_length)
+        price_window = price_history.iloc[window_start:current_idx + 1].copy()
+        balance_window = balance_history.iloc[window_start:current_idx + 1].copy()
+        
+        # Ensure balance_window has same length as price_window
+        if len(balance_window) != len(price_window):
+            # Pad or trim balance_window
+            if len(balance_window) < len(price_window):
+                # Pad with last value
+                last_balance = balance_window.iloc[-1] if len(balance_window) > 0 else INITIAL_BALANCE
+                padding = pd.Series([last_balance] * (len(price_window) - len(balance_window)), 
+                                   index=price_window.index[len(balance_window):])
+                balance_window = pd.concat([balance_window, padding])
+            else:
+                balance_window = balance_window.iloc[:len(price_window)]
+        
+        # Create exit signals (none for now, agent will decide)
+        exit_signals = pd.Series(False, index=price_window.index)
+        
+        # Create environment
+        all_tickers_data = {
+            'single_ticker': {
+                'price': price_window,
+                'balance': balance_window,
+                'entry_signals': pd.Series(False, index=price_window.index),
+                'exit_signals': exit_signals
+            }
+        }
+        
+        env = RiskManagementEnv(
+            all_tickers_data=all_tickers_data,
+            initial_balance=rl_manager.initial_balance,
+            history_length=history_length,
+            max_steps=rl_manager.max_steps,
+            fee_rate=rl_manager.fee_rate
+        )
+        
+        # Manually set entry point
+        env.current_ticker = 'single_ticker'
+        env.price_data = price_window
+        env.balance_data = balance_window
+        env.exit_signals = exit_signals
+        env.entry_price = entry_price
+        env.entry_idx = entry_idx - window_start
+        env.exit_signal_idx = None  # No exit signal, agent decides
+        env.exit_idx = len(price_window) - 1
+        
+        # Set up episode windows
+        env.episode_start_idx = env.entry_idx
+        env.episode_end_idx = env.exit_idx
+        env.episode_length = env.exit_idx - env.episode_start_idx + 1
+        env.data_start_idx = max(0, env.entry_idx - env.history_length)
+        env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+        env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+        
+        # Reset environment state
+        env.current_step = 0
+        env.current_idx = current_idx - window_start  # Current position in window (relative to episode start)
+        env.position_open = True
+        env.peak_balance = rl_manager.initial_balance
+        env.max_drawdown = 0.0
+        env.total_reward = 0.0
+        env.episode_return = 0.0
+        env.returns_history = []
+        env.wins = 0
+        env.total_trades = 0
+        env.entry_balance = rl_manager.initial_balance
+        
+        # Track max/min prices from entry point
+        entry_idx_in_window = env.entry_idx
+        prices_since_entry = price_window.iloc[entry_idx_in_window:env.current_idx + 1].values
+        if len(prices_since_entry) > 0:
+            env.episode_max_price = float(np.max(prices_since_entry))
+            env.episode_min_price = float(np.min(prices_since_entry))
+        else:
+            env.episode_max_price = entry_price
+            env.episode_min_price = entry_price
+        
+        try:
+            # Get observation for current state
+            obs = env._get_observation()
+            
+            # Query RL agent
+            action, _ = rl_manager.model.predict(obs, deterministic=True)
+            
+            # Action 0 = Hold, Action 1 = Close
+            return action == 1
+        except Exception as e:
+            logger.error(f"Error getting RL agent decision for {symbol}: {e}")
+            logger.warning("Falling back to rule-based risk management")
+            return self.check_risk_management(symbol) is not None
 
 
 def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str, lookback_periods: int = 500) -> pd.DataFrame:
@@ -755,57 +904,29 @@ def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str
             return pd.DataFrame()
 
 
-def generate_signals(df: pd.DataFrame, ticker: str) -> Tuple[pd.Series, pd.Series]:
+def generate_signals(df: pd.DataFrame, ticker: str, strategy: str = "Combined") -> Tuple[pd.Series, pd.Series]:
     """
-    Generate buy/sell signals for a ticker.
-    
+    Generate buy/sell signals for a ticker using shared entry_signal_generator.
+    Same logic as evaluate_rl_agent and train_rl_agent (backtest divergence strategies).
+
     Args:
         df: DataFrame with OHLCV data
         ticker: Ticker symbol
-    
+        strategy: Strategy name (default "Combined")
+
     Returns:
         entries, exits: Boolean series for entry and exit signals
     """
     ticker_df = df[df['tic'] == ticker].copy()
-    
+
     if ticker_df.empty:
         return pd.Series(), pd.Series()
-    
-    # Set time as index
+
     ticker_df['time'] = pd.to_datetime(ticker_df['time'])
     ticker_df = ticker_df.set_index('time').sort_index()
-    
+
     price = ticker_df['close']
-    
-    # Initialize signals
-    all_strategies = {}
-    signals_dict = {}
-    
-    # Strategy 1: MACD Trend Reversals
-    if ENABLE_MACD_TREND_REVERSAL:
-        macd, signal, histogram = calculate_macd(ticker_df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-        macd_signals = identify_trend_reversals(price, macd, signal, histogram)
-        all_strategies['macd'] = macd_signals
-        signals_dict.update(macd_signals)
-    
-    # Strategy 2: RSI Trend Reversals
-    if ENABLE_RSI_TREND_REVERSAL:
-        rsi = calculate_rsi(price, RSI_PERIOD)
-        rsi_signals = identify_rsi_trend_reversals(price, rsi)
-        all_strategies['rsi'] = rsi_signals
-        signals_dict['rsi'] = rsi
-    
-    # Strategy 3: Bullish Trend Confirmation
-    if ENABLE_BULLISH_CONFIRMATION:
-        bullish_signals = identify_bullish_trend_confirmation(price)
-        all_strategies['bullish_confirmation'] = bullish_signals
-        signals_dict['ema_fast'] = bullish_signals.get('ema_fast')
-        signals_dict['ema_slow'] = bullish_signals.get('ema_slow')
-    
-    # Create combined signals
-    entries, exits = create_vectorbt_signals(ticker_df, all_strategies, price)
-    
-    return entries, exits
+    return get_strategy_signals(ticker_df, price, strategy=strategy)
 
 
 def run_live_trading(
@@ -814,7 +935,10 @@ def run_live_trading(
     private_key_path: Optional[str] = None,
     ticker_list: list = None,
     time_interval: str = "15m",
-    check_interval_seconds: int = 15
+    check_interval_seconds: int = 15,
+    use_rl_agent: bool = True,
+    rl_model_path: Optional[Path] = None,
+    rl_model_name: str = "best_model"
 ):
     """
     Run live trading loop.
@@ -822,15 +946,19 @@ def run_live_trading(
     Args:
         api_key: Binance API key
         api_secret: Binance API secret
+        private_key_path: Path to RSA private key (for RSA auth)
         ticker_list: List of tickers to trade
         time_interval: Time interval for strategy (e.g., '15m')
         check_interval_seconds: How often to check for signals (in seconds)
             - Recommended: 15-30 seconds for 15m candles
             - Too frequent (< 10s): More API calls, potential rate limiting
             - Too slow (> 60s): Might miss signals or risk management triggers
+        use_rl_agent: Whether to use RL agent for hold/close decisions (default: True)
+        rl_model_path: Path to RL model directory (default: models/rl_agent)
+        rl_model_name: RL model filename without .zip extension (default: best_model)
     """
     if ticker_list is None:
-        ticker_list = ["BTCUSDT", "ETHUSDT"]
+        ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
     
     logger.info("="*60)
     logger.info("Starting Live Trading Bot")
@@ -840,9 +968,11 @@ def run_live_trading(
     logger.info(f"Check Interval: {check_interval_seconds} seconds")
     logger.info(f"Trading Enabled: {TRADING_ENABLED}")
     logger.info(f"Testnet: {TESTNET}")
+    logger.info(f"RL Agent: {'Enabled' if use_rl_agent else 'Disabled (using rule-based)'}")
     logger.info("")
     logger.info(f"Note: Checking every {check_interval_seconds}s allows quick detection of:")
     logger.info(f"  - New candle signals (candles update every {time_interval})")
+    logger.info(f"  - RL agent hold/close decisions (if enabled)")
     logger.info(f"  - Risk management triggers (stop loss, take profit)")
     
     # Initialize trader
@@ -852,6 +982,27 @@ def run_live_trading(
         private_key_path=private_key_path,
         testnet=TESTNET
     )
+    
+    # Load RL agent if enabled
+    rl_manager = None
+    if use_rl_agent:
+        try:
+            if rl_model_path is None:
+                rl_model_path = Path("models/rl_agent")
+            
+            logger.info(f"Loading RL model from: {rl_model_path}/{rl_model_name}.zip")
+            rl_manager = RLRiskManager(
+                model_path=rl_model_path,
+                model_name=rl_model_name,
+                initial_balance=INITIAL_BALANCE,
+                deterministic=True  # Use deterministic policy for live trading
+            )
+            logger.info(f"✅ RL model loaded successfully (device: {rl_manager.model.device})")
+        except Exception as e:
+            logger.error(f"❌ Failed to load RL model: {e}")
+            logger.warning("Falling back to rule-based risk management")
+            use_rl_agent = False
+            rl_manager = None
     
     # Display initial balance
     balances = trader.get_account_balance()
@@ -881,13 +1032,44 @@ def run_live_trading(
             for ticker in ticker_list:
                 logger.info(f"Processing {ticker}...")
                 
-                # Check risk management for existing positions
-                risk_exit = trader.check_risk_management(ticker)
-                if risk_exit:
-                    logger.warning(f"Risk management exit triggered: {risk_exit}")
-                    trader.sell(ticker)
-                    last_signals[ticker]['exit'] = True
-                    continue
+                # Check if position exists
+                if ticker in trader.positions:
+                    # Get price history for RL agent decision
+                    ticker_df = df[df['tic'] == ticker].copy()
+                    if not ticker_df.empty:
+                        ticker_df = ticker_df.set_index('time').sort_index()
+                        price_history = ticker_df['close']
+                        
+                        # Create balance history (simplified - use current balance)
+                        # In a real scenario, you'd track balance over time
+                        current_balance = trader.get_account_balance().get('USDT', {}).get('total', INITIAL_BALANCE)
+                        balance_history = pd.Series(current_balance, index=price_history.index)
+                        
+                        # Check RL agent decision if enabled
+                        if use_rl_agent and rl_manager is not None:
+                            try:
+                                should_close = trader.check_rl_agent_decision(
+                                    ticker, price_history, balance_history, rl_manager
+                                )
+                                if should_close:
+                                    logger.info(f"🤖 RL Agent decision: CLOSE position for {ticker}")
+                                    trader.sell(ticker)
+                                    last_signals[ticker]['exit'] = True
+                                    continue
+                                else:
+                                    logger.info(f"🤖 RL Agent decision: HOLD position for {ticker}")
+                            except Exception as e:
+                                logger.error(f"Error querying RL agent for {ticker}: {e}")
+                                logger.warning("Falling back to rule-based risk management")
+                                # Fall through to rule-based check
+                        
+                        # Fallback to rule-based risk management
+                        risk_exit = trader.check_risk_management(ticker)
+                        if risk_exit:
+                            logger.warning(f"Risk management exit triggered: {risk_exit}")
+                            trader.sell(ticker)
+                            last_signals[ticker]['exit'] = True
+                            continue
                 
                 # Generate signals
                 entries, exits = generate_signals(df, ticker)
@@ -1031,19 +1213,26 @@ if __name__ == "__main__":
     # For HMAC Authentication (Legacy):
     #   - Need API_KEY and API_SECRET
     #   - No private key needed
+    from dotenv import load_dotenv
+    load_dotenv()
     
     API_KEY = os.getenv("BINANCE_API_KEY", "your_testnet_api_key_here")
     API_SECRET = os.getenv("BINANCE_API_SECRET", None)  # Only needed for HMAC auth
     PRIVATE_KEY_PATH = os.getenv("BINANCE_PRIVATE_KEY_PATH", "test-prv-key.pem")  # Only needed for RSA auth
     
     # Trading configuration
-    TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Tickers to trade
+    TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # All tickers to trade
     TIME_INTERVAL = "15m"  # Strategy interval
     # Check interval: How often to check for signals and risk management
     # - For 15m candles: 15-30 seconds is good (catches new candles quickly)
     # - Too frequent (< 10s): More API calls, potential rate limiting
     # - Too slow (> 60s): Might miss signals or risk management triggers
-    CHECK_INTERVAL_SECONDS = 60  # Check for signals every 15 seconds
+    CHECK_INTERVAL_SECONDS = 60  # Check for signals every 60 seconds
+    
+    # RL Agent configuration
+    USE_RL_AGENT = True  # Enable RL agent for hold/close decisions
+    RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory
+    RL_MODEL_NAME = "best_model_03012026"  # Model filename without .zip extension
     
     # Validate API key
     if API_KEY == "your_testnet_api_key_here":
@@ -1088,5 +1277,8 @@ if __name__ == "__main__":
         private_key_path=PRIVATE_KEY_PATH,
         ticker_list=TICKER_LIST,
         time_interval=TIME_INTERVAL,
-        check_interval_seconds=CHECK_INTERVAL_SECONDS
+        check_interval_seconds=CHECK_INTERVAL_SECONDS,
+        use_rl_agent=USE_RL_AGENT,
+        rl_model_path=RL_MODEL_PATH,
+        rl_model_name=RL_MODEL_NAME
     )

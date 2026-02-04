@@ -69,8 +69,8 @@ BULLISH_EMA_FAST = 9                # Fast EMA for bullish confirmation
 BULLISH_EMA_SLOW = 21               # Slow EMA for bullish confirmation
 
 # EMA 25/99 Crossover Parameters
-EMA_25_99_FAST = 99                 # Fast EMA period (25)
-EMA_25_99_SLOW = 200                 # Slow EMA period (99)
+EMA_25_99_FAST = 25                 # Fast EMA period (25)
+EMA_25_99_SLOW = 99                 # Slow EMA period (99)
 
 # Portfolio Parameters
 INITIAL_BALANCE = 100.0  # Starting balance in USD ($)
