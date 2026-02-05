@@ -154,45 +154,26 @@ class RiskManagementEnv(gym.Env):
         # Action space: 0 = Hold, 1 = Close (close position)
         self.action_space = spaces.Discrete(2)
         
-        # Observation space: 68 features (28 base + 40 timeseries)
-        # Original 12 features:
-        # 1. Current account balance (normalized)
-        # 2. Position unrealized P&L %
-        # 3. Periods held (normalized)
-        # 4. Max price change in percentage (since entry)
-        # 5. Min price change in percentage (since entry)
-        # 6. Current price change in percentage (since entry)
-        # 7. Max Balance change in percentage (since entry)
-        # 8. Min Balance change in percentage (since entry)
-        # 9. Current Balance change in percentage (since entry)
-        # 10. Current price position relative to entry (normalized)
-        # 11. Recent volatility (rolling std of returns)
-        # 12. Current drawdown from peak
-        # Technical indicator features (13-28):
-        # 13. RSI (14 period)
-        # 14. MACD line
-        # 15. MACD signal line
-        # 16. MACD histogram
-        # 17. Short-term MA (5 periods)
-        # 18. Long-term MA (20 periods)
-        # 19. MA difference (short - long) normalized
-        # 20. Price position in recent range (0-1, relative to high/low in last 20 periods)
-        # 21. Trend strength (slope of price over last 10 periods)
-        # 22. Volatility-adjusted return (return / volatility)
-        # 23. Price acceleration (rate of change of returns)
-        # 24. Distance to recent high (last 20 periods)
-        # 25. Distance to recent low (last 20 periods)
-        # 26. Rate of change (momentum over last 5 periods)
-        # 27. Price relative to entry (normalized to [-1, 1])
-        # 28. Return consistency (inverse of return volatility)
-        # Timeseries features (29-68):
-        # 29-48. Historical price sequence (last 20 prices, normalized by entry price)
-        # 49-68. Historical return sequence (last 20 returns)
-        self.timeseries_length = 20  # Number of historical periods to include
+        # Observation space: 60 timesteps × 6 features = 360 features
+        # Features per timestep:
+        # 1. MACD (normalized by entry price)
+        # 2. MACD Histogram (normalized by entry price)
+        # 3. RSI (normalized to [0, 1])
+        # 4. EMA 25 (percent-change from entry price)
+        # 5. EMA 99 (percent-change from entry price)
+        # 6. Close Price (percent-change from entry price)
+        # 
+        # Normalization strategy:
+        # - MACD/Histogram: Normalized by entry price (relative values)
+        # - RSI: Normalized to [0, 1] range (RSI/100)
+        # - EMA 25/99/Close: Percent-change from entry price (handles future out-of-range prices)
+        self.timeseries_length = 60  # Number of historical timesteps
+        self.n_features_per_timestep = 6  # MACD, Histogram, RSI, EMA25, EMA99, Close
+        obs_shape = (self.timeseries_length * self.n_features_per_timestep,)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(28 + 2 * self.timeseries_length,),  # 28 base + 20 prices + 20 returns = 68
+            shape=obs_shape,  # 60 timesteps × 6 features = 360 features
             dtype=np.float32
         )
         
@@ -259,6 +240,17 @@ class RiskManagementEnv(gym.Env):
         histogram_normalized = histogram / entry_price if entry_price > 0 else 0.0
         
         return float(macd_normalized), float(signal_normalized), float(histogram_normalized)
+    
+    def _calculate_ema(self, prices: np.ndarray, period: int) -> float:
+        """Calculate Exponential Moving Average (EMA)."""
+        if len(prices) < period:
+            # Not enough data, use simple average of available data
+            return float(np.mean(prices)) if len(prices) > 0 else float(prices[-1]) if len(prices) > 0 else 0.0
+        
+        # Convert to pandas Series for easier EMA calculation
+        price_series = pd.Series(prices)
+        ema = price_series.ewm(span=period, adjust=False).mean().iloc[-1]
+        return float(ema)
     
     def _calculate_moving_averages(self, prices: np.ndarray, short_period: int = 5, long_period: int = 20) -> Tuple[float, float, float]:
         """Calculate short and long moving averages."""
@@ -386,10 +378,16 @@ class RiskManagementEnv(gym.Env):
         
     def _get_observation(self) -> np.ndarray:
         """
-        Construct observation vector from current state.
+        Construct observation vector with 60 timesteps of features.
         
         Returns:
-            Observation array of 68 features (28 base + 20 historical prices + 20 historical returns)
+            Observation array of 360 features (60 timesteps × 6 features):
+            - MACD (normalized by entry price)
+            - MACD Histogram (normalized by entry price)
+            - RSI (normalized to [0, 1])
+            - EMA 25 (percent-change from entry price)
+            - EMA 99 (percent-change from entry price)
+            - Close Price (percent-change from entry price)
         """
         # Ensure environment is initialized (should have been reset)
         if self.price_window is None or self.balance_window is None:
@@ -398,218 +396,80 @@ class RiskManagementEnv(gym.Env):
         if self.current_idx is None:
             # First step, use entry point
             self.current_idx = 0
-            
-        # Get actual data index
-        if self.episode_start_idx is None:
-            self.episode_start_idx = 0
-        data_idx = self.episode_start_idx + self.current_idx
         
         # Ensure we don't go beyond available data
-        if data_idx >= len(self.price_data):
-            data_idx = len(self.price_data) - 1
         if self.current_idx >= len(self.price_window):
             self.current_idx = len(self.price_window) - 1
-            
-        # Current price and balance
-        current_price = float(self.price_window.iloc[self.current_idx])
-        current_balance = float(self.balance_window.iloc[self.current_idx])
         
-        # Current price change % (since entry)
-        price_change_pct = (current_price - self.entry_price) / self.entry_price
+        # Get entry price for normalization
+        entry_price = float(self.entry_price)
         
-        # Position unrealized P&L % (accounting for fees if we exit now)
-        # Net return = (price_change - 2*fee_rate) since we pay fees on entry and exit
-        unrealized_pnl_pct = price_change_pct - 2 * self.fee_rate
-        
-        # Periods held (normalized by max steps)
-        # Use episode_length for normalization instead of max_steps
-        periods_held = self.current_idx / max(self.episode_length, 1) if hasattr(self, 'episode_length') and self.episode_length > 0 else 0.0
-        
-        # Calculate price change statistics (max, min, current) since entry
-        # Get all price changes from entry point to current position
-        price_changes = []
-        initial_balance_value = float(self.balance_data.iloc[max(0, self.data_start_idx)])
-        
-        # Entry point relative to window start
-        entry_idx_in_window = self.entry_idx - self.data_start_idx if self.data_start_idx > 0 else self.entry_idx
-        entry_idx_in_window = max(0, entry_idx_in_window)
-        
-        # Calculate price changes from entry point to current position
-        for i in range(entry_idx_in_window, self.current_idx + 1):
-            if i < len(self.price_window):
-                hist_price = float(self.price_window.iloc[i])
-                price_change = (hist_price - self.entry_price) / self.entry_price
-                price_changes.append(price_change)
-        
-        # Calculate max, min, and current price change
-        if len(price_changes) > 0:
-            max_price_change = max(price_changes)
-            min_price_change = min(price_changes)
-            current_price_change = price_change_pct
-        else:
-            # Fallback if no history yet (shouldn't happen, but safe)
-            max_price_change = price_change_pct
-            min_price_change = price_change_pct
-            current_price_change = price_change_pct
-        
-        # Calculate balance change statistics (max, min, current) since entry
-        # Get all balance changes from entry point to current position
-        balance_changes = []
-        
-        # Calculate balance changes from entry point to current position
-        for i in range(entry_idx_in_window, self.current_idx + 1):
-            if i < len(self.balance_window):
-                hist_balance = float(self.balance_window.iloc[i])
-                balance_change = (hist_balance - initial_balance_value) / initial_balance_value
-                balance_changes.append(balance_change)
-        
-        # Calculate max, min, and current balance change
-        if len(balance_changes) > 0:
-            max_balance_change = max(balance_changes)
-            min_balance_change = min(balance_changes)
-            current_balance_change = (current_balance - initial_balance_value) / initial_balance_value
-        else:
-            # Fallback if no history yet
-            current_balance_change = (current_balance - initial_balance_value) / initial_balance_value
-            max_balance_change = current_balance_change
-            min_balance_change = current_balance_change
-        
-        # Current price position relative to entry (normalized)
-        # Use a simple normalization: clip to [-2, 2] range and normalize
-        price_relative = np.clip(price_change_pct, -0.5, 0.5) / 0.5  # Normalize to [-1, 1]
-        
-        # Recent volatility (rolling std of returns over last 30 periods)
-        if self.current_idx >= 1:
-            lookback = min(self.current_idx + 1, 30)  # Use last 30 periods
-            recent_prices = [float(self.price_window.iloc[max(0, self.current_idx - i)]) 
-                           for i in range(lookback)]
-            if len(recent_prices) > 1:
-                returns = np.diff(recent_prices) / recent_prices[:-1]
-                volatility = np.std(returns) if len(returns) > 0 else 0.0
-            else:
-                volatility = 0.0
-        else:
-            volatility = 0.0
-        
-        # Current drawdown from peak
-        if current_balance > self.peak_balance:
-            self.peak_balance = current_balance
-        current_drawdown = (self.peak_balance - current_balance) / self.peak_balance if self.peak_balance > 0 else 0.0
-        if current_drawdown > self.max_drawdown:
-            self.max_drawdown = current_drawdown
-        
-        # Normalize account balance (relative to initial balance)
-        normalized_balance = (current_balance - self.initial_balance) / self.initial_balance
-        
-        # Get price history for technical indicators
-        # Use prices from the start of the window to current position
-        price_history = []
-        for i in range(max(0, self.current_idx - 60), self.current_idx + 1):
-            if i < len(self.price_window):
-                price_history.append(float(self.price_window.iloc[i]))
-        
-        if len(price_history) == 0:
-            price_history = [current_price]
-        
-        price_array = np.array(price_history)
-        
-        # Calculate technical indicators
-        rsi = self._calculate_rsi(price_array, period=14)
-        macd_line, macd_signal, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
-        short_ma, long_ma, ma_diff = self._calculate_moving_averages(price_array, short_period=5, long_period=20)
-        price_position = self._calculate_price_position_in_range(price_array, lookback=20)
-        trend_strength = self._calculate_trend_strength(price_array, period=10)
-        
-        # Calculate returns for volatility-adjusted metrics
-        if len(price_array) > 1:
-            returns = np.diff(price_array) / price_array[:-1]
-        else:
-            returns = np.array([0.0])
-        
-        volatility_adjusted_return = self._calculate_volatility_adjusted_return(returns)
-        price_acceleration = self._calculate_price_acceleration(price_array, period=5)
-        dist_to_high, dist_to_low = self._calculate_distance_to_extremes(price_array, lookback=20)
-        rate_of_change = self._calculate_rate_of_change(price_array, period=5)
-        return_consistency = self._calculate_return_consistency(returns)
-        
-        # ========== TIMESERIES DATA: Historical prices and returns ==========
-        # Extract historical price sequence (last N periods, normalized by entry price)
-        historical_prices = []
+        # Collect 60 timesteps of features
+        # Start from max(0, current_idx - timeseries_length + 1) to current_idx + 1
         lookback_start = max(0, self.current_idx - self.timeseries_length + 1)
+        timestep_features = []
+        
         for i in range(lookback_start, self.current_idx + 1):
-            if i < len(self.price_window):
-                hist_price = float(self.price_window.iloc[i])
-                # Normalize by entry price to make it relative
-                price_normalized = (hist_price - self.entry_price) / self.entry_price
-                historical_prices.append(price_normalized)
+            if i >= len(self.price_window):
+                break
+            
+            # Get price history up to this timestep (need enough history for indicators)
+            price_history = []
+            # Need at least 99 periods for EMA 99, but use available data
+            history_start = max(0, i - 99)
+            for j in range(history_start, i + 1):
+                if j < len(self.price_window):
+                    price_history.append(float(self.price_window.iloc[j]))
+            
+            if len(price_history) == 0:
+                # Fallback: use current price
+                price_history = [float(self.price_window.iloc[min(i, len(self.price_window) - 1)])]
+            
+            price_array = np.array(price_history)
+            current_price = float(price_array[-1])
+            
+            # Calculate MACD (normalized by entry price)
+            macd_line, macd_signal, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
+            
+            # Calculate RSI (normalized to [0, 1])
+            rsi_raw = self._calculate_rsi(price_array, period=14)
+            rsi_normalized = rsi_raw  # Already normalized to [0, 1] in _calculate_rsi
+            
+            # Calculate EMA 25 and EMA 99 (percent-change from entry price)
+            ema_25 = self._calculate_ema(price_array, period=25)
+            ema_99 = self._calculate_ema(price_array, period=99)
+            
+            # Normalize EMAs and close price by percent-change from entry price
+            # This handles future prices that may be out of training range
+            if entry_price > 0:
+                ema_25_pct = (ema_25 - entry_price) / entry_price
+                ema_99_pct = (ema_99 - entry_price) / entry_price
+                close_pct = (current_price - entry_price) / entry_price
+            else:
+                ema_25_pct = 0.0
+                ema_99_pct = 0.0
+                close_pct = 0.0
+            
+            # Features for this timestep: [MACD, Histogram, RSI, EMA25, EMA99, Close]
+            timestep_features.append([
+                float(macd_line),      # MACD (normalized by entry price)
+                float(macd_histogram), # MACD Histogram (normalized by entry price)
+                float(rsi_normalized), # RSI (normalized to [0, 1])
+                float(ema_25_pct),     # EMA 25 (percent-change from entry)
+                float(ema_99_pct),     # EMA 99 (percent-change from entry)
+                float(close_pct)       # Close Price (percent-change from entry)
+            ])
         
-        # Pad with zeros if not enough history
-        while len(historical_prices) < self.timeseries_length:
-            historical_prices.insert(0, 0.0)
+        # Pad with zeros at the beginning if we don't have enough history
+        while len(timestep_features) < self.timeseries_length:
+            # Use zero values for padding (represents no change from entry)
+            timestep_features.insert(0, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0])  # RSI defaults to 0.5 (neutral)
         
-        # Take only the last N periods
-        historical_prices = historical_prices[-self.timeseries_length:]
+        # Take only the last N timesteps
+        timestep_features = timestep_features[-self.timeseries_length:]
         
-        # Extract historical return sequence (last N periods)
-        historical_returns = []
-        if len(price_array) > 1:
-            # Calculate returns from price array
-            price_returns = np.diff(price_array) / price_array[:-1]
-            # Get last N returns
-            lookback_returns = min(self.timeseries_length, len(price_returns))
-            historical_returns = price_returns[-lookback_returns:].tolist()
-        
-        # Pad with zeros if not enough history
-        while len(historical_returns) < self.timeseries_length:
-            historical_returns.insert(0, 0.0)
-        
-        # Take only the last N periods
-        historical_returns = historical_returns[-self.timeseries_length:]
-        
-        # Convert to numpy arrays
-        historical_prices = np.array(historical_prices, dtype=np.float32)
-        historical_returns = np.array(historical_returns, dtype=np.float32)
-        
-        # Construct observation vector (68 features: 28 base + 20 prices + 20 returns)
-        observation = np.concatenate([
-            # Base features (28)
-            np.array([
-                # Original 12 features
-                normalized_balance,          # 0: Current account balance (normalized)
-                unrealized_pnl_pct,          # 1: Position unrealized P&L %
-                periods_held,                # 2: Periods held (normalized)
-                max_price_change,            # 3: Max price change in percentage
-                min_price_change,            # 4: Min price change in percentage
-                current_price_change,        # 5: Current price change in percentage
-                max_balance_change,          # 6: Max Balance change in percentage
-                min_balance_change,          # 7: Min Balance change in percentage
-                current_balance_change,      # 8: Current Balance change in percentage
-                price_relative,              # 9: Current price relative to entry
-                volatility,                  # 10: Recent volatility
-                current_drawdown,            # 11: Current drawdown
-                
-                # Technical indicator features (13-28)
-                rsi,                         # 12: RSI (14 period, normalized to [0,1])
-                macd_line,                   # 13: MACD line (normalized)
-                macd_signal,                 # 14: MACD signal line (normalized)
-                macd_histogram,              # 15: MACD histogram (normalized)
-                short_ma,                    # 16: Short-term MA (5 periods, normalized)
-                long_ma,                     # 17: Long-term MA (20 periods, normalized)
-                ma_diff,                     # 18: MA difference (short - long, normalized)
-                price_position,              # 19: Price position in recent range [0,1]
-                trend_strength,              # 20: Trend strength (slope, normalized)
-                volatility_adjusted_return,  # 21: Volatility-adjusted return
-                price_acceleration,          # 22: Price acceleration (rate of change of returns)
-                dist_to_high,                # 23: Distance to recent high (normalized)
-                dist_to_low,                 # 24: Distance to recent low (normalized)
-                rate_of_change,              # 25: Rate of change (momentum over 5 periods)
-                np.mean(returns[-10:]) if len(returns) >= 10 else np.mean(returns) if len(returns) > 0 else 0.0,  # 26: Average return over last 10 periods
-                return_consistency           # 27: Return consistency (inverse volatility)
-            ], dtype=np.float32),
-            # Timeseries features (29-68)
-            historical_prices,               # 29-48: Historical price sequence (last 20 prices, normalized)
-            historical_returns               # 49-68: Historical return sequence (last 20 returns)
-        ])
+        # Flatten to 1D array: 60 timesteps × 6 features = 360 features
+        observation = np.array(timestep_features, dtype=np.float32).flatten()
         
         return observation
     

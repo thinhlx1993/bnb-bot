@@ -14,14 +14,10 @@ from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime
 
-# Configure JAX before importing SBX
-# Set device priority: CUDA > CPU (skip TPU to avoid warnings)
-os.environ['JAX_PLATFORMS'] = 'cuda,cpu'  # Use CUDA if available, otherwise CPU (skip TPU)
+# RecurrentPPO uses PyTorch, no JAX configuration needed
 
-# RL imports - Using SBX (Stable Baselines Jax) for faster training
-import jax
-import jax.numpy as jnp
-from sbx import PPO
+# RL imports - Using RecurrentPPO from sb3-contrib for recurrent policies
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
@@ -47,22 +43,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure JAX device selection: CUDA > CPU (skip TPU)
-# This suppresses TPU warnings and sets device priority
-try:
-    # Try to use CUDA if available
-    cuda_devices = jax.devices('gpu')
-    if len(cuda_devices) > 0:
-        logger.info(f"JAX using CUDA: {len(cuda_devices)} GPU(s) available")
-        jax.config.update('jax_default_device', cuda_devices[0])
-    else:
-        logger.info("JAX using CPU (CUDA not available)")
-        jax.config.update('jax_default_device', jax.devices('cpu')[0])
-except Exception as e:
-    # Fallback to CPU if CUDA setup fails
-    logger.info(f"JAX using CPU (CUDA setup failed: {e})")
-    jax.config.update('jax_default_device', jax.devices('cpu')[0])
-
 # Configuration
 TRAINING_DATA_DIR = Path("rl_training_episodes")
 MODEL_SAVE_DIR = Path("models/rl_agent")
@@ -79,7 +59,7 @@ TOTAL_TIMESTEPS = 5e7  # Total training steps (use early stopping)
 LEARNING_RATE = 3e-4  # Initial learning rate
 LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
 USE_LR_SCHEDULE = True  # Enable learning rate scheduling
-BATCH_SIZE = 256  # Batch size for stable training
+BATCH_SIZE = 1024  # Batch size for stable training (increase to 512-1024 for better GPU utilization if memory allows)
 N_STEPS = 2048  # Steps per update
 N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
 GAMMA = 0.99  # Discount factor
@@ -93,10 +73,8 @@ CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conserv
 USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stable training
 
 # Device configuration
-# Note: SBX (JAX-based) automatically handles device selection efficiently
-# JAX can use CPU or GPU/TPU automatically based on availability
-# For MLP policies, both CPU and GPU work well with JAX's efficient computation
-USE_GPU = False  # SBX will use GPU if available and USE_GPU=True, otherwise CPU (both are efficient with JAX)
+# RecurrentPPO uses PyTorch and will automatically use GPU if available
+USE_GPU = True  # RecurrentPPO will use GPU if available (CUDA), otherwise CPU
 
 # Parallel training configuration (inspired by ElegantRL's multiprocessing approach)
 USE_PARALLEL_ENVS = True  # Use SubprocVecEnv for true parallel training (like ElegantRL)
@@ -113,10 +91,12 @@ N_ENVS = None  # Number of parallel environments (None = auto-detect CPU count, 
 # ElegantRL uses 'spawn' on Windows and 'forkserver' on Linux to avoid CUDA fork issues
 MULTIPROCESSING_START_METHOD = 'forkserver' if os.name != 'nt' else 'spawn'
 
-# Model architecture configuration
-POLICY_LAYERS = [256, 256]  # Policy network hidden layers
-VALUE_LAYERS = [256, 256]   # Value network hidden layers
+# Model architecture configuration for RecurrentPPO
+POLICY_LAYERS = [256, 256]  # Policy network hidden layers (after LSTM)
+VALUE_LAYERS = [256, 256]   # Value network hidden layers (after LSTM)
 ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
+LSTM_HIDDEN_SIZE = 256  # LSTM hidden size
+N_LSTM_LAYERS = 1  # Number of LSTM layers
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 50000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
 
@@ -560,12 +540,22 @@ class DynamicEvalCallback(BaseCallback):
                 steps = 0
                 bot_closed = False
                 
+                # Initialize LSTM states for RecurrentPPO
+                lstm_states = None
+                episode_starts = np.ones((1,), dtype=bool)
+                
                 while not done and steps < max_steps_per_episode:
-                    action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                    action, lstm_states = self.model.predict(
+                        obs, 
+                        state=lstm_states, 
+                        episode_start=episode_starts, 
+                        deterministic=self.deterministic
+                    )
                     obs, reward, terminated, truncated, info = env.step(action)
                     total_reward += reward
                     steps += 1
                     done = terminated or truncated
+                    episode_starts = np.array([done], dtype=bool)
                     # Check if bot chose to close (action==1) - this means bot closed voluntarily
                     if action == 1:
                         bot_closed = True
@@ -1387,18 +1377,19 @@ def train_ppo_agent(
         )
         logger.info("VecNormalize enabled: rewards will be normalized (observations already normalized in env)")
     
+    
     logger.info("Eval callback will run full validation (all entry signals, single env sequential) every eval")
     
-    # Create PPO model with more complex architecture
-    logger.info("Creating PPO model with complex architecture (SBX/JAX)...")
+    # Create RecurrentPPO model with LSTM architecture
+    logger.info("Creating RecurrentPPO model with LSTM architecture...")
     
-    # SBX requires JAX activation functions (callables, not strings)
-    # Map string names to JAX activation functions
+    # Map string names to PyTorch activation functions
+    import torch.nn as nn
     activation_map = {
-        'tanh': jnp.tanh,
-        'relu': lambda x: jnp.maximum(x, 0),  # ReLU: max(x, 0)
-        'elu': lambda x: jnp.where(x > 0, x, jnp.exp(x) - 1),  # ELU
-        'leaky_relu': lambda x: jnp.maximum(0.01 * x, x)  # LeakyReLU with alpha=0.01
+        'tanh': nn.Tanh,
+        'relu': nn.ReLU,
+        'elu': nn.ELU,
+        'leaky_relu': nn.LeakyReLU
     }
     
     activation_fn_name = ACTIVATION_FN.lower()
@@ -1409,22 +1400,25 @@ def train_ppo_agent(
     activation_fn = activation_map[activation_fn_name]
     
     policy_kwargs = dict(
-        # Deeper and wider network architecture
-        # Separate networks for policy (pi) and value function (vf)
-        # Policy network: Multiple hidden layers with decreasing width (bottleneck design)
-        # Value network: Multiple hidden layers with decreasing width
-        # SBX format: direct dictionary (not list containing dict)
+        # Network architecture after LSTM
         net_arch={
-            "pi": POLICY_LAYERS,  # Policy network layers
-            "vf": VALUE_LAYERS    # Value network layers
+            "pi": POLICY_LAYERS,  # Policy network layers (after LSTM)
+            "vf": VALUE_LAYERS    # Value network layers (after LSTM)
         },
-        # Use activation function (SBX requires JAX callable functions)
-        activation_fn=activation_fn
+        activation_fn=activation_fn,
+        # LSTM configuration
+        lstm_hidden_size=LSTM_HIDDEN_SIZE,
+        n_lstm_layers=N_LSTM_LAYERS,
+        enable_critic_lstm=True,  # Use separate LSTM for critic
+        shared_lstm=False  # Separate LSTMs for actor and critic
     )
     
-    # SBX (JAX-based) automatically handles device selection efficiently
-    # JAX can use CPU, GPU, or TPU automatically
-    logger.info("SBX (JAX) will automatically select the best available device (CPU/GPU/TPU)")
+    # Set device for PyTorch
+    import torch
+    device = 'cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     
     # Set up learning rate (constant or scheduled)
     if USE_LR_SCHEDULE:
@@ -1434,8 +1428,8 @@ def train_ppo_agent(
         lr_schedule = LEARNING_RATE
         logger.info(f"Using constant LR: {LEARNING_RATE}")
     
-    model = PPO(
-        "MlpPolicy",
+    model = RecurrentPPO(
+        "MlpLstmPolicy",
         train_env,
         learning_rate=lr_schedule,
         n_steps=N_STEPS,
@@ -1446,18 +1440,20 @@ def train_ppo_agent(
         ent_coef=ENT_COEF,
         vf_coef=VF_COEF,
         max_grad_norm=MAX_GRAD_NORM,
-        clip_range=CLIP_RANGE,  # Explicit clip range for conservative policy updates
+        clip_range=CLIP_RANGE,
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(tensorboard_log_dir),
-        verbose=0
-        # Note: SBX automatically handles device selection (no device parameter needed)
+        verbose=0,
+        device=device
     )
     
-    logger.info(f"Model architecture (SBX/JAX):")
-    logger.info(f"  Policy network: {POLICY_LAYERS} ({len(POLICY_LAYERS)} hidden layers)")
-    logger.info(f"  Value network: {VALUE_LAYERS} ({len(VALUE_LAYERS)} hidden layers)")
+    logger.info(f"Model architecture (RecurrentPPO):")
+    logger.info(f"  LSTM hidden size: {LSTM_HIDDEN_SIZE}")
+    logger.info(f"  LSTM layers: {N_LSTM_LAYERS}")
+    logger.info(f"  Policy network (after LSTM): {POLICY_LAYERS} ({len(POLICY_LAYERS)} hidden layers)")
+    logger.info(f"  Value network (after LSTM): {VALUE_LAYERS} ({len(VALUE_LAYERS)} hidden layers)")
     logger.info(f"  Activation function: {ACTIVATION_FN}")
-    logger.info(f"  Framework: SBX (JAX-based) - faster training with JIT compilation")
+    logger.info(f"  Framework: RecurrentPPO (PyTorch) - LSTM for temporal dependencies")
     # Estimate parameters: sum of layer sizes squared
     pi_params = sum(POLICY_LAYERS[i] * POLICY_LAYERS[i+1] for i in range(len(POLICY_LAYERS)-1))
     vf_params = sum(VALUE_LAYERS[i] * VALUE_LAYERS[i+1] for i in range(len(VALUE_LAYERS)-1))
@@ -1518,7 +1514,7 @@ def train_ppo_agent(
     callback_list = CallbackList(callbacks)
     
     # Train model
-    logger.info(f"\nStarting training for {total_timesteps} timesteps...")
+    logger.info(f"Starting training for {total_timesteps} timesteps...")
     logger.info(f"Parallel training: {USE_PARALLEL_ENVS} ({env_type})")
     logger.info(f"Number of parallel environments: {n_envs}")
     logger.info(f"Checkpoints will be saved every {CHECKPOINT_FREQ} steps")
@@ -1564,20 +1560,30 @@ def _evaluate_with_episode_returns(model, vec_env, n_eval_episodes: int, determi
     Run evaluation and collect episode_rewards, episode_lengths, episode_returns.
     Win rate is computed from episode_returns (positive balance = win).
     Returns (episode_rewards, episode_lengths, episode_returns).
+    Supports RecurrentPPO with LSTM states.
     """
     episode_rewards = []
     episode_lengths = []
     episode_returns = []
-    episode_starts = [True] * vec_env.num_envs
+    episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
     n_completed = 0
     obs, _ = vec_env.reset()
     step_count = np.zeros(vec_env.num_envs, dtype=int)
     total_rewards = np.zeros(vec_env.num_envs)
+    lstm_states = None  # LSTM states for RecurrentPPO
+    
     while n_completed < n_eval_episodes:
-        actions, _ = model.predict(obs, deterministic=deterministic)
+        actions, lstm_states = model.predict(
+            obs, 
+            state=lstm_states, 
+            episode_start=episode_starts, 
+            deterministic=deterministic
+        )
         obs, rewards, dones, infos = vec_env.step(actions)
         total_rewards += rewards
         step_count += 1
+        episode_starts = dones  # Update episode starts based on dones
+        
         for i in range(vec_env.num_envs):
             if dones[i]:
                 episode_rewards.append(float(total_rewards[i]))
