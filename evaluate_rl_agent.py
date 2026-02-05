@@ -49,7 +49,7 @@ RESULTS_DIR = Path("results")
 RL_RESULTS_DIR = Path("results/rl_agent")
 RL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_LOAD_DIR = Path("models/rl_agent")
-DEFAULT_MODEL_NAME = "best_model"
+DEFAULT_MODEL_NAME = "ppo_risk_agent_interrupted"
 
 # Evaluation date range configuration
 # Set to None to use all available data, or specify date range for evaluation

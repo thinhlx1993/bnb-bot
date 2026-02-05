@@ -13,6 +13,7 @@ import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime
+from tqdm import tqdm
 
 # RecurrentPPO uses PyTorch, no JAX configuration needed
 
@@ -462,9 +463,19 @@ class DynamicEvalCallback(BaseCallback):
             logger.warning("No entry signals found in validation data")
             return [], [], [], 0
         
-        logger.info(f"Evaluating {len(all_entry_points)} entry signals (single env, max 1000 steps per episode)...")
+        total_signals = len(all_entry_points)
+        logger.info(f"Evaluating {total_signals} entry signals (single env, max 1000 steps per episode)...")
         history_length = 60
         max_steps_per_episode = 1000
+        
+        # Create progress bar for validation
+        pbar = tqdm(
+            total=total_signals,
+            desc="Validation",
+            unit="episode",
+            leave=True,
+            ncols=100
+        )
         
         # Create ONE env that we'll reuse (will be reconfigured per episode)
         env = RiskManagementEnv(
@@ -533,6 +544,9 @@ class DynamicEvalCallback(BaseCallback):
                 env.episode_max_price = env.entry_price
                 env.episode_min_price = env.entry_price
                 
+                # Pre-compute indicators for this episode (performance optimization)
+                env._precomputed_indicators = env._precompute_indicators()
+                
                 # Run episode: bot trades until it closes OR max_steps reached
                 obs = env._get_observation()
                 done = False
@@ -589,11 +603,20 @@ class DynamicEvalCallback(BaseCallback):
                     failure_count += 1
                     # Don't update balance for failed episodes (position still open)
                 
-                if (ep_idx + 1) % 200 == 0 and self.verbose >= 1:
-                    completed = len(all_rewards)
-                    logger.info(f"  Progress: {ep_idx + 1}/{len(all_entry_points)} entries | Completed: {completed}, Failures: {failure_count}")
+                # Update progress bar after each episode
+                completed = len(all_rewards)
+                win_count = len([r for r in all_episode_returns if r > 0])
+                win_rate = win_count / max(completed, 1) if completed > 0 else 0.0
+                pbar.set_description(f"Validation [{ep_idx+1}/{total_signals}]")
+                pbar.set_postfix({
+                    'Completed': completed,
+                    'Failures': failure_count,
+                    'Win Count': f"{win_count}",
+                })
+                pbar.update(1)
         
         finally:
+            pbar.close()
             env.close()
         
         self._last_episode_returns = all_episode_returns

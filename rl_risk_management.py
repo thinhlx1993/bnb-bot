@@ -1,7 +1,7 @@
 """
 RL Risk Management Integration
 Wrapper to integrate trained RL agent with existing backtest system.
-Uses SBX (Stable Baselines Jax) for faster inference.
+Uses RecurrentPPO from sb3_contrib for recurrent policies with LSTM.
 """
 
 import sys
@@ -11,7 +11,7 @@ import pandas as pd
 from typing import Optional, Tuple, Dict, Any
 import logging
 from tqdm import tqdm
-from sbx import PPO  # Using SBX (JAX-based) for faster inference
+from sb3_contrib import RecurrentPPO  # Using RecurrentPPO for recurrent policies
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 # Import custom environment
@@ -92,9 +92,12 @@ class RLRiskManager:
         
         logger.info(f"Loading RL model from: {model_file}")
         try:
-            # SBX (JAX-based) automatically handles device selection efficiently
-            self.model = PPO.load(str(model_file))
-            logger.info(f"RL model loaded successfully (SBX/JAX - automatic device selection)")
+            # RecurrentPPO uses PyTorch and will automatically use GPU if available
+            self.model = RecurrentPPO.load(str(model_file))
+            logger.info(f"RL model loaded successfully (RecurrentPPO - PyTorch)")
+            # Get device info
+            if hasattr(self.model, 'device'):
+                logger.info(f"Using device: {self.model.device}")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
@@ -312,6 +315,9 @@ class RLRiskManager:
             env.episode_max_price = env.entry_price
             env.episode_min_price = env.entry_price
             
+            # Pre-compute indicators for performance (avoids recalculating on every step)
+            env._precomputed_indicators = env._precompute_indicators()
+            
             # Get initial observation
             obs = env._get_observation()
             
@@ -320,14 +326,26 @@ class RLRiskManager:
             position_step = 0
             update_interval = max(1, env.episode_length // 10) if env.episode_length > 0 else 10
             
+            # Initialize LSTM states for RecurrentPPO
+            lstm_states = None
+            episode_starts = np.ones((1,), dtype=bool)
+            
             while not done:
-                # Query RL agent
-                action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                # Query RL agent with LSTM states for RecurrentPPO
+                action, lstm_states = self.model.predict(
+                    obs, 
+                    state=lstm_states, 
+                    episode_start=episode_starts, 
+                    deterministic=self.deterministic
+                )
                 
                 # Step environment
                 obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 position_step += 1
+                
+                # Update episode_start flag for LSTM state management
+                episode_starts = np.array([done], dtype=bool)
                 
                 # Update progress periodically
                 if position_step % update_interval == 0:

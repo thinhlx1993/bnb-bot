@@ -756,12 +756,23 @@ class BinanceTrader:
             env.episode_max_price = entry_price
             env.episode_min_price = entry_price
         
+        # Pre-compute indicators for performance (avoids recalculating on every step)
+        env._precomputed_indicators = env._precompute_indicators()
+        
         try:
             # Get observation for current state
             obs = env._get_observation()
             
-            # Query RL agent
-            action, _ = rl_manager.model.predict(obs, deterministic=True)
+            # Query RL agent with LSTM states for RecurrentPPO
+            # Initialize LSTM states (None = reset state, since this is a fresh check)
+            lstm_states = None
+            episode_starts = np.ones((1,), dtype=bool)
+            action, _ = rl_manager.model.predict(
+                obs, 
+                state=lstm_states, 
+                episode_start=episode_starts, 
+                deterministic=True
+            )
             
             # Action 0 = Hold, Action 1 = Close
             return action == 1

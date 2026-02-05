@@ -195,6 +195,9 @@ class RiskManagementEnv(gym.Env):
         # Track max and min prices during episode
         self.episode_max_price = None
         self.episode_min_price = None
+        
+        # Pre-computed indicators cache (for performance optimization)
+        self._precomputed_indicators = None
     
     def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
         """Calculate RSI (Relative Strength Index)."""
@@ -376,9 +379,86 @@ class RiskManagementEnv(gym.Env):
         consistency = 1.0 / (1.0 + volatility)
         return float(consistency)
         
+    def _precompute_indicators(self):
+        """
+        Pre-compute all technical indicators for the current price window.
+        This is called once per episode (in reset()) to avoid recalculating
+        indicators on every step, which is a major performance bottleneck.
+        """
+        if self.price_window is None or len(self.price_window) == 0:
+            return None
+        
+        prices = self.price_window.values
+        entry_price = float(self.entry_price)
+        n = len(prices)
+        
+        # Convert to pandas Series for efficient calculations
+        price_series = pd.Series(prices)
+        
+        # Pre-compute MACD for all timesteps
+        exp1 = price_series.ewm(span=12, adjust=False).mean()
+        exp2 = price_series.ewm(span=26, adjust=False).mean()
+        macd_line = exp1 - exp2
+        macd_series = macd_line
+        signal_line = macd_series.ewm(span=9, adjust=False).mean()
+        histogram = macd_line - signal_line
+        
+        # Normalize MACD by entry price
+        macd_normalized = (macd_line / entry_price).values if entry_price > 0 else np.zeros(n)
+        histogram_normalized = (histogram / entry_price).values if entry_price > 0 else np.zeros(n)
+        
+        # Pre-compute RSI for all timesteps
+        rsi_values = np.zeros(n)
+        for i in range(n):
+            if i < 14:
+                rsi_values[i] = 0.5  # Neutral RSI if not enough data
+            else:
+                # Use sliding window approach
+                window = prices[max(0, i-14):i+1]
+                if len(window) >= 2:
+                    deltas = np.diff(window)
+                    gains = np.where(deltas > 0, deltas, 0.0)
+                    losses = np.where(deltas < 0, -deltas, 0.0)
+                    avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
+                    avg_loss = np.mean(losses) if len(losses) > 0 else 1e-10
+                    if avg_loss == 0:
+                        rsi_values[i] = 1.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsi = 100 - (100 / (1 + rs))
+                        rsi_values[i] = rsi / 100.0  # Normalize to [0, 1]
+                else:
+                    rsi_values[i] = 0.5
+        
+        # Pre-compute EMAs
+        ema_25 = price_series.ewm(span=25, adjust=False).mean()
+        ema_99 = price_series.ewm(span=99, adjust=False).mean()
+        
+        # Normalize EMAs and prices by percent-change from entry price
+        if entry_price > 0:
+            ema_25_pct = ((ema_25 - entry_price) / entry_price).values
+            ema_99_pct = ((ema_99 - entry_price) / entry_price).values
+            close_pct = ((price_series - entry_price) / entry_price).values
+        else:
+            ema_25_pct = np.zeros(n)
+            ema_99_pct = np.zeros(n)
+            close_pct = np.zeros(n)
+        
+        return {
+            'macd': macd_normalized.astype(np.float32),
+            'histogram': histogram_normalized.astype(np.float32),
+            'rsi': rsi_values.astype(np.float32),
+            'ema_25': ema_25_pct.astype(np.float32),
+            'ema_99': ema_99_pct.astype(np.float32),
+            'close': close_pct.astype(np.float32)
+        }
+    
     def _get_observation(self) -> np.ndarray:
         """
         Construct observation vector with 60 timesteps of features.
+        
+        OPTIMIZED VERSION: Uses pre-computed indicators instead of recalculating
+        them on every step. This provides significant performance improvement.
         
         Returns:
             Observation array of 360 features (60 timesteps × 6 features):
@@ -401,11 +481,43 @@ class RiskManagementEnv(gym.Env):
         if self.current_idx >= len(self.price_window):
             self.current_idx = len(self.price_window) - 1
         
-        # Get entry price for normalization
-        entry_price = float(self.entry_price)
+        # Use pre-computed indicators if available (much faster!)
+        if self._precomputed_indicators is not None:
+            lookback_start = max(0, self.current_idx - self.timeseries_length + 1)
+            end_idx = min(self.current_idx + 1, len(self.price_window))
+            
+            # Extract pre-computed values for the lookback window
+            indices = np.arange(lookback_start, end_idx)
+            macd_vals = self._precomputed_indicators['macd'][indices]
+            hist_vals = self._precomputed_indicators['histogram'][indices]
+            rsi_vals = self._precomputed_indicators['rsi'][indices]
+            ema25_vals = self._precomputed_indicators['ema_25'][indices]
+            ema99_vals = self._precomputed_indicators['ema_99'][indices]
+            close_vals = self._precomputed_indicators['close'][indices]
+            
+            # Stack features: each row is one timestep with 6 features
+            timestep_features = np.column_stack([
+                macd_vals, hist_vals, rsi_vals, ema25_vals, ema99_vals, close_vals
+            ])
+            
+            # Pad with zeros at the beginning if we don't have enough history
+            if len(timestep_features) < self.timeseries_length:
+                padding = np.zeros((self.timeseries_length - len(timestep_features), 6), dtype=np.float32)
+                padding[:, 2] = 0.5  # RSI defaults to 0.5 (neutral)
+                timestep_features = np.vstack([padding, timestep_features])
+            
+            # Take only the last N timesteps
+            timestep_features = timestep_features[-self.timeseries_length:]
+            
+            # Flatten to 1D array: 60 timesteps × 6 features = 360 features
+            observation = timestep_features.flatten()
+            
+            return observation
         
-        # Collect 60 timesteps of features
-        # Start from max(0, current_idx - timeseries_length + 1) to current_idx + 1
+        # Fallback to old method if pre-computed indicators not available
+        # (should not happen in normal operation, but kept for safety)
+        logger.warning("Pre-computed indicators not available, using slow fallback method")
+        entry_price = float(self.entry_price)
         lookback_start = max(0, self.current_idx - self.timeseries_length + 1)
         timestep_features = []
         
@@ -413,34 +525,23 @@ class RiskManagementEnv(gym.Env):
             if i >= len(self.price_window):
                 break
             
-            # Get price history up to this timestep (need enough history for indicators)
             price_history = []
-            # Need at least 99 periods for EMA 99, but use available data
             history_start = max(0, i - 99)
             for j in range(history_start, i + 1):
                 if j < len(self.price_window):
                     price_history.append(float(self.price_window.iloc[j]))
             
             if len(price_history) == 0:
-                # Fallback: use current price
                 price_history = [float(self.price_window.iloc[min(i, len(self.price_window) - 1)])]
             
             price_array = np.array(price_history)
             current_price = float(price_array[-1])
             
-            # Calculate MACD (normalized by entry price)
             macd_line, macd_signal, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
-            
-            # Calculate RSI (normalized to [0, 1])
             rsi_raw = self._calculate_rsi(price_array, period=14)
-            rsi_normalized = rsi_raw  # Already normalized to [0, 1] in _calculate_rsi
-            
-            # Calculate EMA 25 and EMA 99 (percent-change from entry price)
             ema_25 = self._calculate_ema(price_array, period=25)
             ema_99 = self._calculate_ema(price_array, period=99)
             
-            # Normalize EMAs and close price by percent-change from entry price
-            # This handles future prices that may be out of training range
             if entry_price > 0:
                 ema_25_pct = (ema_25 - entry_price) / entry_price
                 ema_99_pct = (ema_99 - entry_price) / entry_price
@@ -450,25 +551,15 @@ class RiskManagementEnv(gym.Env):
                 ema_99_pct = 0.0
                 close_pct = 0.0
             
-            # Features for this timestep: [MACD, Histogram, RSI, EMA25, EMA99, Close]
             timestep_features.append([
-                float(macd_line),      # MACD (normalized by entry price)
-                float(macd_histogram), # MACD Histogram (normalized by entry price)
-                float(rsi_normalized), # RSI (normalized to [0, 1])
-                float(ema_25_pct),     # EMA 25 (percent-change from entry)
-                float(ema_99_pct),     # EMA 99 (percent-change from entry)
-                float(close_pct)       # Close Price (percent-change from entry)
+                float(macd_line), float(macd_histogram), float(rsi_raw),
+                float(ema_25_pct), float(ema_99_pct), float(close_pct)
             ])
         
-        # Pad with zeros at the beginning if we don't have enough history
         while len(timestep_features) < self.timeseries_length:
-            # Use zero values for padding (represents no change from entry)
-            timestep_features.insert(0, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0])  # RSI defaults to 0.5 (neutral)
+            timestep_features.insert(0, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
         
-        # Take only the last N timesteps
         timestep_features = timestep_features[-self.timeseries_length:]
-        
-        # Flatten to 1D array: 60 timesteps × 6 features = 360 features
         observation = np.array(timestep_features, dtype=np.float32).flatten()
         
         return observation
@@ -741,6 +832,10 @@ class RiskManagementEnv(gym.Env):
         # Reset max/min price tracking (start with entry price)
         self.episode_max_price = self.entry_price
         self.episode_min_price = self.entry_price
+        
+        # Pre-compute indicators once per episode (major performance optimization!)
+        # This avoids recalculating MACD, RSI, EMA on every step
+        self._precomputed_indicators = self._precompute_indicators()
         
         observation = self._get_observation()
         info = {
