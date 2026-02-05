@@ -634,12 +634,20 @@ class RiskManagementEnv(gym.Env):
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         periods_held = self.current_idx + 1
+        # Calculate price range for normalization
+        if self.episode_max_price is None:
+            self.episode_max_price = self.entry_price
+        if self.episode_min_price is None:
+            self.episode_min_price = self.entry_price
+
+        price_change_pct = (current_price - self.entry_price) / self.entry_price
+        position_return = price_change_pct - 2 * self.fee_rate  # Account for entry + exit fees
+        price_distance_from_max = abs(self.episode_max_price - current_price)
+        # Calculate price range in episode (max - min) for normalization
+        price_range = self.episode_max_price - self.episode_min_price
         
         # Track statistics for portfolio-level metrics
         if action == 1 or done:  # Closing
-            price_change_pct = (current_price - self.entry_price) / self.entry_price
-            position_return = price_change_pct - 2 * self.fee_rate  # Account for entry + exit fees
-            
             if position_return > 0:
                 self.wins += 1
             self.total_trades += 1
@@ -649,12 +657,6 @@ class RiskManagementEnv(gym.Env):
         if action == 0 and not done:
             # Initialize reward with small neutral value to allow exploration
             reward = 0.01
-            
-            # Calculate price range for normalization
-            if self.episode_max_price is None:
-                self.episode_max_price = self.entry_price
-            if self.episode_min_price is None:
-                self.episode_min_price = self.entry_price
             
             price_range = self.episode_max_price - self.episode_min_price
             
@@ -696,19 +698,6 @@ class RiskManagementEnv(gym.Env):
         
         # ========== CLOSING ACTIONS (action 1 or done=True) ==========
         # Calculate how close current price is to episode max price
-        if self.episode_max_price is None:
-            # Fallback: use entry price if max not tracked yet
-            self.episode_max_price = self.entry_price
-        
-        # Calculate distance from max price
-        price_distance_from_max = abs(self.episode_max_price - current_price)
-        
-        # Calculate price range in episode (max - min) for normalization
-        if self.episode_min_price is None:
-            self.episode_min_price = self.entry_price
-        
-        price_range = self.episode_max_price - self.episode_min_price
-        
         # Calculate closeness to max price (0.0 = far from max, 1.0 = at max)
         if price_range > 1e-10:  # Avoid division by zero
             # Normalized distance: 0 = at max, 1 = at min
@@ -755,7 +744,7 @@ class RiskManagementEnv(gym.Env):
             
             if position_return > 0:
                 # Small bonus for profitable close (scaled by profit)
-                profit_bonus = min(position_return * 2.0, 1.0)  # Max bonus of 1.0
+                profit_bonus = min(position_return * 2.0, 2.0)  # Max bonus of 2.0
                 reward += profit_bonus
             elif position_return < -0.05:  # Large loss (>5%)
                 # Small penalty for large losses
