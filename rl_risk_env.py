@@ -569,7 +569,10 @@ class RiskManagementEnv(gym.Env):
         Calculate reward focused on encouraging closing when price is close to max price in episode.
         
         An episode is defined from entry price to exit price (determined by signals).
-        If exit signal doesn't exist, max_steps=100 is used as episode limit.
+        Episode length is dynamically calculated based on rule-based exit signals:
+        - If exit signal exists: use it (minimum 100 steps)
+        - If exit signal doesn't exist: fallback to 500 steps maximum
+        - If exit signal < 100 steps: set 100 steps as default
         
         Action space: 0 = Hold, 1 = Close
         
@@ -792,19 +795,39 @@ class RiskManagementEnv(gym.Env):
             
             self.entry_price = entry_price
             self.entry_idx = entry_idx
-            self.exit_signal_idx = exit_signal_idx
             
-            # Set exit_idx: use exit signal only (required)
+            # Calculate episode length based on exit signal with fallbacks
+            # 1. Use rule-based exit signal for each episode
+            # 2. If exit signal doesn't exist, fallback to 500 steps as maximum
+            # 3. If exit signal < 100 steps, set 100 as default
             if exit_signal_idx is not None:
-                # Use exit signal as episode end
-                exit_idx = exit_signal_idx
+                # Exit signal exists: calculate steps from entry to exit signal
+                steps_to_exit = exit_signal_idx - entry_idx
+                
+                # Ensure minimum of 100 steps
+                if steps_to_exit < 100:
+                    steps_to_exit = 100
+                    # Adjust exit_idx to be 100 steps after entry (if within data bounds)
+                    exit_idx = min(entry_idx + steps_to_exit, len(price_series) - 1)
+                    # Clear exit_signal_idx so it doesn't cause early truncation
+                    # The episode will run for the full 100 steps
+                    self.exit_signal_idx = None
+                else:
+                    # Use exit signal as episode end
+                    exit_idx = exit_signal_idx
+                    self.exit_signal_idx = exit_signal_idx
             else:
-                # No exit signal found - skip this entry by setting exit to entry (will result in episode_length=1)
-                # This should rarely happen if exit signals are properly generated
-                logger.warning(f"No exit signal found after entry at index {entry_idx} for {self.current_ticker}, using end of data")
-                exit_idx = len(price_series) - 1
+                # No exit signal found - fallback to 500 steps as maximum
+                steps_to_exit = 500
+                exit_idx = min(entry_idx + steps_to_exit, len(price_series) - 1)
+                self.exit_signal_idx = None
+                logger.debug(f"No exit signal found after entry at index {entry_idx} for {self.current_ticker}, using {steps_to_exit} steps fallback")
             
             self.exit_idx = exit_idx
+            
+            # Update max_steps dynamically for this episode
+            # This ensures the episode respects the calculated episode length
+            self.max_steps = exit_idx - entry_idx + 1
             
             # Set up episode windows
             self.episode_start_idx = entry_idx
