@@ -57,7 +57,7 @@ MA99_PERIOD = 50              # EMA period (default: 50, originally 99)
 ENABLE_MACD_TREND_REVERSAL = True   # Strategy 1: MACD Trend Reversals (Divergence)
 ENABLE_RSI_TREND_REVERSAL = True    # Strategy 2: RSI Trend Reversals (Divergence)
 ENABLE_BULLISH_CONFIRMATION = False  # Strategy 3: Bullish Trend Confirmation (EMA Crossover)
-ENABLE_EMA_25_99_CROSSOVER = False   # Strategy 4: EMA 25/99 Crossover (Entry when EMA 25 crosses above EMA 99)
+ENABLE_EMA_25_99_CROSSOVER = True   # Strategy 4: EMA 25/99 Crossover (Entry when EMA 25 crosses above EMA 99)
 
 # RSI Parameters
 RSI_PERIOD = 14                     # RSI calculation period

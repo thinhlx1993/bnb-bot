@@ -49,7 +49,7 @@ RESULTS_DIR = Path("results")
 RL_RESULTS_DIR = Path("results/rl_agent")
 RL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_LOAD_DIR = Path("models/rl_agent")
-DEFAULT_MODEL_NAME = "ppo_risk_agent_interrupted"
+DEFAULT_MODEL_NAME = "best_model"
 
 # Evaluation date range configuration
 # Set to None to use all available data, or specify date range for evaluation
@@ -225,6 +225,7 @@ def evaluate_rl_agent(
     logger.info(f"Evaluating RL agent for {ticker}...")
     
     # Use provided manager or load a new one
+    # Note: RLRiskManager automatically loads VecNormalize statistics if available
     if rl_manager is None:
         try:
             # Use reduced max_steps for faster evaluation (2000 instead of 5000)
@@ -235,6 +236,8 @@ def evaluate_rl_agent(
                 max_steps=2000  # Reduced for faster evaluation
             )
             logger.info(f"Using device: {rl_manager.model.device}")
+            if rl_manager.vec_normalize is not None:
+                logger.info("✓ VecNormalize statistics loaded")
         except Exception as e:
             logger.error(f"Error loading RL model: {e}")
             logger.error("Falling back to rule-based baseline")
@@ -913,11 +916,9 @@ def main(
     else:
         logger.info("Using all available data (no date filtering)")
     
-    # Load RL model ONCE and reuse for all tickers
     rl_manager = None
     if USE_RL_RISK_MANAGEMENT:
         try:
-            logger.info("Loading RL model (will be reused for all tickers)...")
             rl_manager = RLRiskManager(
                 model_path=MODEL_LOAD_DIR,
                 model_name=DEFAULT_MODEL_NAME,

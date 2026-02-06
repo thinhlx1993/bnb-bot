@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Dict, Any
 import logging
 from tqdm import tqdm
 from sb3_contrib import RecurrentPPO  # Using RecurrentPPO for recurrent policies
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 # Import custom environment
 from rl_risk_env import RiskManagementEnv
@@ -72,35 +72,67 @@ class RLRiskManager:
         if model_path is None:
             model_path = MODEL_LOAD_DIR
         
-        model_file = model_path / f"{model_name}.zip"
-        if not model_file.exists():
-            # Try alternative names
-            for alt_name in ["ppo_risk_agent_final", "best_model", "ppo_risk_agent"]:
-                alt_file = model_path / f"{alt_name}.zip"
-                if alt_file.exists():
-                    model_file = alt_file
-                    logger.info(f"Using alternative model: {alt_name}")
-                    break
-            else:
-                # Search for any .zip file in the directory
-                zip_files = list(model_path.glob("*.zip"))
-                if zip_files:
-                    model_file = zip_files[0]
-                    logger.warning(f"Using first available model: {model_file.name}")
-                else:
-                    raise FileNotFoundError(f"Model file not found in {model_path}")
-        
+        model_file = model_path / "best_model" / f"{model_name}.zip"
         logger.info(f"Loading RL model from: {model_file}")
         try:
-            # RecurrentPPO uses PyTorch and will automatically use GPU if available
+            # Load as RecurrentPPO (LSTM-based model)
             self.model = RecurrentPPO.load(str(model_file))
             logger.info(f"RL model loaded successfully (RecurrentPPO - PyTorch)")
+            
             # Get device info
             if hasattr(self.model, 'device'):
                 logger.info(f"Using device: {self.model.device}")
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
+            logger.error(f"Error loading RecurrentPPO model: {e}")
+            logger.error("Make sure the model was trained and saved as RecurrentPPO")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
+        
+        # Load VecNormalize statistics if available
+        # Check multiple possible locations:
+        # 1. In best_model directory (if loading best_model.zip)
+        # 2. In model_path root directory
+        self.vec_normalize = None
+        vec_normalize_paths = [
+            model_path / "best_model" / "vec_normalize.pkl",  # Best model directory
+            model_path / "vec_normalize.pkl",  # Root directory
+        ]
+        
+        vec_normalize_path = None
+        for path in vec_normalize_paths:
+            if path.exists():
+                vec_normalize_path = path
+                break
+        
+        if vec_normalize_path is not None:
+            logger.info(f"Loading VecNormalize statistics from: {vec_normalize_path}")
+            try:
+                # Create a dummy vectorized env to load VecNormalize stats
+                # We'll use these stats to normalize observations manually
+                dummy_env = RiskManagementEnv(
+                    price_data=pd.Series([100.0] * 100),
+                    balance_data=pd.Series([100.0] * 100),
+                    entry_price=100.0,
+                    entry_idx=50,
+                    exit_idx=99,
+                    initial_balance=self.initial_balance,
+                    history_length=self.history_length,
+                    max_steps=self.max_steps,
+                    fee_rate=self.fee_rate
+                )
+                dummy_vec_env = DummyVecEnv([lambda: dummy_env])
+                self.vec_normalize = VecNormalize.load(str(vec_normalize_path), dummy_vec_env)
+                logger.info("VecNormalize statistics loaded successfully")
+            except Exception as e:
+                logger.warning(f"Could not load VecNormalize statistics: {e}")
+                logger.warning("Continuing without normalization (may affect model performance)")
+                self.vec_normalize = None
+        else:
+            logger.warning(f"VecNormalize statistics not found in expected locations:")
+            for path in vec_normalize_paths:
+                logger.warning(f"  - {path}")
+            logger.warning("Observations will not be normalized (may affect model performance)")
         
         # Track open positions
         self.positions = []  # [(entry_idx, entry_price, current_idx, env, peak_balance)]
@@ -321,6 +353,12 @@ class RLRiskManager:
             # Get initial observation
             obs = env._get_observation()
             
+            # Normalize observation if VecNormalize is available
+            if self.vec_normalize is not None:
+                # VecNormalize.normalize_obs expects shape (n_envs, obs_dim)
+                obs_normalized = self.vec_normalize.normalize_obs(obs.reshape(1, -1))
+                obs = obs_normalized[0]  # Extract single observation from batch
+            
             # Run RL agent for this position until it decides to exit or reaches exit signal
             done = False
             position_step = 0
@@ -341,6 +379,12 @@ class RLRiskManager:
                 
                 # Step environment
                 obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Normalize observation if VecNormalize is available
+                if self.vec_normalize is not None:
+                    # VecNormalize.normalize_obs expects shape (n_envs, obs_dim)
+                    obs_normalized = self.vec_normalize.normalize_obs(obs.reshape(1, -1))
+                    obs = obs_normalized[0]  # Extract single observation from batch
                 done = terminated or truncated
                 position_step += 1
                 

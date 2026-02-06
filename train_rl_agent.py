@@ -5,6 +5,7 @@ SBX provides faster training through JAX JIT compilation and efficient computati
 
 import os
 import sys
+import warnings
 import numpy as np
 from pathlib import Path
 import pickle
@@ -14,8 +15,6 @@ from typing import List, Dict, Optional, Tuple
 import logging
 from datetime import datetime
 from tqdm import tqdm
-
-# RecurrentPPO uses PyTorch, no JAX configuration needed
 
 # RL imports - Using RecurrentPPO from sb3-contrib for recurrent policies
 from sb3_contrib import RecurrentPPO
@@ -70,9 +69,6 @@ VF_COEF = 0.25  # Value function coefficient (further reduced to prevent value l
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
 CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conservative)
 
-# Reward normalization settings
-USE_VEC_NORMALIZE = True  # Enable reward and observation normalization for stable training
-
 # Device configuration
 # RecurrentPPO uses PyTorch and will automatically use GPU if available
 USE_GPU = True  # RecurrentPPO will use GPU if available (CUDA), otherwise CPU
@@ -99,7 +95,8 @@ ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 LSTM_HIDDEN_SIZE = 256  # LSTM hidden size
 N_LSTM_LAYERS = 1  # Number of LSTM layers
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
-EVAL_FREQ = 50000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
+EVAL_FREQ = 10000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
+N_EVAL_EPISODES = 20  # Number of episodes to evaluate
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -796,7 +793,7 @@ class DynamicEvalCallback(BaseCallback):
         # Monitor tracks episode lengths, which equals holding time in our case
         if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
             for env in self.training_env.envs:
-                # Unwrap VecNormalize if present
+                # Unwrap wrappers if present
                 unwrapped_env = env
                 if hasattr(env, 'venv'):
                     unwrapped_env = env.venv
@@ -1387,21 +1384,39 @@ def train_ppo_agent(
         vec_env_cls=vec_env_cls
     )
     
-    # Apply reward and observation normalization for stable training
-    if USE_VEC_NORMALIZE:
-        logger.info("Applying VecNormalize for reward and observation normalization...")
-        train_env = VecNormalize(
-            train_env,
-            norm_obs=False,  # Don't normalize observations (they're already normalized in env)
-            norm_reward=True,  # Normalize rewards (critical for stable value function learning)
-            clip_obs=10.0,  # Clip observations to prevent extreme values
-            clip_reward=5.0,  # Reduced clip range for rewards (rewards are already scaled down)
-            gamma=GAMMA  # Use same gamma for reward normalization
-        )
-        logger.info("VecNormalize enabled: rewards will be normalized (observations already normalized in env)")
+    # Wrap training environment with VecNormalize for observation normalization
+    logger.info("Wrapping training environment with VecNormalize...")
+    train_env = VecNormalize(
+        train_env,
+        norm_obs=True,  # Normalize observations
+        norm_reward=False,  # Don't normalize rewards (rewards are already scaled appropriately)
+        clip_obs=10.0,  # Clip observations to prevent extreme values
+        training=True  # Enable training mode (updates running statistics)
+    )
+    
+    # Create evaluation environment for EvalCallback
+    # Use same vec_env_cls as training env to avoid type mismatch warning
+    # For evaluation, we use n_envs=1 (single environment)
+    logger.info("Creating evaluation environment...")
+    eval_env_factory = create_env_factory(val_tickers_data, seed=123)
+    eval_env = make_vec_env(
+        eval_env_factory,
+        n_envs=1,  # Single environment for evaluation
+        vec_env_cls=vec_env_cls  # Use same type as training env
+    )
+    
+    # Wrap evaluation environment with VecNormalize (will sync stats from training env)
+    logger.info("Wrapping evaluation environment with VecNormalize...")
+    eval_env = VecNormalize(
+        eval_env,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        training=False  # Evaluation mode (uses fixed statistics)
+    )
     
     
-    logger.info("Eval callback will run full validation (all entry signals, single env sequential) every eval")
+    logger.info("Eval callback will use standard EvalCallback with validation environment")
     
     # Create RecurrentPPO model with LSTM architecture
     logger.info("Creating RecurrentPPO model with LSTM architecture...")
@@ -1489,7 +1504,6 @@ def train_ppo_agent(
     logger.info(f"  Batch size: {BATCH_SIZE}")
     logger.info(f"  Steps per update: {N_STEPS}")
     logger.info(f"  Epochs per update: {N_EPOCHS}")
-    logger.info(f"  Reward normalization: {USE_VEC_NORMALIZE}")
     
     # Create callbacks
     callbacks = []
@@ -1500,20 +1514,80 @@ def train_ppo_agent(
         save_path=str(model_save_dir / "checkpoints"),
         name_prefix="ppo_risk_agent",
         save_replay_buffer=True,
-        save_vecnormalize=True
+        save_vecnormalize=True  # Save VecNormalize statistics with checkpoints
     )
     callbacks.append(checkpoint_callback)
     
-    # Evaluation callback - single env, all entry signals, max 1000 steps per episode
-    eval_callback = DynamicEvalCallback(
-        all_tickers_data=val_tickers_data,
+    # Evaluation callback - standard EvalCallback with VecNormalize saving
+    # Create a wrapper callback that syncs VecNormalize stats before evaluation
+    class VecNormalizeSyncCallback(BaseCallback):
+        """Callback to sync VecNormalize statistics before evaluation."""
+        def __init__(self, train_env, eval_env, verbose=0):
+            super().__init__(verbose)
+            self.train_env = train_env
+            self.eval_env = eval_env
+        
+        def _on_step(self) -> bool:
+            # Sync VecNormalize stats from training to evaluation environment
+            # This ensures eval uses the same normalization as training
+            if hasattr(self.train_env, 'obs_rms') and hasattr(self.eval_env, 'obs_rms'):
+                self.eval_env.obs_rms.mean = self.train_env.obs_rms.mean.copy()
+                self.eval_env.obs_rms.var = self.train_env.obs_rms.var.copy()
+                self.eval_env.obs_rms.count = self.train_env.obs_rms.count
+            return True
+    
+    # Create sync callback
+    sync_callback = VecNormalizeSyncCallback(train_env, eval_env, verbose=1)
+    callbacks.append(sync_callback)
+    
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(model_save_dir / "best_model"),
+        log_path=str(model_save_dir / "eval_logs"),
         eval_freq=EVAL_FREQ,
-        model_save_dir=model_save_dir,
-        log_path=model_save_dir / "eval_logs",
         deterministic=True,
-        verbose=1,
+        render=False,
+        n_eval_episodes=N_EVAL_EPISODES,  # Number of episodes to evaluate
+        verbose=1
     )
     callbacks.append(eval_callback)
+    
+    # Also create a callback to save VecNormalize when best model is saved
+    # This monitors the eval_callback's best_mean_reward
+    class SaveVecNormalizeWithBestModel(BaseCallback):
+        """Save VecNormalize statistics when best model is saved by EvalCallback."""
+        def __init__(self, train_env, eval_callback, best_model_save_path, verbose=0):
+            super().__init__(verbose)
+            self.train_env = train_env
+            self.eval_callback = eval_callback
+            self.best_model_save_path = Path(best_model_save_path)
+            self.last_best_mean_reward = float('-inf')
+        
+        def _on_step(self) -> bool:
+            # Check if eval_callback has a new best model
+            if hasattr(self.eval_callback, 'best_mean_reward'):
+                current_best = self.eval_callback.best_mean_reward
+                if current_best > self.last_best_mean_reward:
+                    self.last_best_mean_reward = current_best
+                    # Save VecNormalize statistics to the same directory as best_model.zip
+                    # EvalCallback saves best_model.zip in best_model_save_path directory
+                    vec_normalize_path = self.best_model_save_path / "vec_normalize.pkl"
+                    vec_normalize_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        self.train_env.save(str(vec_normalize_path))
+                        if self.verbose >= 1:
+                            logger.info(f"VecNormalize statistics saved with best model (mean_reward: {current_best:.2f})")
+                            logger.info(f"  Saved to: {vec_normalize_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not save VecNormalize with best model: {e}")
+            return True
+    
+    save_vecnorm_callback = SaveVecNormalizeWithBestModel(
+        train_env, eval_callback, 
+        best_model_save_path=str(model_save_dir / "best_model"),
+        verbose=1
+    )
+    callbacks.append(save_vecnorm_callback)
     
     # Early stopping callback
     if ENABLE_EARLY_STOPPING:
@@ -1558,16 +1632,25 @@ def train_ppo_agent(
         model.save(str(final_model_path))
         logger.info(f"\nFinal model saved: {final_model_path}")
         
+        # Save VecNormalize statistics
+        vec_normalize_path = model_save_dir / "vec_normalize.pkl"
+        train_env.save(str(vec_normalize_path))
+        logger.info(f"VecNormalize statistics saved: {vec_normalize_path}")
+        
     except KeyboardInterrupt:
         logger.info("\nTraining interrupted by user")
         final_model_path = model_save_dir / "ppo_risk_agent_interrupted.zip"
         model.save(str(final_model_path))
         logger.info(f"Model saved: {final_model_path}")
+        
+        # Save VecNormalize statistics
+        vec_normalize_path = model_save_dir / "vec_normalize.pkl"
+        train_env.save(str(vec_normalize_path))
+        logger.info(f"VecNormalize statistics saved: {vec_normalize_path}")
     
     # Cleanup
     train_env.close()
-    # Note: eval_env was already closed when we switched to DynamicEvalCallback
-    # (it creates its own environments each evaluation)
+    eval_env.close()
     
     logger.info("="*60)
     logger.info("Training complete!")
@@ -1622,7 +1705,8 @@ def _evaluate_with_episode_returns(model, vec_env, n_eval_episodes: int, determi
 
 def evaluate_on_test_data(
     model,
-    test_tickers_data: Dict[str, Dict[str, pd.Series]]
+    test_tickers_data: Dict[str, Dict[str, pd.Series]],
+    vec_normalize_path: Optional[Path] = None
 ) -> Dict:
     """
     Evaluate the trained model on ALL entry signals in test data.
@@ -1630,6 +1714,7 @@ def evaluate_on_test_data(
     Args:
         model: Trained PPO model
         test_tickers_data: Test data for each ticker (with entry_signals)
+        vec_normalize_path: Path to VecNormalize statistics file (optional)
     
     Returns:
         Dictionary with evaluation metrics
@@ -1667,6 +1752,23 @@ def evaluate_on_test_data(
         n_envs=n_test_envs,
         vec_env_cls=DummyVecEnv
     )
+    
+    # Wrap test environment with VecNormalize
+    logger.info("Wrapping test environment with VecNormalize...")
+    test_env = VecNormalize(
+        test_env,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        training=False  # Evaluation mode (uses fixed statistics)
+    )
+    
+    # Load VecNormalize statistics if provided
+    if vec_normalize_path is not None and vec_normalize_path.exists():
+        logger.info(f"Loading VecNormalize statistics from: {vec_normalize_path}")
+        test_env = VecNormalize.load(str(vec_normalize_path), test_env)
+    else:
+        logger.warning("VecNormalize statistics not provided - test environment will use default normalization")
     
     # Run evaluation and collect episode returns (for win rate = positive balance)
     logger.info(f"\nRunning evaluation on ALL {n_episodes} entry signals...")
@@ -1834,9 +1936,11 @@ def main():
     
     # Evaluate on TEST data after training (using ALL entry signals)
     if len(test_tickers_data) > 0 and model is not None:
+        vec_normalize_path = MODEL_SAVE_DIR / "vec_normalize.pkl"
         test_results = evaluate_on_test_data(
             model,
-            test_tickers_data
+            test_tickers_data,
+            vec_normalize_path=vec_normalize_path
         )
         
         # Save test results
