@@ -712,13 +712,193 @@ class RiskManagementEnv(gym.Env):
         
         return float(reward)
     
+    def _calculate_reward_long_term(self, action: int, done: bool) -> float:
+        """
+        Improved reward function for long-term performance optimization.
+        
+        Key improvements:
+        1. Risk-adjusted returns (Sharpe-like ratio)
+        2. Time decay / opportunity cost
+        3. Drawdown penalties during holding
+        4. Early exit bonuses for good prices
+        5. Consistency rewards
+        6. Maximum drawdown tracking
+        
+        This reward function balances short-term trade performance with long-term
+        portfolio metrics to encourage sustainable, risk-adjusted returns.
+        """
+        current_price = float(self.price_window.iloc[self.current_idx])
+        periods_held = self.current_idx + 1
+        
+        # Initialize max/min prices if needed
+        if self.episode_max_price is None:
+            self.episode_max_price = self.entry_price
+        if self.episode_min_price is None:
+            self.episode_min_price = self.entry_price
+        
+        # Calculate price metrics
+        price_change_pct = (current_price - self.entry_price) / self.entry_price
+        position_return = price_change_pct - 2 * self.fee_rate  # Account for entry + exit fees
+        price_range = self.episode_max_price - self.episode_min_price
+        
+        # Calculate current drawdown
+        if self.episode_max_price > 0:
+            current_drawdown = (self.episode_max_price - current_price) / self.episode_max_price
+        else:
+            current_drawdown = 0.0
+        
+        # Update maximum drawdown
+        if current_drawdown > self.max_drawdown:
+            self.max_drawdown = current_drawdown
+        
+        # Track statistics for portfolio-level metrics
+        if action == 1 or done:  # Closing
+            if position_return > 0:
+                self.wins += 1
+            self.total_trades += 1
+            self.returns_history.append(position_return)
+        
+        # ========== HOLDING ACTIONS (action 0) ==========
+        if action == 0 and not done:
+            # Base reward: small neutral value
+            reward = 0.01
+            
+            # 1. Drawdown penalty during holding (IMPROVEMENT #3)
+            # Penalize holding when experiencing large drawdowns
+            if current_drawdown > 0.05:  # 5% drawdown threshold
+                # Penalty increases with drawdown severity
+                drawdown_penalty = min(current_drawdown * 3.0, 2.0)  # Max penalty of 2.0
+                reward -= drawdown_penalty
+            
+            # 2. Time decay / opportunity cost (IMPROVEMENT #2)
+            # Penalize holding too long relative to episode length
+            max_holding_period = max(self.episode_length, periods_held)
+            if max_holding_period > 0:
+                time_efficiency = 1.0 - (periods_held / max_holding_period) * 0.2  # Max 20% penalty
+                reward *= time_efficiency
+            
+            # 3. Closeness to min price penalty (existing logic, but refined)
+            if price_range > 1e-10:
+                distance_from_min = current_price - self.episode_min_price
+                normalized_distance_from_min = distance_from_min / price_range
+                closeness_to_min = 1.0 - normalized_distance_from_min
+                
+                # Stronger penalty for holding near minimum
+                if closeness_to_min >= 0.9:
+                    reward -= 2.5 * closeness_to_min  # Increased from 2.0
+                elif closeness_to_min >= 0.7:
+                    reward -= 1.2 * closeness_to_min  # Increased from 1.0
+                elif closeness_to_min >= 0.5:
+                    reward -= 0.6 * closeness_to_min  # Increased from 0.5
+            
+            # Clip holding reward
+            reward = np.clip(reward, -3.0, 0.1)  # Increased negative range for stronger penalties
+            return float(reward)
+        
+        # ========== CLOSING ACTIONS (action 1 or done=True) ==========
+        # Calculate closeness to max price
+        if price_range > 1e-10:
+            price_distance_from_max = abs(self.episode_max_price - current_price)
+            normalized_distance = price_distance_from_max / price_range
+            closeness_to_max = 1.0 - normalized_distance
+        else:
+            price_distance_from_max = abs(self.episode_max_price - current_price)
+            if price_distance_from_max < 1e-10:
+                closeness_to_max = 1.0
+            else:
+                closeness_to_max = 0.0
+        
+        # Base reward from closeness to max (existing logic)
+        if closeness_to_max >= 0.9:
+            reward = 8.0 * closeness_to_max  # Slightly reduced from 10.0
+        elif closeness_to_max >= 0.7:
+            reward = 6.0 * closeness_to_max  # Slightly reduced from 7.0
+        elif closeness_to_max >= 0.5:
+            reward = 4.0 * closeness_to_max  # Reduced from 5.0
+        elif closeness_to_max >= 0.3:
+            reward = 2.0 * closeness_to_max
+        elif closeness_to_max >= 0.1:
+            reward = 0.5 * closeness_to_max
+        else:
+            reward = -1.0
+        
+        # 4. Early exit bonus for good prices (IMPROVEMENT #4)
+        # Reward closing at good prices (top 20% of range) even if not absolute max
+        if closeness_to_max >= 0.8 and periods_held < self.episode_length * 0.7:
+            # Bonus for closing early at good price
+            early_exit_factor = 1.0 - (periods_held / max(self.episode_length, periods_held))
+            early_exit_bonus = early_exit_factor * 1.5  # Max bonus of 1.5
+            reward += early_exit_bonus
+        
+        # 5. Profit efficiency (IMPROVEMENT #6)
+        # Reward based on profit per unit time
+        if periods_held > 0:
+            profit_efficiency = position_return / periods_held
+            # Scale profit efficiency reward
+            reward += profit_efficiency * 3.0
+        
+        # 6. Profit bonus/penalty (existing, refined)
+        if position_return > 0:
+            # Profit bonus scaled by return magnitude
+            profit_bonus = min(position_return * 2.5, 2.5)  # Increased from 2.0
+            reward += profit_bonus
+        elif position_return < -0.05:  # Large loss (>5%)
+            # Stronger penalty for large losses
+            loss_penalty = abs(position_return) * 2.0  # Proportional to loss
+            reward -= min(loss_penalty, 2.0)  # Max penalty of 2.0
+        
+        # 7. Maximum drawdown penalty (IMPROVEMENT #7)
+        # Penalize trades that experienced large drawdowns
+        if self.max_drawdown > 0.15:  # 15% max drawdown threshold
+            drawdown_penalty = min(self.max_drawdown * 2.0, 1.5)  # Max penalty of 1.5
+            reward -= drawdown_penalty
+        
+        # 8. Risk-adjusted return component (IMPROVEMENT #1)
+        # Consider Sharpe-like ratio for portfolio performance
+        if len(self.returns_history) >= 3:  # Need at least 3 trades
+            mean_return = np.mean(self.returns_history)
+            std_return = np.std(self.returns_history)
+            if std_return > 1e-10:
+                sharpe_like = mean_return / std_return
+                # Add scaled Sharpe-like component (positive = good)
+                sharpe_bonus = sharpe_like * 0.3  # Scale factor
+                reward += sharpe_bonus
+        
+        # 9. Consistency reward (IMPROVEMENT #5)
+        # Encourage consistent returns (lower volatility)
+        if len(self.returns_history) >= 5:
+            return_std = np.std(self.returns_history)
+            # Lower std = higher consistency bonus
+            consistency_bonus = max(0, (1.0 - return_std * 5.0)) * 0.5  # Max bonus of 0.5
+            reward += consistency_bonus
+        
+        # 10. Win rate consideration
+        # Bonus for maintaining good win rate
+        if self.total_trades >= 5:
+            win_rate = self.wins / self.total_trades
+            if win_rate >= 0.6:  # 60%+ win rate
+                win_rate_bonus = (win_rate - 0.5) * 1.0  # Bonus up to 0.5
+                reward += win_rate_bonus
+        
+        # Final reward clipping
+        # Keep rewards in reasonable range for PPO stability
+        reward = np.clip(reward, -5.0, 12.0)  # Slightly wider range to accommodate new components
+        
+        return float(reward)
+    
     def _calculate_reward(self, action: int, done: bool) -> float:
         """
         Calculate reward based on configured reward function.
         
         This is the main entry point that routes to the appropriate reward function.
+        
+        To switch reward functions, change the return statement:
+        - return self._calculate_reward_total_return_only(action, done)  # Original
+        - return self._calculate_reward_long_term(action, done)  # Improved for long-term
         """
-        return self._calculate_reward_total_return_only(action, done)
+        # Switch between reward functions here
+        return self._calculate_reward_long_term(action, done)  # Using improved long-term reward
+        # return self._calculate_reward_total_return_only(action, done)  # Original reward
     
     def reset(
         self, 
