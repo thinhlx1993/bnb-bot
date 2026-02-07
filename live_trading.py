@@ -1001,7 +1001,7 @@ def run_live_trading(
             if rl_model_path is None:
                 rl_model_path = Path("models/rl_agent")
             
-            logger.info(f"Loading RL model from: {rl_model_path}/{rl_model_name}.zip")
+            logger.info(f"Loading RL model from: {rl_model_path}/best_model/{rl_model_name}.zip")
             rl_manager = RLRiskManager(
                 model_path=rl_model_path,
                 model_name=rl_model_name,
@@ -1017,7 +1017,7 @@ def run_live_trading(
     
     # Display initial balance
     balances = trader.get_account_balance()
-    logger.info(f"Initial Balance: {balances}")
+    # logger.info(f"Initial Balance: {balances}")
     
     # Display initial positions (if any)
     trader.print_positions()
@@ -1242,8 +1242,8 @@ if __name__ == "__main__":
     
     # RL Agent configuration
     USE_RL_AGENT = True  # Enable RL agent for hold/close decisions
-    RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory
-    RL_MODEL_NAME = "best_model_03012026"  # Model filename without .zip extension
+    RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory (parent of best_model folder)
+    RL_MODEL_NAME = "best_model"  # Model filename without .zip extension
     
     # Validate API key
     if API_KEY == "your_testnet_api_key_here":
