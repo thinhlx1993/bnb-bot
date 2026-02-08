@@ -1243,7 +1243,7 @@ if __name__ == "__main__":
     # RL Agent configuration
     USE_RL_AGENT = True  # Enable RL agent for hold/close decisions
     RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory (parent of best_model folder)
-    RL_MODEL_NAME = "best_model"  # Model filename without .zip extension
+    RL_MODEL_NAME = "best_model_02082026"  # Model filename without .zip extension
     
     # Validate API key
     if API_KEY == "your_testnet_api_key_here":

@@ -55,7 +55,7 @@ TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"
 INITIAL_BALANCE = 1000.0  # Default initial balance
 
 # Training hyperparameters
-TOTAL_TIMESTEPS = 5e7  # Total training steps (use early stopping)
+TOTAL_TIMESTEPS = 1e7  # Total training steps (use early stopping)
 LEARNING_RATE = 3e-4  # Initial learning rate
 LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
 USE_LR_SCHEDULE = True  # Enable learning rate scheduling
@@ -64,7 +64,7 @@ N_STEPS = 2048  # Steps per update
 N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # GAE lambda
-ENT_COEF = 0.05  # Entropy coefficient (exploration) - increased to prevent premature convergence
+ENT_COEF = 0.01  # Entropy coefficient (exploration) - increased to prevent premature convergence
 VF_COEF = 0.25  # Value function coefficient (further reduced to prevent value loss from dominating)
 MAX_GRAD_NORM = 0.5  # Maximum gradient norm for clipping
 CLIP_RANGE = 0.2  # PPO clip range (standard value, keeps policy updates conservative)
@@ -95,8 +95,8 @@ ACTIVATION_FN = 'tanh'  # Activation function: 'tanh', 'relu', or 'elu'
 LSTM_HIDDEN_SIZE = 256  # LSTM hidden size
 N_LSTM_LAYERS = 1  # Number of LSTM layers
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
-EVAL_FREQ = 10000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
-N_EVAL_EPISODES = 20  # Number of episodes to evaluate
+EVAL_FREQ = 1000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
+N_EVAL_EPISODES = 200  # Number of episodes to evaluate
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
@@ -113,12 +113,12 @@ TRAIN_SPLIT = 0.7  # 70% training, 30% validation
 # Time-series split: TRAIN -> VALIDATION -> EVAL (chronological order)
 
 # Training data date range  # YYYY-MM-DD format, or None for all data
-TRAIN_START_DATE = "2017-01-01"  # Start date for training data (None = beginning of data)
+TRAIN_START_DATE = "2010-01-01"  # Start date for training data (None = beginning of data)
 TRAIN_END_DATE = "2024-01-01"    # End date for training data (None = use TRAIN_SPLIT)
 
 # Validation data date range (for evaluation during training)
 VAL_START_DATE = "2024-01-01"    # Start date for validation data (None = after TRAIN_END_DATE)
-VAL_END_DATE = "2024-12-31"      # End date for validation data (None = end of data)
+VAL_END_DATE = "2025-01-01"      # End date for validation data (None = end of data)
 
 # Evaluation data date range (for final evaluation after training)
 EVAL_START_DATE = "2025-01-01"   # Start date for evaluation (None = use VAL dates)
@@ -1255,7 +1255,13 @@ def _evaluate_with_episode_returns(model, vec_env, n_eval_episodes: int, determi
     episode_returns = []
     episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
     n_completed = 0
-    obs, _ = vec_env.reset()
+    reset_result = vec_env.reset()
+    # Handle different return formats from reset()
+    # VecEnv.reset() should return (observations, infos), but handle edge cases
+    if isinstance(reset_result, tuple):
+        obs = reset_result[0]  # Always take first element as observations
+    else:
+        obs = reset_result  # If not a tuple, it's just observations
     step_count = np.zeros(vec_env.num_envs, dtype=int)
     total_rewards = np.zeros(vec_env.num_envs)
     lstm_states = None  # LSTM states for RecurrentPPO

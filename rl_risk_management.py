@@ -72,7 +72,7 @@ class RLRiskManager:
         if model_path is None:
             model_path = MODEL_LOAD_DIR
         
-        model_file = model_path / "best_model" / f"{model_name}.zip"
+        model_file = "models/rl_agent/best_model/best_model.zip"
         logger.info(f"Loading RL model from: {model_file}")
         try:
             # Load as RecurrentPPO (LSTM-based model)
@@ -95,8 +95,7 @@ class RLRiskManager:
         # 2. In model_path root directory
         self.vec_normalize = None
         vec_normalize_paths = [
-            model_path / "best_model" / "vec_normalize.pkl",  # Best model directory
-            model_path / "vec_normalize.pkl",  # Root directory
+            Path("models/rl_agent/best_model/vec_normalize.pkl")
         ]
         
         vec_normalize_path = None
