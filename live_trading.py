@@ -35,11 +35,9 @@ from binance.exceptions import BinanceAPIException
 from meta.data_processor import DataProcessor
 from meta.data_processors._base import DataSource
 
-# Import strategy functions from backtest (risk management, EMA, etc.)
+# Import strategy functions from backtest (risk management, etc.)
 from backtest import (
-    calculate_ema, apply_risk_management,
-    USE_MA99_FILTER, MA99_PERIOD, ENABLE_RISK_MANAGEMENT,
-    BULLISH_EMA_FAST, BULLISH_EMA_SLOW,
+    ENABLE_RISK_MANAGEMENT,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_HOLDING_PERIODS,
     USE_STOP_LOSS, USE_TAKE_PROFIT, USE_MAX_HOLDING,
     INITIAL_BALANCE

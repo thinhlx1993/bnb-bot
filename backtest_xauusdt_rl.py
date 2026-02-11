@@ -31,14 +31,10 @@ from backtest import (
     identify_trend_reversals,
     calculate_rsi,
     identify_rsi_trend_reversals,
-    identify_bullish_trend_confirmation,
-    identify_ema_25_99_crossover,
     INITIAL_BALANCE,
     TIME_INTERVAL,
     ENABLE_MACD_TREND_REVERSAL,
     ENABLE_RSI_TREND_REVERSAL,
-    ENABLE_BULLISH_CONFIRMATION,
-    ENABLE_EMA_25_99_CROSSOVER
 )
 
 # Import RL risk management
@@ -208,22 +204,6 @@ def get_strategy_signals(ticker_df: pd.DataFrame, price: pd.Series) -> Tuple[pd.
         entries = entries | rsi_signals.get('bullish_reversal', pd.Series(False, index=price.index))
         exits = exits | rsi_signals.get('bearish_reversal', pd.Series(False, index=price.index))
         logger.info(f"    RSI entries: {entries.sum()}, exits: {exits.sum()}")
-    
-    # Bullish Trend Confirmation signals
-    if ENABLE_BULLISH_CONFIRMATION:
-        logger.info("  Calculating Bullish Confirmation signals...")
-        bullish_signals = identify_bullish_trend_confirmation(price)
-        entries = entries | bullish_signals.get('bullish_reversal', pd.Series(False, index=price.index))
-        exits = exits | bullish_signals.get('bearish_reversal', pd.Series(False, index=price.index))
-        logger.info(f"    Bullish entries: {entries.sum()}, exits: {exits.sum()}")
-    
-    # EMA 25/99 Crossover signals
-    if ENABLE_EMA_25_99_CROSSOVER:
-        logger.info("  Calculating EMA 25/99 Crossover signals...")
-        ema_25_99_signals = identify_ema_25_99_crossover(price)
-        entries = entries | ema_25_99_signals.get('entry', pd.Series(False, index=price.index))
-        exits = exits | ema_25_99_signals.get('exit', pd.Series(False, index=price.index))
-        logger.info(f"    EMA 25/99 entries: {ema_25_99_signals.get('entry', pd.Series(False, index=price.index)).sum()}, exits: {ema_25_99_signals.get('exit', pd.Series(False, index=price.index)).sum()}")
     
     entries = entries.fillna(False)
     exits = exits.fillna(False)

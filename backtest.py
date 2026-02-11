@@ -39,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-START_DATE = "2017-01-01" # YYYY-MM-DD
+START_DATE = "2010-01-01" # YYYY-MM-DD
 END_DATE = "2026-01-23" # YYYY-MM-DD
 TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
 TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # You can add more cryptocurrencies
@@ -49,28 +49,43 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Trend Filter Parameters
-USE_MA99_FILTER = False        # Enable EMA trend filter
-MA99_PERIOD = 50              # EMA period (default: 50, originally 99)
-
-# Strategy Configuration - Enable/Disable Strategies
-ENABLE_MACD_TREND_REVERSAL = True   # Strategy 1: MACD Trend Reversals (Divergence)
-ENABLE_RSI_TREND_REVERSAL = True    # Strategy 2: RSI Trend Reversals (Divergence)
-ENABLE_BULLISH_CONFIRMATION = False  # Strategy 3: Bullish Trend Confirmation (EMA Crossover)
-ENABLE_EMA_25_99_CROSSOVER = False   # Strategy 4: EMA 25/99 Crossover (Entry when EMA 25 crosses above EMA 99)
+# Strategy Configuration - Enable/Disable Divergence Strategies
+ENABLE_MACD_TREND_REVERSAL = True    # MACD Divergence
+ENABLE_RSI_TREND_REVERSAL = True     # RSI Divergence
+ENABLE_STOCHASTIC_DIVERGENCE = True # Stochastic Divergence
+ENABLE_OBV_DIVERGENCE = True         # On-Balance Volume Divergence (requires volume)
+ENABLE_MFI_DIVERGENCE = True        # Money Flow Index Divergence (requires volume)
+ENABLE_CCI_DIVERGENCE = True        # CCI Divergence
+ENABLE_WILLIAMS_DIVERGENCE = True   # Williams %R Divergence
+ENABLE_TSI_DIVERGENCE = True        # True Strength Index Divergence
+ENABLE_ROC_DIVERGENCE = True        # Rate of Change Divergence
+ENABLE_AD_DIVERGENCE = True        # Accumulation/Distribution Divergence (requires volume)
+ENABLE_PVT_DIVERGENCE = True        # Price Volume Trend Divergence (requires volume)
 
 # RSI Parameters
 RSI_PERIOD = 14                     # RSI calculation period
 RSI_OVERSOLD = 30                   # RSI oversold level
 RSI_OVERBOUGHT = 70                 # RSI overbought level
 
-# Bullish Trend Confirmation Parameters
-BULLISH_EMA_FAST = 9                # Fast EMA for bullish confirmation
-BULLISH_EMA_SLOW = 21               # Slow EMA for bullish confirmation
+# Stochastic Parameters
+STOCH_K_PERIOD = 14
+STOCH_D_PERIOD = 3
 
-# EMA 25/99 Crossover Parameters
-EMA_25_99_FAST = 25                 # Fast EMA period (25)
-EMA_25_99_SLOW = 99                 # Slow EMA period (99)
+# MFI Parameters
+MFI_PERIOD = 14
+
+# CCI Parameters
+CCI_PERIOD = 20
+
+# Williams %R Parameters
+WILLIAMS_PERIOD = 14
+
+# TSI Parameters
+TSI_FAST = 13
+TSI_SLOW = 25
+
+# ROC Parameters
+ROC_PERIOD = 12
 
 # Portfolio Parameters
 INITIAL_BALANCE = 100.0  # Starting balance in USD ($)
@@ -118,7 +133,7 @@ def calculate_macd(df, fast=12, slow=26, signal=9):
     return macd, signal_line, histogram
 
 
-def calculate_ema(price, period=MA99_PERIOD):
+def calculate_ema(price, period=50):
     """Calculate Exponential Moving Average (EMA)."""
     ema = price.ewm(span=period, adjust=False).mean()
     return ema
@@ -324,72 +339,157 @@ def identify_rsi_trend_reversals(price, rsi, lookback_periods=30):
     }
 
 
-def identify_bullish_trend_confirmation(price, ema_fast_period=BULLISH_EMA_FAST, ema_slow_period=BULLISH_EMA_SLOW):
+def _identify_divergence(price, indicator, window=30):
     """
-    Identify bullish trend confirmation using EMA crossover:
-    - Buy when fast EMA crosses above slow EMA (golden cross)
-    - Sell when fast EMA crosses below slow EMA (death cross)
+    Generic divergence detection: regular (reversal) only.
+    Bullish: price lower low, indicator higher low. Bearish: price higher high, indicator lower high.
+    Returns dict with bullish_reversal, bearish_reversal, and indicator series.
     """
-    ema_fast = calculate_ema(price, ema_fast_period)
-    ema_slow = calculate_ema(price, ema_slow_period)
-    
-    # Golden cross: fast EMA crosses above slow EMA (bullish)
-    bullish_signal = pd.Series(False, index=price.index)
-    bearish_signal = pd.Series(False, index=price.index)
-    
-    # Detect crossovers
-    for i in range(1, len(price)):
-        # Golden cross: fast was below slow, now above
-        if ema_fast.iloc[i-1] <= ema_slow.iloc[i-1] and ema_fast.iloc[i] > ema_slow.iloc[i]:
-            bullish_signal.iloc[i] = True
-        # Death cross: fast was above slow, now below
-        elif ema_fast.iloc[i-1] >= ema_slow.iloc[i-1] and ema_fast.iloc[i] < ema_slow.iloc[i]:
-            bearish_signal.iloc[i] = True
-    
-    return {
-        'bullish_reversal': bullish_signal,
-        'bearish_reversal': bearish_signal,
-        'ema_fast': ema_fast,
-        'ema_slow': ema_slow
-    }
+    bullish = pd.Series(False, index=price.index)
+    bearish = pd.Series(False, index=price.index)
+    price_min, price_max = find_local_extrema(price, window=window)
+    ind_min, ind_max = find_local_extrema(indicator, window=window)
+    price_low_idx = price_min[price_min].index
+    price_high_idx = price_max[price_max].index
+    ind_low_idx = ind_min[ind_min].index
+    ind_high_idx = ind_max[ind_max].index
+    for i in range(1, len(price_low_idx)):
+        pl1, pl2 = price_low_idx[i - 1], price_low_idx[i]
+        il1 = ind_low_idx[ind_low_idx <= pl1]
+        il2 = ind_low_idx[ind_low_idx <= pl2]
+        if len(il1) > 0 and len(il2) > 0:
+            il1, il2 = il1[-1], il2[-1]
+            if il1 != il2 and price.loc[pl2] < price.loc[pl1] and indicator.loc[il2] > indicator.loc[il1]:
+                bullish.loc[pl2] = True
+    for i in range(1, len(price_high_idx)):
+        ph1, ph2 = price_high_idx[i - 1], price_high_idx[i]
+        ih1 = ind_high_idx[ind_high_idx <= ph1]
+        ih2 = ind_high_idx[ind_high_idx <= ph2]
+        if len(ih1) > 0 and len(ih2) > 0:
+            ih1, ih2 = ih1[-1], ih2[-1]
+            if ih1 != ih2 and price.loc[ph2] > price.loc[ph1] and indicator.loc[ih2] < indicator.loc[ih1]:
+                bearish.loc[ph2] = True
+    return {'bullish_reversal': bullish, 'bearish_reversal': bearish, 'indicator': indicator}
 
 
-def identify_ema_25_99_crossover(price, ema_fast_period=EMA_25_99_FAST, ema_slow_period=EMA_25_99_SLOW):
-    """
-    Identify EMA 25/99 crossover signals:
-    - Entry signal when EMA 25 crosses above EMA 99 (bullish golden cross)
-    - Exit signal when EMA 25 crosses below EMA 99 (bearish death cross)
-    
-    Args:
-        price: Price series
-        ema_fast_period: Fast EMA period (default: 25)
-        ema_slow_period: Slow EMA period (default: 99)
-    
-    Returns:
-        Dictionary with entry and exit signals, plus EMA series
-    """
-    ema_fast = calculate_ema(price, ema_fast_period)
-    ema_slow = calculate_ema(price, ema_slow_period)
-    
-    # Initialize signals
-    entry_signal = pd.Series(False, index=price.index)
-    exit_signal = pd.Series(False, index=price.index)
-    
-    # Detect crossovers
-    for i in range(1, len(price)):
-        # Golden cross: EMA 25 crosses above EMA 99 (entry signal)
-        if ema_fast.iloc[i-1] <= ema_slow.iloc[i-1] and ema_fast.iloc[i] > ema_slow.iloc[i]:
-            entry_signal.iloc[i] = True
-        # Death cross: EMA 25 crosses below EMA 99 (exit signal)
-        elif ema_fast.iloc[i-1] >= ema_slow.iloc[i-1] and ema_fast.iloc[i] < ema_slow.iloc[i]:
-            exit_signal.iloc[i] = True
-    
-    return {
-        'entry': entry_signal,
-        'exit': exit_signal,
-        'ema_fast': ema_fast,
-        'ema_slow': ema_slow
-    }
+def calculate_stochastic(df, k_period=14, d_period=3):
+    """Stochastic %K and %D. Returns %K for divergence (or average of K/D)."""
+    low = df['low'].rolling(window=k_period).min()
+    high = df['high'].rolling(window=k_period).max()
+    k = 100 * (df['close'] - low) / (high - low).replace(0, np.nan)
+    k = k.ffill().fillna(50)
+    d = k.rolling(window=d_period).mean()
+    return k, d
+
+
+def calculate_obv(df):
+    """On-Balance Volume. Add volume when close up, subtract when close down."""
+    direction = np.sign(df['close'].diff())
+    direction = direction.fillna(0)
+    obv = (direction * df['volume']).cumsum()
+    return obv
+
+
+def calculate_mfi(df, period=14):
+    """Money Flow Index (volume-weighted RSI)."""
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    mf = tp * df['volume']
+    delta = tp.diff()
+    pos = mf.where(delta > 0, 0).rolling(period).sum()
+    neg = mf.where(delta < 0, 0).rolling(period).sum()
+    mfi = 100 - (100 / (1 + pos / neg.replace(0, np.nan)))
+    return mfi.fillna(50)
+
+
+def calculate_cci(df, period=20):
+    """Commodity Channel Index."""
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    sma = tp.rolling(period).mean()
+    mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    cci = (tp - sma) / (0.015 * mad.replace(0, np.nan))
+    return cci.fillna(0)
+
+
+def calculate_williams_r(df, period=14):
+    """Williams %R."""
+    high = df['high'].rolling(period).max()
+    low = df['low'].rolling(period).min()
+    wr = -100 * (high - df['close']) / (high - low).replace(0, np.nan)
+    return wr.fillna(-50)
+
+
+def calculate_tsi(price, fast=13, slow=25):
+    """True Strength Index (double-smoothed ROC)."""
+    pc = price.diff()
+    pcds = pc.ewm(span=fast, adjust=False).mean().ewm(span=slow, adjust=False).mean()
+    abs_pc = pc.abs()
+    apcds = abs_pc.ewm(span=fast, adjust=False).mean().ewm(span=slow, adjust=False).mean()
+    tsi = 100 * (pcds / apcds.replace(0, np.nan))
+    return tsi.fillna(0)
+
+
+def calculate_roc(price, period=12):
+    """Rate of Change."""
+    return price.pct_change(period)
+
+
+def calculate_ad_line(df):
+    """Accumulation/Distribution Line."""
+    cl = (df['close'] - df['low']) - (df['high'] - df['close'])
+    cl = cl / (df['high'] - df['low']).replace(0, np.nan)
+    ad = (cl * df['volume']).fillna(0).cumsum()
+    return ad
+
+
+def calculate_pvt(df):
+    """Price Volume Trend."""
+    pvt = (df['close'].pct_change() * df['volume']).fillna(0).cumsum()
+    return pvt
+
+
+def identify_stochastic_divergence(price, df, k_period=14, d_period=3):
+    k, d = calculate_stochastic(df, k_period, d_period)
+    return _identify_divergence(price, k, window=30)
+
+
+def identify_obv_divergence(price, df):
+    obv = calculate_obv(df)
+    return _identify_divergence(price, obv, window=30)
+
+
+def identify_mfi_divergence(price, df, period=14):
+    mfi = calculate_mfi(df, period)
+    return _identify_divergence(price, mfi, window=30)
+
+
+def identify_cci_divergence(price, df, period=20):
+    cci = calculate_cci(df, period)
+    return _identify_divergence(price, cci, window=30)
+
+
+def identify_williams_divergence(price, df, period=14):
+    wr = calculate_williams_r(df, period)
+    return _identify_divergence(price, wr, window=30)
+
+
+def identify_tsi_divergence(price, fast=13, slow=25):
+    tsi = calculate_tsi(price, fast, slow)
+    return _identify_divergence(price, tsi, window=30)
+
+
+def identify_roc_divergence(price, period=12):
+    roc = calculate_roc(price, period)
+    return _identify_divergence(price, roc, window=30)
+
+
+def identify_ad_divergence(price, df):
+    ad = calculate_ad_line(df)
+    return _identify_divergence(price, ad, window=30)
+
+
+def identify_pvt_divergence(price, df):
+    pvt = calculate_pvt(df)
+    return _identify_divergence(price, pvt, window=30)
 
 
 def apply_risk_management(entries, exits, price):
@@ -500,38 +600,36 @@ def create_vectorbt_signals(df, all_strategies, price):
             'exits': rsi_exits.sum()
         }
     
-    if ENABLE_BULLISH_CONFIRMATION and 'bullish_confirmation' in all_strategies:
-        bullish_signals = all_strategies['bullish_confirmation']
-        bullish_entries = bullish_signals.get('bullish_reversal', pd.Series(False, index=price.index)).fillna(False)
-        bullish_exits = bullish_signals.get('bearish_reversal', pd.Series(False, index=price.index)).fillna(False)
-        entries = entries | bullish_entries
-        exits = exits | bullish_exits
-        strategy_counts['Bullish Trend Confirmation'] = {
-            'entries': bullish_entries.sum(),
-            'exits': bullish_exits.sum()
-        }
-    
-    if ENABLE_EMA_25_99_CROSSOVER and 'ema_25_99_crossover' in all_strategies:
-        ema_25_99_signals = all_strategies['ema_25_99_crossover']
-        ema_25_99_entries = ema_25_99_signals.get('entry', pd.Series(False, index=price.index)).fillna(False)
-        ema_25_99_exits = ema_25_99_signals.get('exit', pd.Series(False, index=price.index)).fillna(False)
-        entries = entries | ema_25_99_entries
-        exits = exits | ema_25_99_exits
-        strategy_counts['EMA 25/99 Crossover'] = {
-            'entries': ema_25_99_entries.sum(),
-            'exits': ema_25_99_exits.sum()
-        }
-    
-    # Apply EMA trend filter to entries (only buy when price > EMA)
-    if USE_MA99_FILTER:
-        ema = calculate_ema(price, MA99_PERIOD)
-        price_above_ema = price > ema
-        original_entries = entries.sum()
-        entries = entries & price_above_ema
-        filtered_count = original_entries - entries.sum()
-        if filtered_count > 0:
-            logger.info(f"  EMA{MA99_PERIOD} filter: {filtered_count} buy signals filtered (price below EMA)")
-    
+    def _add_divergence(name, key, all_strategies):
+        nonlocal entries, exits
+        if key not in all_strategies:
+            return
+        sig = all_strategies[key]
+        e = sig.get('bullish_reversal', pd.Series(False, index=price.index)).fillna(False)
+        x = sig.get('bearish_reversal', pd.Series(False, index=price.index)).fillna(False)
+        entries = entries | e
+        exits = exits | x
+        strategy_counts[name] = {'entries': e.sum(), 'exits': x.sum()}
+
+    if ENABLE_STOCHASTIC_DIVERGENCE:
+        _add_divergence('Stochastic Divergence', 'stochastic', all_strategies)
+    if ENABLE_OBV_DIVERGENCE:
+        _add_divergence('OBV Divergence', 'obv', all_strategies)
+    if ENABLE_MFI_DIVERGENCE:
+        _add_divergence('MFI Divergence', 'mfi', all_strategies)
+    if ENABLE_CCI_DIVERGENCE:
+        _add_divergence('CCI Divergence', 'cci', all_strategies)
+    if ENABLE_WILLIAMS_DIVERGENCE:
+        _add_divergence('Williams Divergence', 'williams', all_strategies)
+    if ENABLE_TSI_DIVERGENCE:
+        _add_divergence('TSI Divergence', 'tsi', all_strategies)
+    if ENABLE_ROC_DIVERGENCE:
+        _add_divergence('ROC Divergence', 'roc', all_strategies)
+    if ENABLE_AD_DIVERGENCE:
+        _add_divergence('A/D Divergence', 'ad', all_strategies)
+    if ENABLE_PVT_DIVERGENCE:
+        _add_divergence('PVT Divergence', 'pvt', all_strategies)
+
     # Log strategy breakdown
     logger.info(f"  Strategy Signal Breakdown:")
     for strategy_name, counts in strategy_counts.items():
@@ -650,14 +748,47 @@ def analyze_results(portfolio, ticker_name, start_date=None, end_date=None, entr
     # Signal statistics
     if entries is not None and exits is not None:
         num_entries = entries.sum()
-        num_exits = exits.sum()
+        num_exits_total = exits.sum()
+        
+        # Count only exit signals that occur when there's an open position
+        # Track position state chronologically
+        valid_exits_count = 0
+        ignored_exits_count = 0
+        in_position = False
+        
+        # Process signals chronologically
+        for idx in entries.index:
+            # Check entry signal
+            if entries.loc[idx]:
+                in_position = True
+            
+            # Check exit signal
+            if exits.loc[idx]:
+                if in_position:
+                    valid_exits_count += 1
+                    in_position = False  # Position closed
+                else:
+                    ignored_exits_count += 1
+        
         logger.info(f"Signal Statistics:")
         logger.info(f"  Buy Signals Generated: {num_entries}")
-        logger.info(f"  Sell Signals Generated: {num_exits}")
+        logger.info(f"  Sell Signals Generated: {num_exits_total} (total)")
+        if ignored_exits_count > 0:
+            logger.info(f"    - Valid exits (closing positions): {valid_exits_count}")
+            logger.info(f"    - Ignored exits (no open position): {ignored_exits_count}")
+        else:
+            logger.info(f"    - All exits are valid (closing positions)")
     
     # Basic statistics
     total_return = portfolio.total_return()
     num_trades = portfolio.trades.count()
+    
+    # Show actual trades executed
+    if entries is not None:
+        num_entries = entries.sum()
+        logger.info(f"  Actual Trades Executed: {num_trades}")
+        if num_entries > 0:
+            logger.info(f"  Entry-to-Trade Ratio: {num_trades / num_entries:.2%} ({num_trades}/{num_entries} entries resulted in trades)")
     
     # Get portfolio value progression
     equity = portfolio.value()
@@ -1173,12 +1304,6 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
     # Price with buy/sell signals
     axes[0].plot(df.index, df['close'], label='Close Price', linewidth=1.5)
     
-    # Plot EMA if available
-    if 'ma99' in signals_dict or 'ema' in signals_dict:
-        ema_data = signals_dict.get('ema', signals_dict.get('ma99'))
-        axes[0].plot(df.index, ema_data, label=f'EMA{MA99_PERIOD}', 
-                    linewidth=1.5, linestyle='--', color='orange', alpha=0.7)
-    
     # Get buy/sell signals - check for different possible keys
     buy_signal_key = None
     sell_signal_key = None
@@ -1200,8 +1325,7 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
         axes[0].scatter(sell_signals.index, sell_signals['close'], 
                         color='red', marker='v', s=100, label='Sell Signal', zorder=5)
     
-    filter_status = "ON" if USE_MA99_FILTER else "OFF"
-    axes[0].set_title(f'{ticker_name} - Price with Signals (EMA{MA99_PERIOD} Filter: {filter_status})')
+    axes[0].set_title(f'{ticker_name} - Price with Signals')
     axes[0].set_ylabel('Price (USDT)')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
@@ -1248,27 +1372,14 @@ def plot_results(portfolio, df, signals_dict, ticker_name, output_dir):
         axes[1].set_xlabel('Date')
         # Hide third subplot for RSI
         axes[2].axis('off')
-    elif 'ema_fast' in signals_dict and 'ema_slow' in signals_dict:
-        # EMA Crossover indicators (for Bullish Trend Confirmation)
-        axes[1].plot(df.index, signals_dict['ema_fast'], label=f'EMA{BULLISH_EMA_FAST}', linewidth=1.5, color='blue')
-        axes[1].plot(df.index, signals_dict['ema_slow'], label=f'EMA{BULLISH_EMA_SLOW}', linewidth=1.5, color='orange')
-        axes[1].set_title('EMA Crossover')
-        axes[1].set_ylabel('Price (USDT)')
+    elif 'indicator' in signals_dict:
+        # Generic indicator (Stochastic, OBV, MFI, CCI, Williams, TSI, ROC, A/D, PVT)
+        axes[1].plot(df.index, signals_dict['indicator'], label='Indicator', linewidth=1.5, color='teal')
+        axes[1].set_title('Indicator')
+        axes[1].set_ylabel('Value')
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
         axes[1].set_xlabel('Date')
-        # Hide third subplot for EMA crossover
-        axes[2].axis('off')
-    elif 'ema_25' in signals_dict and 'ema_99' in signals_dict:
-        # EMA 25/99 Crossover indicators
-        axes[1].plot(df.index, signals_dict['ema_25'], label='EMA25', linewidth=1.5, color='blue')
-        axes[1].plot(df.index, signals_dict['ema_99'], label='EMA99', linewidth=1.5, color='orange')
-        axes[1].set_title('EMA 25/99 Crossover')
-        axes[1].set_ylabel('Price (USDT)')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        axes[1].set_xlabel('Date')
-        # Hide third subplot for EMA crossover
         axes[2].axis('off')
     else:
         # No specific indicators, just show price
@@ -1361,16 +1472,20 @@ def main(download_only: bool = False):
         return
     
     # Log enabled strategies
-    enabled_strategies = []
-    if ENABLE_MACD_TREND_REVERSAL:
-        enabled_strategies.append("1. MACD Trend Reversals")
-    if ENABLE_RSI_TREND_REVERSAL:
-        enabled_strategies.append("2. RSI Trend Reversals")
-    if ENABLE_BULLISH_CONFIRMATION:
-        enabled_strategies.append("3. Bullish Trend Confirmation")
-    if ENABLE_EMA_25_99_CROSSOVER:
-        enabled_strategies.append("4. EMA 25/99 Crossover")
-    
+    DIVERGENCE_FLAGS = [
+        (ENABLE_MACD_TREND_REVERSAL, "MACD Trend Reversals"),
+        (ENABLE_RSI_TREND_REVERSAL, "RSI Trend Reversals"),
+        (ENABLE_STOCHASTIC_DIVERGENCE, "Stochastic Divergence"),
+        (ENABLE_OBV_DIVERGENCE, "OBV Divergence"),
+        (ENABLE_MFI_DIVERGENCE, "MFI Divergence"),
+        (ENABLE_CCI_DIVERGENCE, "CCI Divergence"),
+        (ENABLE_WILLIAMS_DIVERGENCE, "Williams %R Divergence"),
+        (ENABLE_TSI_DIVERGENCE, "TSI Divergence"),
+        (ENABLE_ROC_DIVERGENCE, "ROC Divergence"),
+        (ENABLE_AD_DIVERGENCE, "A/D Divergence"),
+        (ENABLE_PVT_DIVERGENCE, "PVT Divergence"),
+    ]
+    enabled_strategies = [name for flag, name in DIVERGENCE_FLAGS if flag]
     logger.info(f"Enabled Strategies:")
     for strategy in enabled_strategies:
         logger.info(f"  ✓ {strategy}")
@@ -1425,11 +1540,6 @@ def main(download_only: bool = False):
             entries = macd_signals['strong_bullish'].fillna(False)
             exits = macd_signals['strong_bearish'].fillna(False).copy()
             
-            # Apply EMA filter if enabled
-            if USE_MA99_FILTER:
-                ema = calculate_ema(price, MA99_PERIOD)
-                entries = entries & (price > ema)
-            
             # Apply risk management
             if ENABLE_RISK_MANAGEMENT:
                 exits = apply_risk_management(entries, exits, price)
@@ -1481,11 +1591,6 @@ def main(download_only: bool = False):
             entries = rsi_signals['bullish_reversal'].fillna(False)
             exits = rsi_signals['bearish_reversal'].fillna(False).copy()
             
-            # Apply EMA filter if enabled
-            if USE_MA99_FILTER:
-                ema = calculate_ema(price, MA99_PERIOD)
-                entries = entries & (price > ema)
-            
             # Apply risk management
             if ENABLE_RISK_MANAGEMENT:
                 exits = apply_risk_management(entries, exits, price)
@@ -1522,132 +1627,223 @@ def main(download_only: bool = False):
             if training_df is not None:
                 save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
         
-        # Strategy 3: Bullish Trend Confirmation
-        if ENABLE_BULLISH_CONFIRMATION:
-            strategy_name = "Bullish_Trend_Confirmation"
+        # Strategy 3: Stochastic Divergence
+        if ENABLE_STOCHASTIC_DIVERGENCE:
+            strategy_name = "Stochastic_Divergence"
             logger.info(f"[Strategy 3] {strategy_name}")
-            
-            # Create strategy-specific folder
             strategy_dir = base_output_dir / strategy_name
             strategy_dir.mkdir(exist_ok=True)
-            
-            bullish_signals = identify_bullish_trend_confirmation(price)
-            
-            # Create signals for this strategy only
-            entries = bullish_signals['bullish_reversal'].fillna(False)
-            exits = bullish_signals['bearish_reversal'].fillna(False).copy()
-            
-            # Apply EMA filter if enabled
-            if USE_MA99_FILTER:
-                ema = calculate_ema(price, MA99_PERIOD)
-                entries = entries & (price > ema)
-            
-            # Apply risk management
+            sig = identify_stochastic_divergence(price, ticker_df, STOCH_K_PERIOD, STOCH_D_PERIOD)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
             if ENABLE_RISK_MANAGEMENT:
                 exits = apply_risk_management(entries, exits, price)
-            
-            # Backtest this strategy
             portfolio = backtest_strategy(price, entries, exits, ticker)
             strategy_portfolios[strategy_name] = portfolio
             strategy_equity_curves[strategy_name] = portfolio.value()
-            
-            # Analyze and save results
-            actual_start = ticker_df.index.min()
-            actual_end = ticker_df.index.max()
-            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", actual_start, actual_end, entries, exits)
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
             all_strategy_results[f"{ticker}_{strategy_name}"] = results
-            
-            # Save CSV files for this strategy
             save_trade_history(portfolio, ticker, strategy_dir)
             save_account_balance(portfolio, ticker, strategy_dir)
-            
-            # Plot individual strategy
-            signals_dict = {
-                'ema_fast': bullish_signals.get('ema_fast'),
-                'ema_slow': bullish_signals.get('ema_slow'),
-                'bullish_reversal': bullish_signals['bullish_reversal'],
-                'bearish_reversal': bullish_signals['bearish_reversal']
-            }
-            plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
-            
-            # Extract training features for Bullish Trend Confirmation strategy
-            all_strategies_for_training = {'bullish_confirmation': bullish_signals}
-            training_df = extract_training_features(
-                portfolio, ticker_df, price, all_strategies_for_training, 
-                ticker, strategy_name, lookback_periods=30
-            )
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'stochastic': sig}, ticker, strategy_name, lookback_periods=30)
             if training_df is not None:
                 save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
-        
-        # Strategy 4: EMA 25/99 Crossover
-        if ENABLE_EMA_25_99_CROSSOVER:
-            strategy_name = "EMA_25_99_Crossover"
+
+        # Strategy 4: OBV Divergence (requires volume)
+        if ENABLE_OBV_DIVERGENCE and 'volume' in ticker_df.columns:
+            strategy_name = "OBV_Divergence"
             logger.info(f"[Strategy 4] {strategy_name}")
-            
-            # Create strategy-specific folder
             strategy_dir = base_output_dir / strategy_name
             strategy_dir.mkdir(exist_ok=True)
-            
-            ema_25_99_signals = identify_ema_25_99_crossover(price)
-            
-            # Create signals for this strategy only
-            entries = ema_25_99_signals['entry'].fillna(False)
-            exits = ema_25_99_signals['exit'].fillna(False).copy()
-            
-            # Apply EMA filter if enabled
-            if USE_MA99_FILTER:
-                ema = calculate_ema(price, MA99_PERIOD)
-                entries = entries & (price > ema)
-            
-            # Apply risk management
+            sig = identify_obv_divergence(price, ticker_df)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
             if ENABLE_RISK_MANAGEMENT:
                 exits = apply_risk_management(entries, exits, price)
-            
-            # Backtest this strategy
             portfolio = backtest_strategy(price, entries, exits, ticker)
             strategy_portfolios[strategy_name] = portfolio
             strategy_equity_curves[strategy_name] = portfolio.value()
-            
-            # Analyze and save results
-            actual_start = ticker_df.index.min()
-            actual_end = ticker_df.index.max()
-            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", actual_start, actual_end, entries, exits)
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
             all_strategy_results[f"{ticker}_{strategy_name}"] = results
-            
-            # Save CSV files for this strategy
             save_trade_history(portfolio, ticker, strategy_dir)
             save_account_balance(portfolio, ticker, strategy_dir)
-            
-            # Plot individual strategy
-            signals_dict = {
-                'ema_fast': ema_25_99_signals.get('ema_fast'),
-                'ema_slow': ema_25_99_signals.get('ema_slow'),
-                'entry': ema_25_99_signals['entry'],
-                'exit': ema_25_99_signals['exit']
-            }
-            plot_results(portfolio, ticker_df, signals_dict, ticker, strategy_dir)
-            
-            # Extract training features for EMA 25/99 Crossover strategy
-            all_strategies_for_training = {'ema_25_99_crossover': ema_25_99_signals}
-            training_df = extract_training_features(
-                portfolio, ticker_df, price, all_strategies_for_training, 
-                ticker, strategy_name, lookback_periods=30
-            )
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'obv': sig}, ticker, strategy_name, lookback_periods=30)
             if training_df is not None:
                 save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
-        
+
+        # Strategy 5: MFI Divergence (requires volume)
+        if ENABLE_MFI_DIVERGENCE and 'volume' in ticker_df.columns:
+            strategy_name = "MFI_Divergence"
+            logger.info(f"[Strategy 5] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_mfi_divergence(price, ticker_df, MFI_PERIOD)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'mfi': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 6: CCI Divergence
+        if ENABLE_CCI_DIVERGENCE:
+            strategy_name = "CCI_Divergence"
+            logger.info(f"[Strategy 6] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_cci_divergence(price, ticker_df, CCI_PERIOD)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'cci': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 7: Williams %R Divergence
+        if ENABLE_WILLIAMS_DIVERGENCE:
+            strategy_name = "Williams_Divergence"
+            logger.info(f"[Strategy 7] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_williams_divergence(price, ticker_df, WILLIAMS_PERIOD)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'williams': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 8: TSI Divergence
+        if ENABLE_TSI_DIVERGENCE:
+            strategy_name = "TSI_Divergence"
+            logger.info(f"[Strategy 8] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_tsi_divergence(price, TSI_FAST, TSI_SLOW)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'tsi': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 9: ROC Divergence
+        if ENABLE_ROC_DIVERGENCE:
+            strategy_name = "ROC_Divergence"
+            logger.info(f"[Strategy 9] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_roc_divergence(price, ROC_PERIOD)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'roc': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 10: A/D Divergence (requires volume)
+        if ENABLE_AD_DIVERGENCE and 'volume' in ticker_df.columns:
+            strategy_name = "AD_Divergence"
+            logger.info(f"[Strategy 10] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_ad_divergence(price, ticker_df)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'ad': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
+        # Strategy 11: PVT Divergence (requires volume)
+        if ENABLE_PVT_DIVERGENCE and 'volume' in ticker_df.columns:
+            strategy_name = "PVT_Divergence"
+            logger.info(f"[Strategy 11] {strategy_name}")
+            strategy_dir = base_output_dir / strategy_name
+            strategy_dir.mkdir(exist_ok=True)
+            sig = identify_pvt_divergence(price, ticker_df)
+            entries = sig['bullish_reversal'].fillna(False)
+            exits = sig['bearish_reversal'].fillna(False).copy()
+            if ENABLE_RISK_MANAGEMENT:
+                exits = apply_risk_management(entries, exits, price)
+            portfolio = backtest_strategy(price, entries, exits, ticker)
+            strategy_portfolios[strategy_name] = portfolio
+            strategy_equity_curves[strategy_name] = portfolio.value()
+            results = analyze_results(portfolio, f"{ticker}_{strategy_name}", ticker_df.index.min(), ticker_df.index.max(), entries, exits)
+            all_strategy_results[f"{ticker}_{strategy_name}"] = results
+            save_trade_history(portfolio, ticker, strategy_dir)
+            save_account_balance(portfolio, ticker, strategy_dir)
+            plot_results(portfolio, ticker_df, sig, ticker, strategy_dir)
+            training_df = extract_training_features(portfolio, ticker_df, price, {'pvt': sig}, ticker, strategy_name, lookback_periods=30)
+            if training_df is not None:
+                save_training_dataset(training_df, ticker, strategy_name, base_output_dir)
+
         # Create comparison plot for all strategies
         if len(strategy_equity_curves) > 1:
             plot_strategy_comparison(strategy_equity_curves, ticker, base_output_dir)
         
         # Also create combined strategy (if multiple enabled)
-        if len([s for s in [ENABLE_MACD_TREND_REVERSAL, ENABLE_RSI_TREND_REVERSAL, ENABLE_BULLISH_CONFIRMATION, ENABLE_EMA_25_99_CROSSOVER] if s]) > 1:
+        if sum(1 for flag, _ in DIVERGENCE_FLAGS if flag) > 1:
             logger.info(f"[Combined Strategy] Running all strategies together...")
             
-            # Create combined strategy folder
             combined_strategy_dir = base_output_dir / "Combined"
             combined_strategy_dir.mkdir(exist_ok=True)
-            
             all_strategies = {}
             signals_dict = {}
             
@@ -1663,17 +1859,50 @@ def main(download_only: bool = False):
                 all_strategies['rsi'] = rsi_signals
                 signals_dict['rsi'] = rsi
             
-            if ENABLE_BULLISH_CONFIRMATION:
-                bullish_signals = identify_bullish_trend_confirmation(price)
-                all_strategies['bullish_confirmation'] = bullish_signals
-                signals_dict['ema_fast'] = bullish_signals.get('ema_fast')
-                signals_dict['ema_slow'] = bullish_signals.get('ema_slow')
-            
-            if ENABLE_EMA_25_99_CROSSOVER:
-                ema_25_99_signals = identify_ema_25_99_crossover(price)
-                all_strategies['ema_25_99_crossover'] = ema_25_99_signals
-                signals_dict['ema_25'] = ema_25_99_signals.get('ema_fast')
-                signals_dict['ema_99'] = ema_25_99_signals.get('ema_slow')
+            if ENABLE_STOCHASTIC_DIVERGENCE:
+                sig = identify_stochastic_divergence(price, ticker_df, STOCH_K_PERIOD, STOCH_D_PERIOD)
+                all_strategies['stochastic'] = sig
+                signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_OBV_DIVERGENCE and 'volume' in ticker_df.columns:
+                sig = identify_obv_divergence(price, ticker_df)
+                all_strategies['obv'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_MFI_DIVERGENCE and 'volume' in ticker_df.columns:
+                sig = identify_mfi_divergence(price, ticker_df, MFI_PERIOD)
+                all_strategies['mfi'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_CCI_DIVERGENCE:
+                sig = identify_cci_divergence(price, ticker_df, CCI_PERIOD)
+                all_strategies['cci'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_WILLIAMS_DIVERGENCE:
+                sig = identify_williams_divergence(price, ticker_df, WILLIAMS_PERIOD)
+                all_strategies['williams'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_TSI_DIVERGENCE:
+                sig = identify_tsi_divergence(price, TSI_FAST, TSI_SLOW)
+                all_strategies['tsi'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_ROC_DIVERGENCE:
+                sig = identify_roc_divergence(price, ROC_PERIOD)
+                all_strategies['roc'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_AD_DIVERGENCE and 'volume' in ticker_df.columns:
+                sig = identify_ad_divergence(price, ticker_df)
+                all_strategies['ad'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
+            if ENABLE_PVT_DIVERGENCE and 'volume' in ticker_df.columns:
+                sig = identify_pvt_divergence(price, ticker_df)
+                all_strategies['pvt'] = sig
+                if 'indicator' not in signals_dict:
+                    signals_dict['indicator'] = sig.get('indicator')
             
             entries, exits = create_vectorbt_signals(ticker_df, all_strategies, price)
             portfolio = backtest_strategy(price, entries, exits, ticker)
@@ -1687,6 +1916,8 @@ def main(download_only: bool = False):
             save_account_balance(portfolio, ticker, combined_strategy_dir)
             
             strategy_equity_curves['Combined'] = portfolio.value()
+            signals_dict['bullish_reversal'] = entries
+            signals_dict['bearish_reversal'] = exits
             plot_results(portfolio, ticker_df, signals_dict, ticker, combined_strategy_dir)
             plot_strategy_comparison(strategy_equity_curves, ticker, base_output_dir)
             
@@ -1713,12 +1944,10 @@ def main(download_only: bool = False):
         summary_df.to_csv(output_dir / "strategy_summary.csv")
         logger.info(f"Summary saved to {output_dir}/strategy_summary.csv")
         logger.info(f"Results organized by strategy in:")
-        logger.info(f"  {output_dir}/MACD_Trend_Reversal/")
-        logger.info(f"  {output_dir}/RSI_Trend_Reversal/")
-        logger.info(f"  {output_dir}/Bullish_Trend_Confirmation/")
-        logger.info(f"  {output_dir}/EMA_25_99_Crossover/")
-        logger.info(f"  {output_dir}/Combined/")
-        logger.info(f"  {output_dir}/strategy_comparison/")
+        for folder in ["MACD_Trend_Reversal", "RSI_Trend_Reversal", "Stochastic_Divergence", "OBV_Divergence",
+                       "MFI_Divergence", "CCI_Divergence", "Williams_Divergence", "TSI_Divergence",
+                       "ROC_Divergence", "AD_Divergence", "PVT_Divergence", "Combined", "strategy_comparison"]:
+            logger.info(f"  {output_dir}/{folder}/")
         logger.info(f"  {output_dir}/training_data/")
     else:
         logger.warning("No strategy results to summarize.")

@@ -4,11 +4,8 @@ SBX provides faster training through JAX JIT compilation and efficient computati
 """
 
 import os
-import sys
-import warnings
 import numpy as np
 from pathlib import Path
-import pickle
 import multiprocessing
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
@@ -27,7 +24,6 @@ from stable_baselines3.common.callbacks import (
 )
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.evaluation import evaluate_policy
 
 # Custom environment
 from rl_risk_env import RiskManagementEnv
@@ -44,7 +40,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TRAINING_DATA_DIR = Path("rl_training_episodes")
 MODEL_SAVE_DIR = Path("models/rl_agent")
 MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 TENSORBOARD_LOG_DIR = MODEL_SAVE_DIR / "tensorboard_logs"
@@ -105,16 +100,13 @@ EARLY_STOPPING_MIN_DELTA = 0.0  # Minimum change to qualify as improvement
 EARLY_STOPPING_MONITOR = 'mean_total_reward'  # Metric to monitor: 'mean_reward', 'mean_total_reward', 'mean_ep_length', or 'loss'
 EARLY_STOPPING_MODE = 'max'  # 'max' for reward/ep_length (higher is better), 'min' for loss (lower is better)
 
-# Training/Validation split (used if date ranges not specified)
-TRAIN_SPLIT = 0.7  # 70% training, 30% validation
-
 # ============== Date Range Configuration ==============
 # Set to None to use all available data, or specify date range (YYYY-MM-DD format)
 # Time-series split: TRAIN -> VALIDATION -> EVAL (chronological order)
 
 # Training data date range  # YYYY-MM-DD format, or None for all data
 TRAIN_START_DATE = "2010-01-01"  # Start date for training data (None = beginning of data)
-TRAIN_END_DATE = "2024-01-01"    # End date for training data (None = use TRAIN_SPLIT)
+TRAIN_END_DATE = "2024-01-01"    # End date for training data (None = end of data)
 
 # Validation data date range (for evaluation during training)
 VAL_START_DATE = "2024-01-01"    # Start date for validation data (None = after TRAIN_END_DATE)
@@ -764,7 +756,8 @@ def load_all_tickers_data(
                             'price': price_series,
                             'balance': balance_series,
                             'entry_signals': entry_signals,
-                            'exit_signals': exit_signals
+                            'exit_signals': exit_signals,
+                            'ohlcv': ticker_df,  # OHLCV for CCI/Williams/TSI/ROC and OBV/MFI/AD/PVT in obs
                         }
                     else:
                         logger.warning(f"  No data found for {ticker}")
@@ -781,89 +774,6 @@ def load_all_tickers_data(
     
     logger.info(f"Successfully loaded data for {len(all_tickers_data)} tickers")
     return all_tickers_data
-
-
-def load_episodes(data_dir: Path) -> List[Dict]:
-    """
-    Load training episodes from disk.
-    
-    Args:
-        data_dir: Directory containing episodes.pkl
-    
-    Returns:
-        List of episode dictionaries
-    """
-    logger.info(f"Loading episodes from {data_dir}...")
-    
-    episodes_file = data_dir / "episodes.pkl"
-    if not episodes_file.exists():
-        logger.error(f"Episodes file not found: {episodes_file}")
-        logger.error("Please run prepare_rl_training_data.py first!")
-        return []
-    
-    with open(episodes_file, 'rb') as f:
-        episodes = pickle.load(f)
-    
-    logger.info(f"Loaded {len(episodes)} episodes")
-    return episodes
-
-
-def split_episodes(episodes: List[Dict], train_split: float = 0.8) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Split episodes into training and validation sets.
-    
-    Args:
-        episodes: List of all episodes
-        train_split: Proportion for training (rest for validation)
-    
-    Returns:
-        train_episodes, val_episodes
-    """
-    # Simple random split (could also do time-based split)
-    np.random.seed(42)
-    indices = np.random.permutation(len(episodes))
-    split_idx = int(len(episodes) * train_split)
-    
-    train_indices = indices[:split_idx]
-    val_indices = indices[split_idx:]
-    
-    train_episodes = [episodes[i] for i in train_indices]
-    val_episodes = [episodes[i] for i in val_indices]
-    
-    logger.info(f"Split episodes: {len(train_episodes)} training, {len(val_episodes)} validation")
-    
-    return train_episodes, val_episodes
-
-
-def make_env(episode: Dict, rank: int = 0, seed: int = 0) -> RiskManagementEnv:
-    """
-    Create a single environment instance.
-    
-    Args:
-        episode: Episode dictionary with price_data, balance_data, etc.
-        rank: Environment rank (for vectorization)
-        seed: Random seed
-    
-    Returns:
-        Environment instance
-    """
-    def _init():
-        env = RiskManagementEnv(
-            price_data=episode['price_series'],
-            balance_data=episode['balance_series'],
-            entry_price=episode['entry_price'],
-            entry_idx=episode['entry_idx'] - episode['entry_idx'],  # Relative to episode start
-            exit_idx=episode['exit_idx'] - episode['entry_idx'],
-            initial_balance=episode['initial_balance'],
-            history_length=60,
-            max_steps=min(episode['episode_length'] + 100, 5000),
-            fee_rate=0.001
-        )
-        # Wrap with Monitor for statistics
-        env = Monitor(env, filename=None, allow_early_resets=True)
-        env.reset(seed=seed + rank)
-        return env
-    return _init
 
 
 def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: int = 42) -> callable:
@@ -890,9 +800,9 @@ def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: 
         env = RiskManagementEnv(
             all_tickers_data=all_tickers_data,
             initial_balance=INITIAL_BALANCE,
-            history_length=60,
+            history_length=14,
             max_steps=1000,  # Initial value, will be overridden in reset() based on exit signals
-            fee_rate=0.001
+            fee_rate=0.001,
         )
         # Wrap with Monitor for statistics
         env = Monitor(env, filename=None, allow_early_resets=True)
@@ -1479,13 +1389,6 @@ def main():
         
         total_val_timesteps = sum(len(data['price']) for data in val_tickers_data.values())
         logger.info(f"  Total validation timesteps: {total_val_timesteps}")
-    
-    # Load validation episodes from file (legacy support)
-    val_episodes = []
-    episodes = load_episodes(TRAINING_DATA_DIR)
-    if len(episodes) > 0:
-        _, val_episodes = split_episodes(episodes, TRAIN_SPLIT)
-        logger.info(f"\nLoaded {len(val_episodes)} validation episodes from file")
     
     # Load TEST data (for final evaluation after training)
     logger.info("\n--- Loading TEST Data ---")
