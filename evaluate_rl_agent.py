@@ -513,7 +513,11 @@ def plot_individual_trades(
                 # Get RL return and PnL for coloring and display
                 trade_return_rl = float(trade.get('Return', 0)) if 'Return' in trade.index else 0
                 trade_pnl_rl = float(trade.get('PnL', 0)) if 'PnL' in trade.index else 0
-                trade_duration_rl = trade.get('Duration', 'N/A') if 'Duration' in trade.index else 'N/A'
+                # Duration: use from trade record if present, else compute from entry/exit timestamps
+                if 'Duration' in trade.index and trade['Duration'] is not None and pd.notna(trade['Duration']):
+                    trade_duration_rl = trade['Duration']
+                else:
+                    trade_duration_rl = exit_time_rl - entry_time
                 
                 # Get position ID if available
                 position_id = trade.get('Position Id', trade_idx) if 'Position Id' in trade.index else trade_idx
@@ -541,7 +545,12 @@ def plot_individual_trades(
                         
                         trade_return_rule = float(rule_trade.get('Return', 0)) if 'Return' in rule_trade.index else 0
                         trade_pnl_rule = float(rule_trade.get('PnL', 0)) if 'PnL' in rule_trade.index else 0
-                        trade_duration_rule = rule_trade.get('Duration', 'N/A') if 'Duration' in rule_trade.index else 'N/A'
+                        if 'Duration' in rule_trade.index and rule_trade['Duration'] is not None and pd.notna(rule_trade['Duration']):
+                            trade_duration_rule = rule_trade['Duration']
+                        elif exit_time_rule is not None:
+                            trade_duration_rule = exit_time_rule - entry_time
+                        else:
+                            trade_duration_rule = None
                     except Exception as e:
                         logger.debug(f"Could not extract rule-based exit for trade {trade_idx}: {e}")
                 
@@ -653,21 +662,33 @@ def plot_individual_trades(
                     ax1.axvline(x=exit_time_rule, color=trade_color_rule, 
                               linestyle=':', alpha=0.5, linewidth=1.5)
                 
-                # Format durations for display
+                # Format durations for display (handles pd.Timedelta, seconds, or existing string)
                 def format_duration(dur):
-                    if isinstance(dur, str) and dur != 'N/A':
+                    if dur is None or (isinstance(dur, str) and dur == 'N/A'):
+                        return 'N/A'
+                    if isinstance(dur, str):
                         return dur
-                    elif hasattr(dur, 'total_seconds'):
-                        days = dur.days
-                        hours = dur.seconds // 3600
-                        return f"{days}d {hours}h" if days > 0 else f"{hours}h"
+                    if hasattr(dur, 'total_seconds'):
+                        total = int(dur.total_seconds())
+                    elif isinstance(dur, (int, float)):
+                        total = int(dur)
                     else:
                         return str(dur)
+                    days, r = divmod(total, 86400)
+                    hours, r = divmod(r, 3600)
+                    mins = r // 60
+                    parts = []
+                    if days > 0:
+                        parts.append(f"{days}d")
+                    if hours > 0 or days > 0:
+                        parts.append(f"{hours}h")
+                    parts.append(f"{mins}m")
+                    return ' '.join(parts)
                 
                 duration_str_rl = format_duration(trade_duration_rl)
                 duration_str_rule = format_duration(trade_duration_rule) if exit_time_rule else 'N/A'
                 
-                # Set title with trade information (escape $ signs for matplotlib)
+                # Set title: Entry, RL Exit, Duration
                 profit_loss_rl = "Profit" if is_profitable_rl else "Loss"
                 title = f'{ticker} - Trade #{trade_idx} (Position ID: {position_id}) - RL: {profit_loss_rl}\n'
                 title += f'Entry: {entry_time.strftime("%Y-%m-%d %H:%M")} @ \\${entry_price:.4f}\n'
@@ -774,21 +795,33 @@ def plot_individual_trades(
                     ax1.axvline(x=trade_data['exit_time_rule'], color=trade_color_rule, 
                               linestyle=':', alpha=0.5, linewidth=1.5)
                 
-                # Format durations for display
+                # Format durations for display (same as per-trade plot)
                 def format_duration(dur):
-                    if isinstance(dur, str) and dur != 'N/A':
+                    if dur is None or (isinstance(dur, str) and dur == 'N/A'):
+                        return 'N/A'
+                    if isinstance(dur, str):
                         return dur
-                    elif hasattr(dur, 'total_seconds'):
-                        days = dur.days
-                        hours = dur.seconds // 3600
-                        return f"{days}d {hours}h" if days > 0 else f"{hours}h"
+                    if hasattr(dur, 'total_seconds'):
+                        total = int(dur.total_seconds())
+                    elif isinstance(dur, (int, float)):
+                        total = int(dur)
                     else:
                         return str(dur)
+                    days, r = divmod(total, 86400)
+                    hours, r = divmod(r, 3600)
+                    mins = r // 60
+                    parts = []
+                    if days > 0:
+                        parts.append(f"{days}d")
+                    if hours > 0 or days > 0:
+                        parts.append(f"{hours}h")
+                    parts.append(f"{mins}m")
+                    return ' '.join(parts)
                 
                 duration_str_rl = format_duration(trade_data['trade_duration_rl'])
                 duration_str_rule = format_duration(trade_data['trade_duration_rule']) if trade_data['exit_time_rule'] else 'N/A'
                 
-                # Set title with trade information
+                # Set title: Entry, RL Exit, Duration
                 profit_loss_rl = "Profit" if is_profitable_rl else "Loss"
                 title = f'{ticker} - {trade_label} Trade (Trade #{trade_data["trade_idx"]}, Position ID: {trade_data["position_id"]}) - RL: {profit_loss_rl}\n'
                 title += f'Entry: {trade_data["entry_time"].strftime("%Y-%m-%d %H:%M")} @ \\${trade_data["entry_price"]:.4f}\n'

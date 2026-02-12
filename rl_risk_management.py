@@ -331,6 +331,10 @@ class RLRiskManager:
             env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
             env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
             
+            # Set ohlcv_window for volume-based indicators (OBV, MFI, AD, PVT)
+            # Create a DataFrame with close, high, low, volume columns if available
+            env.ohlcv_window = None  # Initialize to None (will use fallback zeros for volume indicators)
+            
             # Reset episode tracking
             env.current_step = 0
             env.current_idx = 0

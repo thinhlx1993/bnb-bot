@@ -53,7 +53,7 @@ INITIAL_BALANCE = 1000.0  # Default initial balance
 TOTAL_TIMESTEPS = 1e7  # Total training steps (use early stopping)
 LEARNING_RATE = 3e-4  # Initial learning rate
 LEARNING_RATE_END = 1e-5  # Final learning rate (for linear decay)
-USE_LR_SCHEDULE = True  # Enable learning rate scheduling
+USE_LR_SCHEDULE = False  # Enable learning rate scheduling
 BATCH_SIZE = 1024  # Batch size for stable training (increase to 512-1024 for better GPU utilization if memory allows)
 N_STEPS = 2048  # Steps per update
 N_EPOCHS = 4  # Optimization epochs per update (further reduced to prevent overfitting)
@@ -91,13 +91,13 @@ LSTM_HIDDEN_SIZE = 256  # LSTM hidden size
 N_LSTM_LAYERS = 1  # Number of LSTM layers
 CHECKPOINT_FREQ = 10000  # Save checkpoint every N steps
 EVAL_FREQ = 1000  # Evaluate every N steps (single env, all val entry signals, max 1000 steps per episode)
-N_EVAL_EPISODES = 200  # Number of episodes to evaluate
+N_EVAL_EPISODES = 500  # Number of episodes to evaluate
 
 # Early stopping configuration
 ENABLE_EARLY_STOPPING = False  # Enable early stopping
 EARLY_STOPPING_PATIENCE = 50  # Number of evaluations without improvement before stopping
 EARLY_STOPPING_MIN_DELTA = 0.0  # Minimum change to qualify as improvement
-EARLY_STOPPING_MONITOR = 'mean_total_reward'  # Metric to monitor: 'mean_reward', 'mean_total_reward', 'mean_ep_length', or 'loss'
+EARLY_STOPPING_MONITOR = 'mean_ep_length'  # Metric to monitor: 'mean_reward', 'mean_total_reward', 'mean_ep_length', or 'loss'
 EARLY_STOPPING_MODE = 'max'  # 'max' for reward/ep_length (higher is better), 'min' for loss (lower is better)
 
 # ============== Date Range Configuration ==============
@@ -793,15 +793,12 @@ def create_env_factory(all_tickers_data: Dict[str, Dict[str, pd.Series]], seed: 
     def _make_env(rank: int = 0):
         # Create environment with all tickers' data
         # Entry point will be randomly selected on reset
-        # Note: max_steps will be dynamically set in reset() based on exit signals:
-        # - Uses rule-based exit signal for each episode
-        # - If exit signal doesn't exist, fallback to 500 steps
-        # - If exit signal < 100 steps, sets 100 as default
+        # max_steps = number of bars from entry the bot can play (episode ends at entry + max_steps or end of data)
         env = RiskManagementEnv(
             all_tickers_data=all_tickers_data,
             initial_balance=INITIAL_BALANCE,
-            history_length=14,
-            max_steps=1000,  # Initial value, will be overridden in reset() based on exit signals
+            history_length=50,
+            max_steps=500,  # Steps from entry per episode
             fee_rate=0.001,
         )
         # Wrap with Monitor for statistics

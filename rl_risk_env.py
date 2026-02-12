@@ -21,8 +21,18 @@ class RiskManagementEnv(gym.Env):
     - Market price changes
     - Position performance history
     - Current drawdown
+
+    Note on episode length: The observation uses a fixed 60-timestep window. Without
+    explicit time-in-position info, the policy can learn to close after ~60 steps
+    (when the window is "full"), causing mean episode length to cluster around 61.
+    Use include_steps_held_in_obs=True to add steps_held_normalized (steps since entry,
+    capped by a fixed constant) so the agent can learn variable hold times. A fixed
+    constant is used (not episode_length) so the same observation works in live
+    trading where episode length is unknown.
     """
-    
+    # Normalization length for "steps held" feature: same in train and live (no episode_length needed)
+    STEPS_HELD_NORMALIZATION_LENGTH = 500
+
     metadata = {"render_modes": ["human"], "render_fps": 4}
     
     def __init__(
@@ -35,9 +45,10 @@ class RiskManagementEnv(gym.Env):
         exit_idx: Optional[int] = None,
         initial_balance: float = 100.0,
         history_length: int = 60,
-        max_steps: int = 5000,
+        max_steps: int = 500,
         fee_rate: float = 0.001,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        include_steps_held_in_obs: bool = True,
     ):
         """
         Initialize the risk management environment.
@@ -51,9 +62,14 @@ class RiskManagementEnv(gym.Env):
             exit_idx: Exit index (legacy - will be set on reset if all_tickers_data provided)
             initial_balance: Initial account balance
             history_length: Number of historical periods to include in observations
-            max_steps: Maximum steps per episode
+            max_steps: From entry bar, allow the bot to play this many steps (bars). Episode ends at
+                min(entry_idx + max_steps - 1, end of data). Default 500.
             fee_rate: Trading fee rate (e.g., 0.001 for 0.1%)
             render_mode: Rendering mode
+            include_steps_held_in_obs: If True, append steps_held_normalized (min(current_idx/500, 1.0)) to
+                observation so the agent has explicit time-in-position info. Uses a fixed constant
+                (500) so the same observation works in live trading where episode length is unknown.
+                Default True so the agent gets time-in-position in train and live.
         """
         super().__init__()
         
@@ -72,38 +88,23 @@ class RiskManagementEnv(gym.Env):
             self.exit_idx = None
             self.exit_signal_idx = None  # Next exit signal index after entry
             
-            # Pre-calculate entry and exit signal indices for each ticker
+            # Pre-calculate entry signal indices: valid = enough history before + room for max_steps after
             self._entry_signal_indices = {}
             self._exit_signal_indices = {}
             for ticker in self.tickers_list:
                 ticker_data = all_tickers_data[ticker]
+                price_len = len(ticker_data['price'])
                 
-                # Entry signals
+                # Entry signals: require history_length before and max_steps bars after entry
                 if 'entry_signals' in ticker_data and ticker_data['entry_signals'] is not None:
-                    # Get indices where entry signals are True
                     signals = ticker_data['entry_signals']
                     signal_indices = np.where(signals.values)[0]
-                    # Filter to valid range (need history before and an exit signal after)
-                    # Only include entries that have an exit signal after them
-                    exit_signals = ticker_data.get('exit_signals')
-                    if exit_signals is not None:
-                        exit_indices = np.where(exit_signals.values)[0]
-                        # Only keep entry signals that have at least one exit signal after them
-                        valid_indices = []
-                        for entry_idx in signal_indices:
-                            if entry_idx >= history_length:
-                                # Check if there's an exit signal after this entry
-                                exits_after = exit_indices[exit_indices > entry_idx]
-                                if len(exits_after) > 0:
-                                    valid_indices.append(entry_idx)
-                        self._entry_signal_indices[ticker] = np.array(valid_indices) if len(valid_indices) > 0 else None
-                    else:
-                        # No exit signals, filter by history only
-                        valid_indices = signal_indices[
-                            (signal_indices >= history_length) & 
-                            (signal_indices < len(signals) - 50)  # At least 50 steps after
-                        ]
-                        self._entry_signal_indices[ticker] = valid_indices if len(valid_indices) > 0 else None
+                    valid_mask = (
+                        (signal_indices >= history_length) &
+                        (signal_indices + max_steps <= price_len)
+                    )
+                    valid_indices = signal_indices[valid_mask]
+                    self._entry_signal_indices[ticker] = valid_indices if len(valid_indices) > 0 else None
                 else:
                     self._entry_signal_indices[ticker] = None
                 
@@ -141,6 +142,7 @@ class RiskManagementEnv(gym.Env):
         self.data_start_idx = None
         self.price_window = None
         self.balance_window = None
+        self.ohlcv_window = None  # Optional DataFrame (high, low, close, volume) for OBV/MFI/AD/PVT
         
         # If using legacy approach (single episode), set up windows now
         if not self.use_all_tickers:
@@ -154,26 +156,17 @@ class RiskManagementEnv(gym.Env):
         # Action space: 0 = Hold, 1 = Close (close position)
         self.action_space = spaces.Discrete(2)
         
-        # Observation space: 60 timesteps × 6 features = 360 features
-        # Features per timestep:
-        # 1. MACD (normalized by entry price)
-        # 2. MACD Histogram (normalized by entry price)
-        # 3. RSI (normalized to [0, 1])
-        # 4. EMA 25 (percent-change from entry price)
-        # 5. EMA 99 (percent-change from entry price)
-        # 6. Close Price (percent-change from entry price)
-        # 
-        # Normalization strategy:
-        # - MACD/Histogram: Normalized by entry price (relative values)
-        # - RSI: Normalized to [0, 1] range (RSI/100)
-        # - EMA 25/99/Close: Percent-change from entry price (handles future out-of-range prices)
-        self.timeseries_length = 60  # Number of historical timesteps
-        self.n_features_per_timestep = 6  # MACD, Histogram, RSI, EMA25, EMA99, Close
-        obs_shape = (self.timeseries_length * self.n_features_per_timestep,)
+        # Observation space: 60 timesteps × 14 features = 840 features
+        # Features per timestep: MACD, Histogram, RSI, EMA25, EMA99, Close,
+        #   CCI, MFI, OBV_norm, Williams, TSI, ROC, AD_norm, PVT_norm
+        self.timeseries_length = 60
+        self.n_features_per_timestep = 14
+        obs_size = self.timeseries_length * self.n_features_per_timestep + 1 # 840
+        obs_shape = (obs_size,)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=obs_shape,  # 60 timesteps × 6 features = 360 features
+            shape=obs_shape,
             dtype=np.float32
         )
         
@@ -198,6 +191,29 @@ class RiskManagementEnv(gym.Env):
         
         # Pre-computed indicators cache (for performance optimization)
         self._precomputed_indicators = None
+        
+        # Configurable reward component weights
+        # These allow tuning the importance of different reward components
+        self.reward_weights = {
+            'closeness_to_max': 1.0,      # Base reward for closing near max price
+            'profit_bonus': 1.0,          # Bonus for profitable closes
+            'loss_penalty': 1.0,          # Penalty for large losses
+            'drawdown_penalty': 1.0,      # Penalty for holding during drawdowns
+            'max_drawdown_penalty': 1.0,  # Penalty for trades with large max drawdown
+            'time_efficiency': 0.0,       # Disabled - was encouraging close at fixed duration (~12h45)
+            'early_exit_bonus': 0.0,      # DISABLED - was encouraging early exits around ~12h
+                                          # (the larger early_exit_factor at small periods_held encouraged closing too soon)
+            'profit_efficiency': 0.0,      # DISABLED - was unfairly penalizing longer episodes
+                                          # (dividing return by periods_held meant same return = smaller reward)
+            'holding_base': 0.01,          # Base reward for holding
+            'closeness_to_min_penalty': 1.0,  # Penalty for holding near min price
+            'momentum_reward': 0.5,       # Reward for holding when price is trending up
+            'unrealized_profit_reward': 0.8,  # Reward for holding profitable positions (encourages letting winners run)
+            'closeness_to_max_reward': 0.6,  # Reward for holding when close to max price (potential for more)
+        }
+        
+        # Track reward components for debugging (optional)
+        self._reward_components = {}
     
     def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
         """Calculate RSI (Relative Strength Index)."""
@@ -443,14 +459,89 @@ class RiskManagementEnv(gym.Env):
             ema_25_pct = np.zeros(n)
             ema_99_pct = np.zeros(n)
             close_pct = np.zeros(n)
-        
+
+        # CCI (period=20): use close as typical price when no OHLC
+        tp = price_series
+        sma20 = tp.rolling(20, min_periods=1).mean()
+        mad20 = tp.rolling(20, min_periods=1).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+        cci = (tp - sma20) / (0.015 * mad20.replace(0, np.nan))
+        cci_norm = np.clip(cci.fillna(0).values / 200.0, -1.0, 1.0).astype(np.float32)
+
+        # Williams %R (period=14): use rolling max/min of close when no high/low
+        high = price_series.rolling(14, min_periods=1).max()
+        low = price_series.rolling(14, min_periods=1).min()
+        wr = -100 * (high - price_series) / (high - low).replace(0, np.nan)
+        williams_norm = (wr.fillna(-50).values / 100.0).astype(np.float32)  # roughly [-1, 0]
+
+        # TSI (fast=13, slow=25)
+        pc = price_series.diff()
+        pcds = pc.ewm(span=13, adjust=False).mean().ewm(span=25, adjust=False).mean()
+        apcds = pc.abs().ewm(span=13, adjust=False).mean().ewm(span=25, adjust=False).mean()
+        tsi = 100 * (pcds / apcds.replace(0, np.nan))
+        tsi_norm = np.clip(tsi.fillna(0).values / 100.0, -1.0, 1.0).astype(np.float32)
+
+        # ROC (period=12)
+        roc = price_series.pct_change(12)
+        roc_norm = np.clip(roc.fillna(0).values, -1.0, 1.0).astype(np.float32)
+
+        # Volume-based: OBV, MFI, AD, PVT (use ohlcv_window when available)
+        has_volume = (
+            self.ohlcv_window is not None
+            and isinstance(self.ohlcv_window, pd.DataFrame)
+            and 'volume' in self.ohlcv_window.columns
+        )
+        if has_volume:
+            df = self.ohlcv_window
+            # OBV
+            direction = np.sign(df['close'].diff().fillna(0))
+            obv = (direction * df['volume']).cumsum().values
+            obv_max = np.abs(obv).max()
+            obv_norm = (obv / (obv_max + 1e-8)).astype(np.float32)
+            # MFI (period=14)
+            tp_df = (df['high'] + df['low'] + df['close']) / 3 if all(c in df.columns for c in ['high', 'low']) else df['close']
+            if 'high' in df.columns and 'low' in df.columns:
+                mf = tp_df * df['volume']
+                delta = tp_df.diff()
+                pos = mf.where(delta > 0, 0).rolling(14, min_periods=1).sum()
+                neg = mf.where(delta < 0, 0).rolling(14, min_periods=1).sum()
+                mfi = 100 - (100 / (1 + pos / neg.replace(0, np.nan)))
+                mfi_norm = (mfi.fillna(50).values / 100.0).astype(np.float32)
+            else:
+                mfi_norm = np.full(n, 0.5, dtype=np.float32)
+            # AD
+            if all(c in df.columns for c in ['high', 'low']):
+                cl = (df['close'] - df['low']) - (df['high'] - df['close'])
+                cl = cl / (df['high'] - df['low']).replace(0, np.nan)
+                ad = (cl * df['volume']).fillna(0).cumsum().values
+                ad_max = np.abs(ad).max()
+                ad_norm = (ad / (ad_max + 1e-8)).astype(np.float32)
+            else:
+                ad_norm = np.zeros(n, dtype=np.float32)
+            # PVT
+            pvt = (df['close'].pct_change().fillna(0) * df['volume']).cumsum().values
+            pvt_max = np.abs(pvt).max()
+            pvt_norm = (pvt / (pvt_max + 1e-8)).astype(np.float32)
+        else:
+            obv_norm = np.zeros(n, dtype=np.float32)
+            mfi_norm = np.full(n, 0.5, dtype=np.float32)
+            ad_norm = np.zeros(n, dtype=np.float32)
+            pvt_norm = np.zeros(n, dtype=np.float32)
+
         return {
             'macd': macd_normalized.astype(np.float32),
             'histogram': histogram_normalized.astype(np.float32),
             'rsi': rsi_values.astype(np.float32),
             'ema_25': ema_25_pct.astype(np.float32),
             'ema_99': ema_99_pct.astype(np.float32),
-            'close': close_pct.astype(np.float32)
+            'close': close_pct.astype(np.float32),
+            'cci': cci_norm,
+            'mfi': mfi_norm,
+            'obv': obv_norm,
+            'williams': williams_norm,
+            'tsi': tsi_norm,
+            'roc': roc_norm,
+            'ad': ad_norm,
+            'pvt': pvt_norm,
         }
     
     def _get_observation(self) -> np.ndarray:
@@ -461,13 +552,8 @@ class RiskManagementEnv(gym.Env):
         them on every step. This provides significant performance improvement.
         
         Returns:
-            Observation array of 360 features (60 timesteps × 6 features):
-            - MACD (normalized by entry price)
-            - MACD Histogram (normalized by entry price)
-            - RSI (normalized to [0, 1])
-            - EMA 25 (percent-change from entry price)
-            - EMA 99 (percent-change from entry price)
-            - Close Price (percent-change from entry price)
+            Observation array of 840 features (60 timesteps × 14 features):
+            MACD, Histogram, RSI, EMA25, EMA99, Close, CCI, MFI, OBV_norm, Williams, TSI, ROC, AD_norm, PVT_norm.
         """
         # Ensure environment is initialized (should have been reset)
         if self.price_window is None or self.balance_window is None:
@@ -494,24 +580,42 @@ class RiskManagementEnv(gym.Env):
             ema25_vals = self._precomputed_indicators['ema_25'][indices]
             ema99_vals = self._precomputed_indicators['ema_99'][indices]
             close_vals = self._precomputed_indicators['close'][indices]
+            cci_vals = self._precomputed_indicators['cci'][indices]
+            mfi_vals = self._precomputed_indicators['mfi'][indices]
+            obv_vals = self._precomputed_indicators['obv'][indices]
+            williams_vals = self._precomputed_indicators['williams'][indices]
+            tsi_vals = self._precomputed_indicators['tsi'][indices]
+            roc_vals = self._precomputed_indicators['roc'][indices]
+            ad_vals = self._precomputed_indicators['ad'][indices]
+            pvt_vals = self._precomputed_indicators['pvt'][indices]
             
-            # Stack features: each row is one timestep with 6 features
+            # Stack features: each row is one timestep with 14 features
             timestep_features = np.column_stack([
-                macd_vals, hist_vals, rsi_vals, ema25_vals, ema99_vals, close_vals
+                macd_vals, hist_vals, rsi_vals, ema25_vals, ema99_vals, close_vals,
+                cci_vals, mfi_vals, obv_vals, williams_vals, tsi_vals, roc_vals, ad_vals, pvt_vals
             ])
             
             # Pad with zeros at the beginning if we don't have enough history
             if len(timestep_features) < self.timeseries_length:
-                padding = np.zeros((self.timeseries_length - len(timestep_features), 6), dtype=np.float32)
-                padding[:, 2] = 0.5  # RSI defaults to 0.5 (neutral)
+                padding = np.zeros((self.timeseries_length - len(timestep_features), self.n_features_per_timestep), dtype=np.float32)
+                padding[:, 2] = 0.5   # RSI neutral
+                padding[:, 7] = 0.5   # MFI neutral
                 timestep_features = np.vstack([padding, timestep_features])
             
             # Take only the last N timesteps
             timestep_features = timestep_features[-self.timeseries_length:]
-            
-            # Flatten to 1D array: 60 timesteps × 6 features = 360 features
+
+            # Flatten to 1D: 60 timesteps × 14 features = 840 features
             observation = timestep_features.flatten()
-            
+
+            # Fixed normalization so we don't need episode_length (works in live trading)
+            steps_held_normalized = min(
+                float(self.current_idx) / self.STEPS_HELD_NORMALIZATION_LENGTH, 1.0
+            )
+            observation = np.append(
+                observation, np.array([steps_held_normalized], dtype=np.float32)
+            )
+
             return observation
         
         # Fallback to old method if pre-computed indicators not available
@@ -551,39 +655,40 @@ class RiskManagementEnv(gym.Env):
                 ema_99_pct = 0.0
                 close_pct = 0.0
             
-            timestep_features.append([
-                float(macd_line), float(macd_histogram), float(rsi_raw),
-                float(ema_25_pct), float(ema_99_pct), float(close_pct)
-            ])
+            # 6 base + 8 placeholder zeros for CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT
+            row = [float(macd_line), float(macd_histogram), float(rsi_raw),
+                   float(ema_25_pct), float(ema_99_pct), float(close_pct)]
+            row.extend([0.0] * 8)  # fallback has no precomputed CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT
+            timestep_features.append(row)
         
         while len(timestep_features) < self.timeseries_length:
-            timestep_features.insert(0, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
+            padding_row = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0] + [0.0] * 8
+            padding_row[7] = 0.5  # MFI neutral
+            timestep_features.insert(0, padding_row)
         
         timestep_features = timestep_features[-self.timeseries_length:]
         observation = np.array(timestep_features, dtype=np.float32).flatten()
-        
+
+        steps_held_normalized = min(
+            float(self.current_idx) / self.STEPS_HELD_NORMALIZATION_LENGTH, 1.0
+        )
+        observation = np.append(
+            observation, np.array([steps_held_normalized], dtype=np.float32)
+        )
+
         return observation
     
     def _calculate_reward_total_return_only(self, action: int, done: bool) -> float:
         """
         Calculate reward focused on encouraging closing when price is close to max price in episode.
         
-        An episode is defined from entry price to exit price (determined by signals).
-        Episode length is dynamically calculated based on rule-based exit signals:
-        - If exit signal exists: use it (minimum 100 steps)
-        - If exit signal doesn't exist: fallback to 500 steps maximum
-        - If exit signal < 100 steps: set 100 steps as default
+        Episode has max_steps (500) bars from entry. Goal: close at episode max price.
+        Terminal-only reward: hold steps get 0; all reward on close step.
         
         Action space: 0 = Hold, 1 = Close
         
         Reward strategy:
-        - Primary goal: Reward closing when current price is close to episode max price
-        - Holding: Small neutral reward, but penalty if price is close to episode min price
-        - Closing near max: High reward
-        - Closing far from max: Low/negative reward
-        
-        Reward Structure:
-        - Holding (action 0): Small neutral reward (0.01), but penalty if close to min price
+        - Holding (action 0): reward = 0
         - Closing (action 1): Reward based on how close current price is to episode max price
         """
         current_price = float(self.price_window.iloc[self.current_idx])
@@ -600,55 +705,21 @@ class RiskManagementEnv(gym.Env):
         # Calculate price range in episode (max - min) for normalization
         price_range = self.episode_max_price - self.episode_min_price
         
-        # Track statistics for portfolio-level metrics
+        # Track statistics for evaluation only (NOT used in reward calculation)
         if action == 1 or done:  # Closing
             if position_return > 0:
                 self.wins += 1
             self.total_trades += 1
             self.returns_history.append(position_return)
         
+        # Reset reward components tracking
+        self._reward_components = {}
+        
         # ========== HOLDING ACTIONS (action 0) ==========
+        # Terminal-only reward: no per-step reward for hold. All reward on close step.
         if action == 0 and not done:
-            # Initialize reward with small neutral value to allow exploration
-            reward = 0.01
-            
-            price_range = self.episode_max_price - self.episode_min_price
-            
-            # Calculate how close current price is to episode min price
-            if price_range > 1e-10:  # Avoid division by zero
-                # Distance from min price
-                distance_from_min = current_price - self.episode_min_price
-                # Normalized distance: 0 = at min, 1 = at max
-                normalized_distance_from_min = distance_from_min / price_range
-                # Closeness to min: 1.0 = at min, 0.0 = at max
-                closeness_to_min = 1.0 - normalized_distance_from_min
-            else:
-                # No price movement in episode (max == min)
-                # Check if current price is at or near min
-                price_distance_from_min = abs(self.episode_min_price - current_price)
-                if price_distance_from_min < 1e-10:
-                    closeness_to_min = 1.0
-                else:
-                    closeness_to_min = 0.0
-            
-            # Apply penalty if holding when price is close to min price
-            # This encourages closing before price drops too much
-            if closeness_to_min >= 0.9:
-                # Very close to min: Strong penalty
-                penalty = -2.0 * closeness_to_min  # -1.8 to -2.0
-                reward += penalty
-            elif closeness_to_min >= 0.7:
-                # Close to min: Moderate penalty
-                penalty = -1.0 * closeness_to_min  # -0.7 to -1.0
-                reward += penalty
-            elif closeness_to_min >= 0.5:
-                # Approaching min: Small penalty
-                penalty = -0.5 * closeness_to_min  # -0.25 to -0.5
-                reward += penalty
-            
-            # Clip holding reward to reasonable range
-            reward = np.clip(reward, -2.0, 0.1)
-            return float(reward)
+            self._reward_components['holding_base'] = 0.0
+            return 0.0
         
         # ========== CLOSING ACTIONS (action 1 or done=True) ==========
         # Calculate how close current price is to episode max price
@@ -690,19 +761,22 @@ class RiskManagementEnv(gym.Env):
             # Very poor: Closing at or near minimum price
             reward = -1.0  # Penalty for closing at worst price
         
+        self._reward_components['closeness_to_max'] = reward
+        
         # ========== BONUS FOR PROFITABLE CLOSES ==========
         # Small bonus if closing with profit (encourages profitable exits)
+        # Note: position_return already calculated above, reuse it
         if action == 1 or done:
-            price_change_pct = (current_price - self.entry_price) / self.entry_price
-            position_return = price_change_pct - 2 * self.fee_rate
-            
             if position_return > 0:
                 # Small bonus for profitable close (scaled by profit)
                 profit_bonus = min(position_return * 2.0, 2.0)  # Max bonus of 2.0
                 reward += profit_bonus
+                self._reward_components['profit_bonus'] = profit_bonus
             elif position_return < -0.05:  # Large loss (>5%)
                 # Small penalty for large losses
-                reward -= 0.5
+                loss_penalty = -0.5
+                reward += loss_penalty
+                self._reward_components['loss_penalty'] = loss_penalty
         
         # ========== FINAL REWARD CLIPPING ==========
         # Clip reward to prevent extreme values
@@ -716,21 +790,22 @@ class RiskManagementEnv(gym.Env):
         """
         Improved reward function for long-term performance optimization.
         
-        Key improvements:
-        1. Risk-adjusted returns (Sharpe-like ratio)
-        2. Time decay / opportunity cost
-        3. Drawdown penalties during holding
-        4. Early exit bonuses for good prices
-        5. Consistency rewards
-        6. Maximum drawdown tracking
+        Primary goal: Encourage the bot to close at episode max price within the max_steps
+        (500 bars) window. No fixed bar count—reward is driven by how close the close price
+        is to the episode max (closeness_to_max), not by when in the episode we close.
         
-        This reward function balances short-term trade performance with long-term
-        portfolio metrics to encourage sustainable, risk-adjusted returns.
+        Terminal-only reward: Reward is 0 on every hold step; all reward is given on the
+        close step. This helps with action imbalance (many hold vs one close per episode).
+        
+        Key components:
+        1. Hold: reward = 0 (terminal-only)
+        2. Close: reward scaled by closeness to episode max, profit/loss, early-exit bonus, etc.
+        3. Configurable component weights
         """
         current_price = float(self.price_window.iloc[self.current_idx])
         periods_held = self.current_idx + 1
         
-        # Initialize max/min prices if needed
+        # Ensure max/min prices are initialized (should be set in reset(), but safety check)
         if self.episode_max_price is None:
             self.episode_max_price = self.entry_price
         if self.episode_min_price is None:
@@ -747,53 +822,25 @@ class RiskManagementEnv(gym.Env):
         else:
             current_drawdown = 0.0
         
-        # Update maximum drawdown
+        # Update maximum drawdown (episode-scoped only)
         if current_drawdown > self.max_drawdown:
             self.max_drawdown = current_drawdown
         
-        # Track statistics for portfolio-level metrics
+        # Track statistics for evaluation only (NOT used in reward calculation)
         if action == 1 or done:  # Closing
             if position_return > 0:
                 self.wins += 1
             self.total_trades += 1
             self.returns_history.append(position_return)
         
+        # Reset reward components tracking
+        self._reward_components = {}
+        
         # ========== HOLDING ACTIONS (action 0) ==========
+        # Terminal-only reward: no per-step reward for hold. All reward on close step.
         if action == 0 and not done:
-            # Base reward: small neutral value
-            reward = 0.01
-            
-            # 1. Drawdown penalty during holding (IMPROVEMENT #3)
-            # Penalize holding when experiencing large drawdowns
-            if current_drawdown > 0.05:  # 5% drawdown threshold
-                # Penalty increases with drawdown severity
-                drawdown_penalty = min(current_drawdown * 3.0, 2.0)  # Max penalty of 2.0
-                reward -= drawdown_penalty
-            
-            # 2. Time decay / opportunity cost (IMPROVEMENT #2)
-            # Penalize holding too long relative to episode length
-            max_holding_period = max(self.episode_length, periods_held)
-            if max_holding_period > 0:
-                time_efficiency = 1.0 - (periods_held / max_holding_period) * 0.2  # Max 20% penalty
-                reward *= time_efficiency
-            
-            # 3. Closeness to min price penalty (existing logic, but refined)
-            if price_range > 1e-10:
-                distance_from_min = current_price - self.episode_min_price
-                normalized_distance_from_min = distance_from_min / price_range
-                closeness_to_min = 1.0 - normalized_distance_from_min
-                
-                # Stronger penalty for holding near minimum
-                if closeness_to_min >= 0.9:
-                    reward -= 2.5 * closeness_to_min  # Increased from 2.0
-                elif closeness_to_min >= 0.7:
-                    reward -= 1.2 * closeness_to_min  # Increased from 1.0
-                elif closeness_to_min >= 0.5:
-                    reward -= 0.6 * closeness_to_min  # Increased from 0.5
-            
-            # Clip holding reward
-            reward = np.clip(reward, -3.0, 0.1)  # Increased negative range for stronger penalties
-            return float(reward)
+            self._reward_components['holding_base'] = 0.0
+            return 0.0
         
         # ========== CLOSING ACTIONS (action 1 or done=True) ==========
         # Calculate closeness to max price
@@ -802,87 +849,60 @@ class RiskManagementEnv(gym.Env):
             normalized_distance = price_distance_from_max / price_range
             closeness_to_max = 1.0 - normalized_distance
         else:
+            # No price movement in episode (max == min)
             price_distance_from_max = abs(self.episode_max_price - current_price)
             if price_distance_from_max < 1e-10:
                 closeness_to_max = 1.0
             else:
                 closeness_to_max = 0.0
         
-        # Base reward from closeness to max (existing logic)
+        # Base reward from closeness to max (scaled by weight)
         if closeness_to_max >= 0.9:
-            reward = 8.0 * closeness_to_max  # Slightly reduced from 10.0
+            reward = 8.0 * closeness_to_max * self.reward_weights['closeness_to_max']
         elif closeness_to_max >= 0.7:
-            reward = 6.0 * closeness_to_max  # Slightly reduced from 7.0
+            reward = 6.0 * closeness_to_max * self.reward_weights['closeness_to_max']
         elif closeness_to_max >= 0.5:
-            reward = 4.0 * closeness_to_max  # Reduced from 5.0
+            reward = 4.0 * closeness_to_max * self.reward_weights['closeness_to_max']
         elif closeness_to_max >= 0.3:
-            reward = 2.0 * closeness_to_max
+            reward = 2.0 * closeness_to_max * self.reward_weights['closeness_to_max']
         elif closeness_to_max >= 0.1:
-            reward = 0.5 * closeness_to_max
+            reward = 0.5 * closeness_to_max * self.reward_weights['closeness_to_max']
         else:
-            reward = -1.0
+            reward = -1.0 * self.reward_weights['closeness_to_max']
         
-        # 4. Early exit bonus for good prices (IMPROVEMENT #4)
-        # Reward closing at good prices (top 20% of range) even if not absolute max
-        if closeness_to_max >= 0.8 and periods_held < self.episode_length * 0.7:
-            # Bonus for closing early at good price
-            early_exit_factor = 1.0 - (periods_held / max(self.episode_length, periods_held))
-            early_exit_bonus = early_exit_factor * 1.5  # Max bonus of 1.5
-            reward += early_exit_bonus
+        self._reward_components['closeness_to_max'] = reward
         
-        # 5. Profit efficiency (IMPROVEMENT #6)
-        # Reward based on profit per unit time
-        if periods_held > 0:
-            profit_efficiency = position_return / periods_held
-            # Scale profit efficiency reward
-            reward += profit_efficiency * 3.0
+        # 4. Early exit bonus (OPTIONAL - weight can be 0)
+        # Small bonus for closing at good price (top 20% of range) before 70% of episode.
+        # No fixed bar count: primary goal is to close at episode max price within max_steps (500).
+        if closeness_to_max >= 0.8 and self.episode_length is not None and self.reward_weights['early_exit_bonus'] > 0:
+            if periods_held < self.episode_length * 0.7:
+                early_exit_factor = 1.0 - (periods_held / max(self.episode_length, periods_held))
+                early_exit_bonus = early_exit_factor * 1.5 * self.reward_weights['early_exit_bonus']
+                reward += early_exit_bonus
+                self._reward_components['early_exit_bonus'] = early_exit_bonus
         
-        # 6. Profit bonus/penalty (existing, refined)
+        # 5. Profit bonus/penalty
         if position_return > 0:
             # Profit bonus scaled by return magnitude
-            profit_bonus = min(position_return * 2.5, 2.5)  # Increased from 2.0
+            profit_bonus = min(position_return * 2.5, 2.5) * self.reward_weights['profit_bonus']
             reward += profit_bonus
+            self._reward_components['profit_bonus'] = profit_bonus
         elif position_return < -0.05:  # Large loss (>5%)
-            # Stronger penalty for large losses
-            loss_penalty = abs(position_return) * 2.0  # Proportional to loss
-            reward -= min(loss_penalty, 2.0)  # Max penalty of 2.0
+            # Penalty for large losses
+            loss_penalty = abs(position_return) * 2.0 * self.reward_weights['loss_penalty']
+            reward -= min(loss_penalty, 2.0)
+            self._reward_components['loss_penalty'] = -min(loss_penalty, 2.0)
         
-        # 7. Maximum drawdown penalty (IMPROVEMENT #7)
-        # Penalize trades that experienced large drawdowns
+        # 7. Maximum drawdown penalty (episode-scoped only)
+        # Penalize trades that experienced large drawdowns during the episode
         if self.max_drawdown > 0.15:  # 15% max drawdown threshold
-            drawdown_penalty = min(self.max_drawdown * 2.0, 1.5)  # Max penalty of 1.5
-            reward -= drawdown_penalty
+            max_dd_penalty = min(self.max_drawdown * 2.0, 1.5) * self.reward_weights['max_drawdown_penalty']
+            reward -= max_dd_penalty
+            self._reward_components['max_drawdown_penalty'] = -max_dd_penalty
         
-        # 8. Risk-adjusted return component (IMPROVEMENT #1)
-        # Consider Sharpe-like ratio for portfolio performance
-        if len(self.returns_history) >= 3:  # Need at least 3 trades
-            mean_return = np.mean(self.returns_history)
-            std_return = np.std(self.returns_history)
-            if std_return > 1e-10:
-                sharpe_like = mean_return / std_return
-                # Add scaled Sharpe-like component (positive = good)
-                sharpe_bonus = sharpe_like * 0.3  # Scale factor
-                reward += sharpe_bonus
-        
-        # 9. Consistency reward (IMPROVEMENT #5)
-        # Encourage consistent returns (lower volatility)
-        if len(self.returns_history) >= 5:
-            return_std = np.std(self.returns_history)
-            # Lower std = higher consistency bonus
-            consistency_bonus = max(0, (1.0 - return_std * 5.0)) * 0.5  # Max bonus of 0.5
-            reward += consistency_bonus
-        
-        # 10. Win rate consideration
-        # Bonus for maintaining good win rate
-        if self.total_trades >= 5:
-            win_rate = self.wins / self.total_trades
-            if win_rate >= 0.6:  # 60%+ win rate
-                win_rate_bonus = (win_rate - 0.5) * 1.0  # Bonus up to 0.5
-                reward += win_rate_bonus
-        
-        # Final reward clipping
-        # Keep rewards in reasonable range for PPO stability
-        reward = np.clip(reward, -5.0, 12.0)  # Slightly wider range to accommodate new components
+        # Final reward clipping (narrower range for better stability)
+        reward = np.clip(reward, -3.0, 8.0)
         
         return float(reward)
     
@@ -934,22 +954,16 @@ class RiskManagementEnv(gym.Env):
                 # Use technical signal as entry point
                 entry_idx = int(np.random.choice(signal_indices))
             else:
-                # Fallback: randomly select entry point (must have enough history and an exit signal after)
+                # Fallback: randomly select entry point (need history before and max_steps after)
                 min_entry_idx = self.history_length
-                # Need to ensure there's an exit signal after entry
-                max_entry_idx = len(price_series) - 10  # Leave some room for exit signal
-                
+                max_entry_idx = len(price_series) - self.max_steps
                 if max_entry_idx <= min_entry_idx:
-                    # Not enough data, use available range
                     min_entry_idx = 0
-                    max_entry_idx = max(0, len(price_series) - 10)
-                
+                    max_entry_idx = max(0, len(price_series) - self.max_steps)
                 if max_entry_idx > min_entry_idx:
                     entry_idx = np.random.randint(min_entry_idx, max_entry_idx)
                 else:
                     entry_idx = min_entry_idx if min_entry_idx < len(price_series) else 0
-            
-            # Exit index will be set based on exit signals below
             
             # Set entry price
             entry_price = float(price_series.iloc[entry_idx])
@@ -958,56 +972,16 @@ class RiskManagementEnv(gym.Env):
             self.price_data = price_series
             self.balance_data = balance_series
             
-            # Get exit signals for this ticker
             ticker_data = self.all_tickers_data[self.current_ticker]
             self.exit_signals = ticker_data.get('exit_signals')
-            
-            # Find next exit signal after entry (if exit signals available)
-            exit_signal_idx = None
-            if self.exit_signals is not None and len(self.exit_signals) > 0:
-                # Find exit signals after entry point
-                exit_indices_after_entry = np.where(
-                    (self.exit_signals.values) & 
-                    (np.arange(len(self.exit_signals)) > entry_idx)
-                )[0]
-                if len(exit_indices_after_entry) > 0:
-                    exit_signal_idx = exit_indices_after_entry[0]
+            self.exit_signal_idx = None  # Episode length is fixed from entry by max_steps
             
             self.entry_price = entry_price
             self.entry_idx = entry_idx
             
-            # Calculate episode length based on exit signal with fallbacks
-            # 1. Use rule-based exit signal for each episode
-            # 2. If exit signal doesn't exist, fallback to 500 steps as maximum
-            # 3. If exit signal < 100 steps, set 100 as default
-            if exit_signal_idx is not None:
-                # Exit signal exists: calculate steps from entry to exit signal
-                steps_to_exit = exit_signal_idx - entry_idx
-                
-                # Ensure minimum of 100 steps
-                if steps_to_exit < 100:
-                    steps_to_exit = 100
-                    # Adjust exit_idx to be 100 steps after entry (if within data bounds)
-                    exit_idx = min(entry_idx + steps_to_exit, len(price_series) - 1)
-                    # Clear exit_signal_idx so it doesn't cause early truncation
-                    # The episode will run for the full 100 steps
-                    self.exit_signal_idx = None
-                else:
-                    # Use exit signal as episode end
-                    exit_idx = exit_signal_idx
-                    self.exit_signal_idx = exit_signal_idx
-            else:
-                # No exit signal found - fallback to 500 steps as maximum
-                steps_to_exit = 500
-                exit_idx = min(entry_idx + steps_to_exit, len(price_series) - 1)
-                self.exit_signal_idx = None
-                logger.debug(f"No exit signal found after entry at index {entry_idx} for {self.current_ticker}, using {steps_to_exit} steps fallback")
-            
+            # Episode: from entry, allow max_steps bars (capped by end of data)
+            exit_idx = min(entry_idx + self.max_steps - 1, len(price_series) - 1)
             self.exit_idx = exit_idx
-            
-            # Update max_steps dynamically for this episode
-            # This ensures the episode respects the calculated episode length
-            self.max_steps = exit_idx - entry_idx + 1
             
             # Set up episode windows
             self.episode_start_idx = entry_idx
@@ -1016,6 +990,12 @@ class RiskManagementEnv(gym.Env):
             self.data_start_idx = max(0, entry_idx - self.history_length)
             self.price_window = price_series.iloc[self.data_start_idx:exit_idx + 1].copy()
             self.balance_window = balance_series.iloc[self.data_start_idx:exit_idx + 1].copy()
+            # Optional OHLCV for CCI/Williams/TSI/ROC and OBV/MFI/AD/PVT
+            ohlcv = ticker_data.get('ohlcv')
+            if ohlcv is not None and len(ohlcv) > 0:
+                self.ohlcv_window = ohlcv.iloc[self.data_start_idx:exit_idx + 1].copy()
+            else:
+                self.ohlcv_window = None
         
         # Reset episode tracking
         self.current_step = 0
@@ -1035,6 +1015,9 @@ class RiskManagementEnv(gym.Env):
         # Reset max/min price tracking (start with entry price)
         self.episode_max_price = self.entry_price
         self.episode_min_price = self.entry_price
+        
+        # Initialize reward components tracking
+        self._reward_components = {}
         
         # Pre-compute indicators once per episode (major performance optimization!)
         # This avoids recalculating MACD, RSI, EMA on every step
@@ -1064,6 +1047,12 @@ class RiskManagementEnv(gym.Env):
             observation, reward, terminated, truncated, info
         """
         # Update max and min prices during episode (from entry point onwards)
+        # Ensure max/min prices are initialized (safety check)
+        if self.episode_max_price is None:
+            self.episode_max_price = self.entry_price
+        if self.episode_min_price is None:
+            self.episode_min_price = self.entry_price
+        
         # Calculate entry index relative to price_window
         entry_idx_in_window = self.entry_idx - self.data_start_idx if self.data_start_idx > 0 else self.entry_idx
         entry_idx_in_window = max(0, entry_idx_in_window)
@@ -1073,9 +1062,9 @@ class RiskManagementEnv(gym.Env):
         
         # Update max/min prices if we're at or past the entry point
         if self.current_idx >= entry_idx_in_window:
-            if self.episode_max_price is None or current_price > self.episode_max_price:
+            if current_price > self.episode_max_price:
                 self.episode_max_price = current_price
-            if self.episode_min_price is None or current_price < self.episode_min_price:
+            if current_price < self.episode_min_price:
                 self.episode_min_price = current_price
         
         # Check if position should be closed
@@ -1129,7 +1118,8 @@ class RiskManagementEnv(gym.Env):
             "episode_return": self.episode_return,
             "max_drawdown": self.max_drawdown,
             "action": action,
-            "periods_held": self.current_idx
+            "periods_held": self.current_idx,
+            "reward_components": self._reward_components.copy() if hasattr(self, '_reward_components') else {}
         }
         
         return observation, reward, terminated, truncated, info
