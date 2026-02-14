@@ -13,11 +13,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 import logging
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Timezone configuration - UTC+7 (local time)
 LOCAL_TIMEZONE = timezone(timedelta(hours=7))
 
-# Add FinRL-Meta to sys.path
-finrl_meta_path = Path("/mnt/data/FinRL-Tutorials/3-Practical/FinRL-Meta")
+# Add FinRL-Meta to sys.path (configurable via FINRL_META_PATH in .env)
+finrl_meta_path = Path(os.getenv("FINRL_META_PATH", "/mnt/data/FinRL-Tutorials/3-Practical/FinRL-Meta"))
 if str(finrl_meta_path) not in sys.path:
     sys.path.insert(0, str(finrl_meta_path))
 
@@ -300,6 +303,27 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"Error getting account balance: {e}")
             return {}
+    
+    def get_all_usdt_pairs(self) -> list:
+        """Fetch all USDT spot trading pairs from exchange (public endpoint)."""
+        try:
+            if self.client:
+                exchange_info = self.client.get_exchange_info()
+            else:
+                url = f"{self.base_url}/api/v3/exchangeInfo"
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                exchange_info = response.json()
+            
+            pairs = [
+                s['symbol'] for s in exchange_info['symbols']
+                if s.get('quoteAsset') == 'USDT'
+                and s.get('status') == 'TRADING'
+            ]
+            return sorted(pairs)
+        except Exception as e:
+            logger.error(f"Error fetching USDT pairs: {e}")
+            return []
     
     def get_current_price(self, symbol: str) -> float:
         """Get current price for a symbol."""
@@ -963,13 +987,26 @@ def run_live_trading(
         rl_model_path: Path to RL model directory (default: models/rl_agent)
         rl_model_name: RL model filename without .zip extension (default: best_model)
     """
+    # Initialize trader first (needed to fetch exchange info when using all tickers)
+    trader = BinanceTrader(
+        api_key=api_key,
+        api_secret=api_secret,
+        private_key_path=private_key_path,
+        testnet=TESTNET
+    )
+    
     if ticker_list is None:
-        ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
+        ticker_list = trader.get_all_usdt_pairs()
+        if not ticker_list:
+            logger.error("Failed to fetch USDT pairs from exchange, falling back to default list")
+            ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
+        else:
+            logger.info(f"Using all {len(ticker_list)} USDT pairs from exchange")
     
     logger.info("="*60)
     logger.info("Starting Live Trading Bot")
     logger.info("="*60)
-    logger.info(f"Tickers: {ticker_list}")
+    logger.info(f"Tickers: {len(ticker_list)} pairs" + (f" (first 10: {ticker_list[:10]}...)" if len(ticker_list) > 10 else f" - {ticker_list}"))
     logger.info(f"Interval: {time_interval}")
     logger.info(f"Check Interval: {check_interval_seconds} seconds")
     logger.info(f"Trading Enabled: {TRADING_ENABLED}")
@@ -980,14 +1017,6 @@ def run_live_trading(
     logger.info(f"  - New candle signals (candles update every {time_interval})")
     logger.info(f"  - RL agent hold/close decisions (if enabled)")
     logger.info(f"  - Risk management triggers (stop loss, take profit)")
-    
-    # Initialize trader
-    trader = BinanceTrader(
-        api_key=api_key,
-        api_secret=api_secret,
-        private_key_path=private_key_path,
-        testnet=TESTNET
-    )
     
     # Load RL agent if enabled
     rl_manager = None
@@ -1195,9 +1224,13 @@ def run_live_trading(
         for symbol in list(trader.positions.keys()):
             trader.sell(symbol)
         
-        # Display final balance
+        # Display final balance - only traded tickers (USDT + base assets from ticker_list)
         balances = trader.get_account_balance()
-        logger.info(f"Final Balance: {balances}")
+        relevant_assets = {'USDT'}.union(
+            t.replace('USDT', '') for t in ticker_list if t.endswith('USDT')
+        )
+        filtered_balances = {k: v for k, v in balances.items() if k in relevant_assets}
+        logger.info(f"Final Balance ({len(filtered_balances)} assets): {filtered_balances}")
         
         # Display trade history
         logger.info(f"Trade History ({len(trader.trade_history)} trades):")
@@ -1220,15 +1253,13 @@ if __name__ == "__main__":
     # For HMAC Authentication (Legacy):
     #   - Need API_KEY and API_SECRET
     #   - No private key needed
-    from dotenv import load_dotenv
-    load_dotenv()
-    
     API_KEY = os.getenv("BINANCE_API_KEY", "your_testnet_api_key_here")
     API_SECRET = os.getenv("BINANCE_API_SECRET", None)  # Only needed for HMAC auth
     PRIVATE_KEY_PATH = os.getenv("BINANCE_PRIVATE_KEY_PATH", "test-prv-key.pem")  # Only needed for RSA auth
     
     # Trading configuration
-    TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]  # All tickers to trade
+    # None = trade all USDT pairs from exchange; or specify list e.g. ["BTCUSDT", "ETHUSDT"]
+    TICKER_LIST = None
     TIME_INTERVAL = "15m"  # Strategy interval
     # Check interval: How often to check for signals and risk management
     # - For 15m candles: 15-30 seconds is good (catches new candles quickly)
