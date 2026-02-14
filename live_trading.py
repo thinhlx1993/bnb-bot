@@ -49,16 +49,14 @@ from entry_signal_generator import get_strategy_signals
 from rl_risk_management import RLRiskManager
 from rl_risk_env import RiskManagementEnv, ENV_DEFAULT_CONFIG
 
-# Configure logging
+# Configure logging - add FileHandler explicitly because basicConfig is a no-op
+# when backtest/rl_risk_management (imported above) already configured the root logger
 Path("logs").mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/live_trading.log'),
-        logging.StreamHandler()
-    ]
-)
+_root = logging.getLogger()
+_live_handler = logging.FileHandler('logs/live_trading.log', encoding='utf-8')
+_live_handler.setLevel(logging.INFO)
+_live_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+_root.addHandler(_live_handler)
 logger = logging.getLogger(__name__)
 
 # Trading Configuration
