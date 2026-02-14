@@ -78,8 +78,11 @@ class RLRiskManager:
         # Load model
         if model_path is None:
             model_path = MODEL_LOAD_DIR
-        
-        model_file = "models/rl_agent/best_model/best_model.zip"
+        model_path = Path(model_path)
+
+        # Avoid double .zip: strip if model_name already ends with .zip
+        model_name_clean = model_name.removesuffix(".zip") if model_name.endswith(".zip") else model_name
+        model_file = model_path / "best_model" / f"{model_name_clean}.zip"
         logger.info(f"Loading RL model from: {model_file}")
         try:
             # Load as RecurrentPPO (LSTM-based model)
@@ -96,13 +99,11 @@ class RLRiskManager:
             logger.error(traceback.format_exc())
             raise
         
-        # Load VecNormalize statistics if available
-        # Check multiple possible locations:
-        # 1. In best_model directory (if loading best_model.zip)
-        # 2. In model_path root directory
+        # Load VecNormalize statistics if available (same dir as model)
         self.vec_normalize = None
         vec_normalize_paths = [
-            Path("models/rl_agent/best_model/vec_normalize.pkl")
+            model_path / "best_model" / "vec_normalize.pkl",
+            Path("models/rl_agent/best_model/vec_normalize.pkl"),  # fallback
         ]
         
         vec_normalize_path = None
