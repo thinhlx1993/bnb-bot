@@ -30,11 +30,12 @@ from rl_risk_management import RLRiskManager
 from entry_signal_generator import get_strategy_signals
 
 # Configure logging
+Path("logs").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('evaluate_rl_agent.log'),
+        logging.FileHandler('logs/evaluate_rl_agent.log'),
         logging.StreamHandler()
     ]
 )
@@ -243,9 +244,9 @@ def evaluate_rl_agent(
     # First, get initial balance progression (simulate it)
     balance = pd.Series(INITIAL_BALANCE, index=price.index)
     
-    # Apply RL risk management
+    # Apply RL risk management (pass ticker_df for OHLCV so observations match training)
     exits_rl = rl_manager.apply_rl_risk_management(
-        entries, exits.copy(), price, balance
+        entries, exits.copy(), price, balance, ohlcv_df=ticker_df
     )
     
     # Backtest

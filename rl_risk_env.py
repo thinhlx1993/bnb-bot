@@ -12,6 +12,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Shared env config: single source of truth for train and evaluate.
+# Both train_rl_agent and rl_risk_management use this so observation space and normalization stay in sync.
+ENV_DEFAULT_CONFIG = {
+    "history_length": 50,
+    "max_steps": 100,
+    "obs_periods_norm_steps": 100,
+    "fee_rate": 0.001,
+}
+
+
 class RiskManagementEnv(gym.Env):
     """
     Custom Gymnasium environment for position risk management.
@@ -22,17 +32,9 @@ class RiskManagementEnv(gym.Env):
     - Position performance history
     - Current drawdown
 
-    Note on episode length: The observation uses a fixed 60-timestep window. Without
-    explicit time-in-position info, the policy can learn to close after ~60 steps
-    (when the window is "full"), causing mean episode length to cluster around 61.
-    Use include_steps_held_in_obs=True to add steps_held_normalized (steps since entry,
-    capped by a fixed constant) so the agent can learn variable hold times. A fixed
-    constant is used (not episode_length) so the same observation works in live
-    trading where episode length is unknown.
+    The observation is the current bar only (14 market + 6 account features); RecurrentPPO
+    LSTM provides temporal context across env steps.
     """
-    # Normalization length for "steps held" feature: same in train and live (no episode_length needed)
-    STEPS_HELD_NORMALIZATION_LENGTH = 500
-
     metadata = {"render_modes": ["human"], "render_fps": 4}
     
     def __init__(
@@ -45,14 +47,14 @@ class RiskManagementEnv(gym.Env):
         exit_idx: Optional[int] = None,
         initial_balance: float = 100.0,
         history_length: int = 60,
-        max_steps: int = 500,
+        max_steps: int = 100,
+        obs_periods_norm_steps: Optional[int] = None,
         fee_rate: float = 0.001,
         render_mode: Optional[str] = None,
-        include_steps_held_in_obs: bool = True,
     ):
         """
         Initialize the risk management environment.
-        
+
         Args:
             all_tickers_data: Dict of {ticker: {'price': Series, 'balance': Series, 'entry_signals': Series (optional)}}
             price_data: Price series (legacy - used if all_tickers_data not provided)
@@ -63,16 +65,17 @@ class RiskManagementEnv(gym.Env):
             initial_balance: Initial account balance
             history_length: Number of historical periods to include in observations
             max_steps: From entry bar, allow the bot to play this many steps (bars). Episode ends at
-                min(entry_idx + max_steps - 1, end of data). Default 500.
+                min(entry_idx + max_steps - 1, end of data). Default 100.
+            obs_periods_norm_steps: If set, normalize periods_held in observation by this value (for eval/train
+                consistency when max_steps differs). If None, use max_steps.
             fee_rate: Trading fee rate (e.g., 0.001 for 0.1%)
             render_mode: Rendering mode
-            include_steps_held_in_obs: If True, append steps_held_normalized (min(current_idx/500, 1.0)) to
-                observation so the agent has explicit time-in-position info. Uses a fixed constant
-                (500) so the same observation works in live trading where episode length is unknown.
-                Default True so the agent gets time-in-position in train and live.
         """
         super().__init__()
-        
+
+        # Normalization scale for periods_held in observation (must match training, e.g. 100)
+        self.obs_periods_norm_steps = obs_periods_norm_steps if obs_periods_norm_steps is not None else max_steps
+
         # New approach: store all tickers' data
         if all_tickers_data is not None:
             self.all_tickers_data = all_tickers_data
@@ -156,12 +159,14 @@ class RiskManagementEnv(gym.Env):
         # Action space: 0 = Hold, 1 = Close (close position)
         self.action_space = spaces.Discrete(2)
         
-        # Observation space: 60 timesteps × 14 features = 840 features
-        # Features per timestep: MACD, Histogram, RSI, EMA25, EMA99, Close,
-        #   CCI, MFI, OBV_norm, Williams, TSI, ROC, AD_norm, PVT_norm
-        self.timeseries_length = 60
+        # Observation space: current bar only (14 market + 6 account = 20). RecurrentPPO LSTM
+        # runs over env steps, so history is in the recurrence, not in the observation.
+        # Market: MACD, Histogram, RSI, EMA25, EMA99, Close, CCI, MFI, OBV_norm, Williams, TSI, ROC, AD_norm, PVT_norm
+        # Account: unrealized_return, balance_ratio, current_drawdown_from_entry,
+        #   max_profit_from_entry_so_far, max_drawdown_from_entry_so_far, periods_held_normalized
         self.n_features_per_timestep = 14
-        obs_size = self.timeseries_length * self.n_features_per_timestep + 1 # 840
+        self.n_account_features = 6
+        obs_size = self.n_features_per_timestep + self.n_account_features  # 20
         obs_shape = (obs_size,)
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -185,9 +190,12 @@ class RiskManagementEnv(gym.Env):
         self.total_trades = 0  # Track total trades
         self.entry_balance = initial_balance  # Track balance at entry
         
-        # Track max and min prices during episode
+        # Track max and min prices during episode (used for reward only; not in obs)
         self.episode_max_price = None
         self.episode_min_price = None
+        # Track from entry (observable in live: no future knowledge)
+        self.max_profit_from_entry = 0.0   # max (price - entry)/entry seen so far
+        self.max_drawdown_from_entry = 0.0  # max (entry - price)/entry when underwater, so far
         
         # Pre-computed indicators cache (for performance optimization)
         self._precomputed_indicators = None
@@ -205,11 +213,12 @@ class RiskManagementEnv(gym.Env):
                                           # (the larger early_exit_factor at small periods_held encouraged closing too soon)
             'profit_efficiency': 0.0,      # DISABLED - was unfairly penalizing longer episodes
                                           # (dividing return by periods_held meant same return = smaller reward)
-            'holding_base': 0.01,          # Base reward for holding
+            'holding_base': 0.0,          # Base reward for holding
+            'holding_penalty': 0.01,       # Small penalty per hold step (encourages closing instead of holding to end)
             'closeness_to_min_penalty': 1.0,  # Penalty for holding near min price
             'momentum_reward': 0.5,       # Reward for holding when price is trending up
-            'unrealized_profit_reward': 0.8,  # Reward for holding profitable positions (encourages letting winners run)
-            'closeness_to_max_reward': 0.6,  # Reward for holding when close to max price (potential for more)
+            'unrealized_profit_reward': 0.3,  # Reward for holding profitable positions (encourages letting winners run)
+            'closeness_to_max_reward': 1.0,  # Reward for holding when close to max price (potential for more)
         }
         
         # Track reward components for debugging (optional)
@@ -544,145 +553,127 @@ class RiskManagementEnv(gym.Env):
             'pvt': pvt_norm,
         }
     
+    def _get_account_features(self) -> np.ndarray:
+        """
+        Compute account/position features using only entry and current state
+        (no future knowledge: no episode high/low). All metrics are from entry or
+        tracked over time.
+        Returns array of shape (6,) with normalized metrics.
+        """
+        current_price = float(self.price_window.iloc[self.current_idx])
+        current_balance = float(self.balance_window.iloc[self.current_idx])
+        entry_price = float(self.entry_price)
+        entry_balance = float(self.entry_balance) if self.entry_balance > 0 else 1.0
+        # Current unrealized return from entry (clip to [-1, 1])
+        unrealized_return = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
+        unrealized_return = float(np.clip(unrealized_return, -1.0, 1.0))
+        # Balance relative to entry (e.g. 1.0 = unchanged)
+        balance_ratio = current_balance / entry_balance if entry_balance > 0 else 1.0
+        balance_ratio = float(np.clip(balance_ratio, 0.0, 3.0))
+        # Current drawdown from entry: how far underwater now (0 if in profit)
+        if entry_price > 0 and current_price < entry_price:
+            current_drawdown_from_entry = (entry_price - current_price) / entry_price
+        else:
+            current_drawdown_from_entry = 0.0
+        current_drawdown_from_entry = float(np.clip(current_drawdown_from_entry, 0.0, 1.0))
+        # Update and expose max profit from entry so far (tracked; no future knowledge)
+        if entry_price > 0:
+            current_return = (current_price - entry_price) / entry_price
+            self.max_profit_from_entry = max(self.max_profit_from_entry, current_return)
+        max_profit_so_far = float(np.clip(self.max_profit_from_entry, 0.0, 1.0))
+        # Update and expose max drawdown from entry so far (tracked; no future knowledge)
+        if entry_price > 0 and current_price < entry_price:
+            dd_from_entry = (entry_price - current_price) / entry_price
+            self.max_drawdown_from_entry = max(self.max_drawdown_from_entry, dd_from_entry)
+        max_drawdown_from_entry_so_far = float(np.clip(self.max_drawdown_from_entry, 0.0, 1.0))
+        # Time in position (0 = just entered, 1 = at norm steps). Use obs_periods_norm_steps so eval matches training.
+        effective_max = max(self.obs_periods_norm_steps, 1)
+        periods_held_norm = float(self.current_idx) / effective_max if effective_max > 0 else 0.0
+        periods_held_norm = float(np.clip(periods_held_norm, 0.0, 1.0))
+        return np.array([
+            unrealized_return,
+            balance_ratio,
+            current_drawdown_from_entry,
+            max_profit_so_far,
+            max_drawdown_from_entry_so_far,
+            periods_held_norm,
+        ], dtype=np.float32)
+    
     def _get_observation(self) -> np.ndarray:
         """
-        Construct observation vector with 60 timesteps of features.
-        
-        OPTIMIZED VERSION: Uses pre-computed indicators instead of recalculating
-        them on every step. This provides significant performance improvement.
-        
-        Returns:
-            Observation array of 840 features (60 timesteps × 14 features):
-            MACD, Histogram, RSI, EMA25, EMA99, Close, CCI, MFI, OBV_norm, Williams, TSI, ROC, AD_norm, PVT_norm.
+        Construct observation for the current bar only: 14 market features + 6 account features = 20.
+        RecurrentPPO's LSTM runs over env steps, so temporal context comes from the recurrence.
         """
         # Ensure environment is initialized (should have been reset)
         if self.price_window is None or self.balance_window is None:
             raise RuntimeError("Environment not initialized. Call reset() first.")
         
         if self.current_idx is None:
-            # First step, use entry point
             self.current_idx = 0
         
-        # Ensure we don't go beyond available data
         if self.current_idx >= len(self.price_window):
             self.current_idx = len(self.price_window) - 1
         
-        # Use pre-computed indicators if available (much faster!)
+        idx = self.current_idx
+        
         if self._precomputed_indicators is not None:
-            lookback_start = max(0, self.current_idx - self.timeseries_length + 1)
-            end_idx = min(self.current_idx + 1, len(self.price_window))
-            
-            # Extract pre-computed values for the lookback window
-            indices = np.arange(lookback_start, end_idx)
-            macd_vals = self._precomputed_indicators['macd'][indices]
-            hist_vals = self._precomputed_indicators['histogram'][indices]
-            rsi_vals = self._precomputed_indicators['rsi'][indices]
-            ema25_vals = self._precomputed_indicators['ema_25'][indices]
-            ema99_vals = self._precomputed_indicators['ema_99'][indices]
-            close_vals = self._precomputed_indicators['close'][indices]
-            cci_vals = self._precomputed_indicators['cci'][indices]
-            mfi_vals = self._precomputed_indicators['mfi'][indices]
-            obv_vals = self._precomputed_indicators['obv'][indices]
-            williams_vals = self._precomputed_indicators['williams'][indices]
-            tsi_vals = self._precomputed_indicators['tsi'][indices]
-            roc_vals = self._precomputed_indicators['roc'][indices]
-            ad_vals = self._precomputed_indicators['ad'][indices]
-            pvt_vals = self._precomputed_indicators['pvt'][indices]
-            
-            # Stack features: each row is one timestep with 14 features
-            timestep_features = np.column_stack([
-                macd_vals, hist_vals, rsi_vals, ema25_vals, ema99_vals, close_vals,
-                cci_vals, mfi_vals, obv_vals, williams_vals, tsi_vals, roc_vals, ad_vals, pvt_vals
-            ])
-            
-            # Pad with zeros at the beginning if we don't have enough history
-            if len(timestep_features) < self.timeseries_length:
-                padding = np.zeros((self.timeseries_length - len(timestep_features), self.n_features_per_timestep), dtype=np.float32)
-                padding[:, 2] = 0.5   # RSI neutral
-                padding[:, 7] = 0.5   # MFI neutral
-                timestep_features = np.vstack([padding, timestep_features])
-            
-            # Take only the last N timesteps
-            timestep_features = timestep_features[-self.timeseries_length:]
-
-            # Flatten to 1D: 60 timesteps × 14 features = 840 features
-            observation = timestep_features.flatten()
-
-            # Fixed normalization so we don't need episode_length (works in live trading)
-            steps_held_normalized = min(
-                float(self.current_idx) / self.STEPS_HELD_NORMALIZATION_LENGTH, 1.0
-            )
-            observation = np.append(
-                observation, np.array([steps_held_normalized], dtype=np.float32)
-            )
-
+            # Current bar only: one row of 14 market features
+            market_row = np.array([
+                self._precomputed_indicators['macd'][idx],
+                self._precomputed_indicators['histogram'][idx],
+                self._precomputed_indicators['rsi'][idx],
+                self._precomputed_indicators['ema_25'][idx],
+                self._precomputed_indicators['ema_99'][idx],
+                self._precomputed_indicators['close'][idx],
+                self._precomputed_indicators['cci'][idx],
+                self._precomputed_indicators['mfi'][idx],
+                self._precomputed_indicators['obv'][idx],
+                self._precomputed_indicators['williams'][idx],
+                self._precomputed_indicators['tsi'][idx],
+                self._precomputed_indicators['roc'][idx],
+                self._precomputed_indicators['ad'][idx],
+                self._precomputed_indicators['pvt'][idx],
+            ], dtype=np.float32)
+            observation = np.append(market_row, self._get_account_features())
             return observation
         
-        # Fallback to old method if pre-computed indicators not available
-        # (should not happen in normal operation, but kept for safety)
+        # Fallback: compute one bar of indicators for current_idx
         logger.warning("Pre-computed indicators not available, using slow fallback method")
         entry_price = float(self.entry_price)
-        lookback_start = max(0, self.current_idx - self.timeseries_length + 1)
-        timestep_features = []
+        price_history = []
+        history_start = max(0, idx - 99)
+        for j in range(history_start, idx + 1):
+            if j < len(self.price_window):
+                price_history.append(float(self.price_window.iloc[j]))
+        if len(price_history) == 0:
+            price_history = [float(self.price_window.iloc[min(idx, len(self.price_window) - 1)])]
+        price_array = np.array(price_history)
+        current_price = float(price_array[-1])
         
-        for i in range(lookback_start, self.current_idx + 1):
-            if i >= len(self.price_window):
-                break
-            
-            price_history = []
-            history_start = max(0, i - 99)
-            for j in range(history_start, i + 1):
-                if j < len(self.price_window):
-                    price_history.append(float(self.price_window.iloc[j]))
-            
-            if len(price_history) == 0:
-                price_history = [float(self.price_window.iloc[min(i, len(self.price_window) - 1)])]
-            
-            price_array = np.array(price_history)
-            current_price = float(price_array[-1])
-            
-            macd_line, macd_signal, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
-            rsi_raw = self._calculate_rsi(price_array, period=14)
-            ema_25 = self._calculate_ema(price_array, period=25)
-            ema_99 = self._calculate_ema(price_array, period=99)
-            
-            if entry_price > 0:
-                ema_25_pct = (ema_25 - entry_price) / entry_price
-                ema_99_pct = (ema_99 - entry_price) / entry_price
-                close_pct = (current_price - entry_price) / entry_price
-            else:
-                ema_25_pct = 0.0
-                ema_99_pct = 0.0
-                close_pct = 0.0
-            
-            # 6 base + 8 placeholder zeros for CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT
-            row = [float(macd_line), float(macd_histogram), float(rsi_raw),
-                   float(ema_25_pct), float(ema_99_pct), float(close_pct)]
-            row.extend([0.0] * 8)  # fallback has no precomputed CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT
-            timestep_features.append(row)
+        macd_line, _, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
+        rsi_raw = self._calculate_rsi(price_array, period=14)
+        ema_25 = self._calculate_ema(price_array, period=25)
+        ema_99 = self._calculate_ema(price_array, period=99)
+        if entry_price > 0:
+            ema_25_pct = (ema_25 - entry_price) / entry_price
+            ema_99_pct = (ema_99 - entry_price) / entry_price
+            close_pct = (current_price - entry_price) / entry_price
+        else:
+            ema_25_pct = ema_99_pct = close_pct = 0.0
         
-        while len(timestep_features) < self.timeseries_length:
-            padding_row = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0] + [0.0] * 8
-            padding_row[7] = 0.5  # MFI neutral
-            timestep_features.insert(0, padding_row)
-        
-        timestep_features = timestep_features[-self.timeseries_length:]
-        observation = np.array(timestep_features, dtype=np.float32).flatten()
-
-        steps_held_normalized = min(
-            float(self.current_idx) / self.STEPS_HELD_NORMALIZATION_LENGTH, 1.0
-        )
-        observation = np.append(
-            observation, np.array([steps_held_normalized], dtype=np.float32)
-        )
-
+        market_row = np.array([
+            float(macd_line), float(macd_histogram), float(rsi_raw),
+            float(ema_25_pct), float(ema_99_pct), float(close_pct),
+        ], dtype=np.float32)
+        market_row = np.append(market_row, np.zeros(8, dtype=np.float32))  # CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT placeholder
+        observation = np.append(market_row, self._get_account_features())
         return observation
     
     def _calculate_reward_total_return_only(self, action: int, done: bool) -> float:
         """
         Calculate reward focused on encouraging closing when price is close to max price in episode.
         
-        Episode has max_steps (500) bars from entry. Goal: close at episode max price.
+        Episode has max_steps (default 100) bars from entry. Goal: close at episode max price.
         Terminal-only reward: hold steps get 0; all reward on close step.
         
         Action space: 0 = Hold, 1 = Close
@@ -791,7 +782,7 @@ class RiskManagementEnv(gym.Env):
         Improved reward function for long-term performance optimization.
         
         Primary goal: Encourage the bot to close at episode max price within the max_steps
-        (500 bars) window. No fixed bar count—reward is driven by how close the close price
+        (default 100 bars) window. No fixed bar count—reward is driven by how close the close price
         is to the episode max (closeness_to_max), not by when in the episode we close.
         
         Terminal-only reward: Reward is 0 on every hold step; all reward is given on the
@@ -837,10 +828,22 @@ class RiskManagementEnv(gym.Env):
         self._reward_components = {}
         
         # ========== HOLDING ACTIONS (action 0) ==========
-        # Terminal-only reward: no per-step reward for hold. All reward on close step.
+        # Small per-step penalty for holding (encourages closing when appropriate instead of holding to end).
         if action == 0 and not done:
-            self._reward_components['holding_base'] = 0.0
-            return 0.0
+            # Penalty only when holding a loss position (current price below entry)
+            position_return = (current_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
+            if position_return >= 0:
+                self._reward_components['holding_penalty'] = 0.0
+                return 0.0
+            holding_penalty = self.reward_weights.get('holding_penalty', 0.02)
+            # Slightly higher penalty later in episode so holding a loss near max_steps costs more
+            if self.episode_length and self.episode_length > 0:
+                progress = periods_held / self.episode_length
+                step_penalty = holding_penalty * (0.5 + 0.5 * progress)
+            else:
+                step_penalty = holding_penalty
+            self._reward_components['holding_penalty'] = -step_penalty
+            return -float(step_penalty)
         
         # ========== CLOSING ACTIONS (action 1 or done=True) ==========
         # Calculate closeness to max price
@@ -874,7 +877,7 @@ class RiskManagementEnv(gym.Env):
         
         # 4. Early exit bonus (OPTIONAL - weight can be 0)
         # Small bonus for closing at good price (top 20% of range) before 70% of episode.
-        # No fixed bar count: primary goal is to close at episode max price within max_steps (500).
+        # No fixed bar count: primary goal is to close at episode max price within max_steps (default 100).
         if closeness_to_max >= 0.8 and self.episode_length is not None and self.reward_weights['early_exit_bonus'] > 0:
             if periods_held < self.episode_length * 0.7:
                 early_exit_factor = 1.0 - (periods_held / max(self.episode_length, periods_held))
@@ -896,7 +899,7 @@ class RiskManagementEnv(gym.Env):
         
         # 7. Maximum drawdown penalty (episode-scoped only)
         # Penalize trades that experienced large drawdowns during the episode
-        if self.max_drawdown > 0.15:  # 15% max drawdown threshold
+        if self.max_drawdown > 0.1:  # 10% max drawdown threshold
             max_dd_penalty = min(self.max_drawdown * 2.0, 1.5) * self.reward_weights['max_drawdown_penalty']
             reward -= max_dd_penalty
             self._reward_components['max_drawdown_penalty'] = -max_dd_penalty
@@ -1012,9 +1015,12 @@ class RiskManagementEnv(gym.Env):
         self.total_trades = 0
         self.entry_balance = self.initial_balance
         
-        # Reset max/min price tracking (start with entry price)
+        # Reset max/min price tracking (start with entry price; used for reward only)
         self.episode_max_price = self.entry_price
         self.episode_min_price = self.entry_price
+        # Reset entry-relative tracking (used in observation; no future knowledge)
+        self.max_profit_from_entry = 0.0
+        self.max_drawdown_from_entry = 0.0
         
         # Initialize reward components tracking
         self._reward_components = {}

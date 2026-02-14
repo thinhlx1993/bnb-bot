@@ -41,18 +41,19 @@ from backtest import (
 from rl_risk_management import apply_rl_risk_management, RLRiskManager
 
 # Configure logging
+Path("logs").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('backtest_xauusdt_rl.log'),
+        logging.FileHandler('logs/backtest_xauusdt_rl.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 # Configuration
-TICKER = "XAUUSDT"
+TICKER = "BNBUSDT"
 RESULTS_DIR = Path("results")
 XAUUSDT_RESULTS_DIR = RESULTS_DIR / "XAUUSDT_RL"
 XAUUSDT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,7 @@ MODEL_LOAD_DIR = Path("models/rl_agent")
 DEFAULT_MODEL_NAME = "best_model"
 
 # Date range for backtesting
-START_DATE = "2023-01-01"
+START_DATE = "2026-01-01"
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 TIME_INTERVAL = "15m"  # 15 minutes
 

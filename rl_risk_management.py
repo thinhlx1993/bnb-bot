@@ -6,7 +6,11 @@ Uses RecurrentPPO from sb3_contrib for recurrent policies with LSTM.
 
 import sys
 from pathlib import Path
+
 import numpy as np
+
+_LOG_DIR = Path("logs")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 import pandas as pd
 from typing import Optional, Tuple, Dict, Any
 import logging
@@ -14,15 +18,15 @@ from tqdm import tqdm
 from sb3_contrib import RecurrentPPO  # Using RecurrentPPO for recurrent policies
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# Import custom environment
-from rl_risk_env import RiskManagementEnv
+# Import custom environment and shared config (same as train_rl_agent)
+from rl_risk_env import RiskManagementEnv, ENV_DEFAULT_CONFIG
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('rl_risk_management.log'),
+        logging.FileHandler(_LOG_DIR / 'rl_risk_management.log'),
         logging.StreamHandler()
     ]
 )
@@ -45,27 +49,30 @@ class RLRiskManager:
         model_path: Optional[Path] = None,
         model_name: str = DEFAULT_MODEL_NAME,
         initial_balance: float = 100.0,
-        history_length: int = 60,
-        max_steps: int = 5000,
-        fee_rate: float = 0.001,
+        history_length: Optional[int] = None,
+        max_steps: Optional[int] = None,
+        fee_rate: Optional[float] = None,
         deterministic: bool = True
     ):
         """
         Initialize RL risk manager.
         
+        Uses ENV_DEFAULT_CONFIG from rl_risk_env so observation space matches training.
+        Override history_length/max_steps/fee_rate only if you need different behavior.
+        
         Args:
             model_path: Path to model directory or model file
             model_name: Model filename (without .zip extension)
             initial_balance: Initial account balance
-            history_length: Number of historical periods in observations
-            max_steps: Maximum steps per position
-            fee_rate: Trading fee rate
+            history_length: Same as training (default from ENV_DEFAULT_CONFIG). Required for correct obs.
+            max_steps: Max steps per position; can be larger than training for long holds (obs scale unchanged).
+            fee_rate: Same as training (default from ENV_DEFAULT_CONFIG).
             deterministic: Use deterministic policy (True) or stochastic (False)
         """
         self.initial_balance = initial_balance
-        self.history_length = history_length
-        self.max_steps = max_steps
-        self.fee_rate = fee_rate
+        self.history_length = history_length if history_length is not None else ENV_DEFAULT_CONFIG["history_length"]
+        self.max_steps = max_steps if max_steps is not None else 5000  # Eval can use longer episodes
+        self.fee_rate = fee_rate if fee_rate is not None else ENV_DEFAULT_CONFIG["fee_rate"]
         self.deterministic = deterministic
         
         # Load model
@@ -117,7 +124,7 @@ class RLRiskManager:
                     exit_idx=99,
                     initial_balance=self.initial_balance,
                     history_length=self.history_length,
-                    max_steps=self.max_steps,
+                    max_steps=ENV_DEFAULT_CONFIG["max_steps"],
                     fee_rate=self.fee_rate
                 )
                 dummy_vec_env = DummyVecEnv([lambda: dummy_env])
@@ -200,7 +207,8 @@ class RLRiskManager:
         entries: pd.Series,
         exits: pd.Series,
         price: pd.Series,
-        balance: Optional[pd.Series] = None
+        balance: Optional[pd.Series] = None,
+        ohlcv_df: Optional[pd.DataFrame] = None
     ) -> pd.Series:
         """
         Apply RL-based risk management to exits - OPTIMIZED VERSION.
@@ -215,7 +223,9 @@ class RLRiskManager:
             exits: Original exit signals (boolean series)
             price: Price series
             balance: Account balance series (if None, will be inferred)
-        
+            ohlcv_df: Optional OHLCV DataFrame (same index as price) for volume-based obs (OBV/MFI/AD/PVT).
+                Must match training; if None, those features are zero/0.5.
+
         Returns:
             Modified exit signals with RL decisions
         """
@@ -299,12 +309,18 @@ class RLRiskManager:
                     'exit_signals': exit_signals_window
                 }
             }
-            
+            # OHLCV for volume-based observation features (OBV/MFI/AD/PVT) - must match training
+            if ohlcv_df is not None and len(ohlcv_df) >= window_end:
+                ohlcv_full_window = ohlcv_df.iloc[window_start:window_end].copy()
+            else:
+                ohlcv_full_window = None
+
             env = RiskManagementEnv(
                 all_tickers_data=all_tickers_data,
                 initial_balance=self.initial_balance,
                 history_length=self.history_length,
-                max_steps=self.max_steps,  # Not used for termination, but kept for compatibility
+                max_steps=self.max_steps,
+                obs_periods_norm_steps=ENV_DEFAULT_CONFIG["obs_periods_norm_steps"],
                 fee_rate=self.fee_rate
             )
             
@@ -330,10 +346,12 @@ class RLRiskManager:
             env.data_start_idx = max(0, env.entry_idx - env.history_length)
             env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
             env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
-            
-            # Set ohlcv_window for volume-based indicators (OBV, MFI, AD, PVT)
-            # Create a DataFrame with close, high, low, volume columns if available
-            env.ohlcv_window = None  # Initialize to None (will use fallback zeros for volume indicators)
+
+            # Set ohlcv_window for volume-based indicators (OBV, MFI, AD, PVT) - must match training
+            if ohlcv_full_window is not None and len(ohlcv_full_window) > env.exit_idx:
+                env.ohlcv_window = ohlcv_full_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+            else:
+                env.ohlcv_window = None
             
             # Reset episode tracking
             env.current_step = 0

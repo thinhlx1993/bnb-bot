@@ -28,11 +28,12 @@ from meta.data_processor import DataProcessor
 from meta.data_processors._base import DataSource
 
 # Configure logging
+Path("logs").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('backtest.log'),
+        logging.FileHandler('logs/backtest.log'),
         logging.StreamHandler()
     ]
 )

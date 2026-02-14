@@ -7,11 +7,12 @@ no episode extraction is required.
 from pathlib import Path
 import logging
 
+Path("logs").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('prepare_rl_training_data.log'),
+        logging.FileHandler('logs/prepare_rl_training_data.log'),
         logging.StreamHandler()
     ]
 )
