@@ -24,3 +24,5 @@ jaxlib>=0.4.0  # Required for SBX (CPU version - fine for MLP policies)
 # or for CUDA 11: pip install jax[cuda11_local] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 tf_keras>=2.12.0  # Required for SBX
 sb3_contrib>=2.7.0  # Required for RecurrentPPO
+stockstats
+TA-lib

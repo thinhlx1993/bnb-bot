@@ -45,9 +45,9 @@ from backtest import (
 # Shared entry/exit signal generator (same as evaluate and train when USE_BACKTEST_SIGNALS)
 from entry_signal_generator import get_strategy_signals
 
-# Import RL risk management
+# Import RL risk management (same env config as train/evaluate for observation consistency)
 from rl_risk_management import RLRiskManager
-from rl_risk_env import RiskManagementEnv
+from rl_risk_env import RiskManagementEnv, ENV_DEFAULT_CONFIG
 
 # Configure logging
 Path("logs").mkdir(parents=True, exist_ok=True)
@@ -624,79 +624,72 @@ class BinanceTrader:
         return None
     
     def check_rl_agent_decision(
-        self, 
-        symbol: str, 
+        self,
+        symbol: str,
         price_history: pd.Series,
         balance_history: pd.Series,
-        rl_manager: Optional[RLRiskManager] = None
+        rl_manager: Optional[RLRiskManager] = None,
+        ohlcv_df: Optional[pd.DataFrame] = None,
     ) -> bool:
         """
         Query RL agent to decide whether to hold or close a position.
-        
+        Uses same observation construction and VecNormalize as evaluate_rl_agent/train.
+
         Args:
             symbol: Trading pair symbol
             price_history: Historical price series (should include entry point and current)
             balance_history: Historical balance series
             rl_manager: RLRiskManager instance (if None, will use rule-based fallback)
-        
+            ohlcv_df: OHLCV DataFrame (same index as price_history; cols: open, high, low, close, volume)
+                      for volume-based obs (OBV/MFI/AD/PVT). Must match train/eval.
+
         Returns:
             True if RL agent wants to close, False if hold
         """
         if symbol not in self.positions:
             return False
-        
+
         if rl_manager is None:
-            # Fallback to rule-based risk management
             return self.check_risk_management(symbol) is not None
-        
+
         position = self.positions[symbol]
         entry_price = position['entry_price']
         entry_time = position['entry_time']
-        
-        # Find entry index in price_history
-        # We need to find where entry_time matches in price_history index
+
         entry_idx = None
         for idx, timestamp in enumerate(price_history.index):
             if isinstance(timestamp, pd.Timestamp):
-                # Compare timestamps (allow some tolerance)
                 time_diff = abs((timestamp - entry_time).total_seconds())
-                if time_diff < 900:  # Within 15 minutes (one candle)
+                if time_diff < 900:
                     entry_idx = idx
                     break
-        
+
         if entry_idx is None:
             logger.warning(f"Could not find entry point in price history for {symbol}, using rule-based fallback")
             return self.check_risk_management(symbol) is not None
-        
-        # Ensure we have enough data
+
         history_length = rl_manager.history_length
         current_idx = len(price_history) - 1
-        
+
         if current_idx - entry_idx < 1:
             logger.warning(f"Not enough price history for {symbol} (need at least 1 period after entry)")
             return self.check_risk_management(symbol) is not None
-        
-        # Ensure we have enough history before entry
+
         window_start = max(0, entry_idx - history_length)
         price_window = price_history.iloc[window_start:current_idx + 1].copy()
         balance_window = balance_history.iloc[window_start:current_idx + 1].copy()
-        
-        # Ensure balance_window has same length as price_window
+
         if len(balance_window) != len(price_window):
-            # Pad or trim balance_window
             if len(balance_window) < len(price_window):
-                # Pad with last value
                 last_balance = balance_window.iloc[-1] if len(balance_window) > 0 else INITIAL_BALANCE
-                padding = pd.Series([last_balance] * (len(price_window) - len(balance_window)), 
+                padding = pd.Series([last_balance] * (len(price_window) - len(balance_window)),
                                    index=price_window.index[len(balance_window):])
                 balance_window = pd.concat([balance_window, padding])
             else:
                 balance_window = balance_window.iloc[:len(price_window)]
-        
-        # Create exit signals (none for now, agent will decide)
+
         exit_signals = pd.Series(False, index=price_window.index)
-        
-        # Create environment
+
         all_tickers_data = {
             'single_ticker': {
                 'price': price_window,
@@ -705,36 +698,45 @@ class BinanceTrader:
                 'exit_signals': exit_signals
             }
         }
-        
+
+        # OHLCV for volume-based observation features (OBV/MFI/AD/PVT) - must match training/eval
+        if ohlcv_df is not None and len(ohlcv_df) >= current_idx + 1:
+            ohlcv_full_window = ohlcv_df.iloc[window_start:current_idx + 1].copy()
+        else:
+            ohlcv_full_window = None
+
         env = RiskManagementEnv(
             all_tickers_data=all_tickers_data,
             initial_balance=rl_manager.initial_balance,
             history_length=history_length,
             max_steps=rl_manager.max_steps,
+            obs_periods_norm_steps=ENV_DEFAULT_CONFIG["obs_periods_norm_steps"],
             fee_rate=rl_manager.fee_rate
         )
-        
-        # Manually set entry point
+
         env.current_ticker = 'single_ticker'
         env.price_data = price_window
         env.balance_data = balance_window
         env.exit_signals = exit_signals
         env.entry_price = entry_price
         env.entry_idx = entry_idx - window_start
-        env.exit_signal_idx = None  # No exit signal, agent decides
+        env.exit_signal_idx = None
         env.exit_idx = len(price_window) - 1
-        
-        # Set up episode windows
+
         env.episode_start_idx = env.entry_idx
         env.episode_end_idx = env.exit_idx
         env.episode_length = env.exit_idx - env.episode_start_idx + 1
         env.data_start_idx = max(0, env.entry_idx - env.history_length)
         env.price_window = price_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
         env.balance_window = balance_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
-        
-        # Reset environment state
+
+        if ohlcv_full_window is not None and len(ohlcv_full_window) > env.exit_idx:
+            env.ohlcv_window = ohlcv_full_window.iloc[env.data_start_idx:env.exit_idx + 1].copy()
+        else:
+            env.ohlcv_window = None
+
         env.current_step = 0
-        env.current_idx = current_idx - window_start  # Current position in window (relative to episode start)
+        env.current_idx = current_idx - window_start
         env.position_open = True
         env.peak_balance = rl_manager.initial_balance
         env.max_drawdown = 0.0
@@ -744,8 +746,7 @@ class BinanceTrader:
         env.wins = 0
         env.total_trades = 0
         env.entry_balance = rl_manager.initial_balance
-        
-        # Track max/min prices from entry point
+
         entry_idx_in_window = env.entry_idx
         prices_since_entry = price_window.iloc[entry_idx_in_window:env.current_idx + 1].values
         if len(prices_since_entry) > 0:
@@ -754,26 +755,23 @@ class BinanceTrader:
         else:
             env.episode_max_price = entry_price
             env.episode_min_price = entry_price
-        
-        # Pre-compute indicators for performance (avoids recalculating on every step)
+
         env._precomputed_indicators = env._precompute_indicators()
-        
+
         try:
-            # Get observation for current state
             obs = env._get_observation()
-            
-            # Query RL agent with LSTM states for RecurrentPPO
-            # Initialize LSTM states (None = reset state, since this is a fresh check)
+
+            if rl_manager.vec_normalize is not None:
+                obs = rl_manager.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
+
             lstm_states = None
             episode_starts = np.ones((1,), dtype=bool)
             action, _ = rl_manager.model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
+                obs,
+                state=lstm_states,
+                episode_start=episode_starts,
+                deterministic=rl_manager.deterministic
             )
-            
-            # Action 0 = Hold, Action 1 = Close
             return action == 1
         except Exception as e:
             logger.error(f"Error getting RL agent decision for {symbol}: {e}")
@@ -1059,7 +1057,8 @@ def run_live_trading(
                         if use_rl_agent and rl_manager is not None:
                             try:
                                 should_close = trader.check_rl_agent_decision(
-                                    ticker, price_history, balance_history, rl_manager
+                                    ticker, price_history, balance_history, rl_manager,
+                                    ohlcv_df=ticker_df
                                 )
                                 if should_close:
                                     logger.info(f"🤖 RL Agent decision: CLOSE position for {ticker}")
