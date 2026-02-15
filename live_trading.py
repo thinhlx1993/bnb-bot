@@ -1259,7 +1259,7 @@ if __name__ == "__main__":
     
     # Trading configuration
     # None = trade all USDT pairs from exchange; or specify list e.g. ["BTCUSDT", "ETHUSDT"]
-    TICKER_LIST = None
+    TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
     TIME_INTERVAL = "15m"  # Strategy interval
     # Check interval: How often to check for signals and risk management
     # - For 15m candles: 15-30 seconds is good (catches new candles quickly)
