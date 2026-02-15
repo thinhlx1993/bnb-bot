@@ -53,7 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TICKER = "LTCUSDT"
+TICKER = "ZECUSDT"
 RESULTS_DIR = Path("results")
 XAUUSDT_RESULTS_DIR = RESULTS_DIR / "XAUUSDT_RL"
 XAUUSDT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,7 +61,7 @@ MODEL_LOAD_DIR = Path("models/rl_agent")
 DEFAULT_MODEL_NAME = "best_model"
 
 # Date range for backtesting
-START_DATE = "2024-01-01"
+START_DATE = "2015-01-01"
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 TIME_INTERVAL = "15m"  # 15 minutes
 
