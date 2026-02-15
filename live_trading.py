@@ -1258,8 +1258,10 @@ if __name__ == "__main__":
     PRIVATE_KEY_PATH = os.getenv("BINANCE_PRIVATE_KEY_PATH", "test-prv-key.pem")  # Only needed for RSA auth
     
     # Trading configuration
-    # None = trade all USDT pairs from exchange; or specify list e.g. ["BTCUSDT", "ETHUSDT"]
-    TICKER_LIST = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
+    # TICKER_LIST in .env: comma-separated symbols, e.g. TICKER_LIST=BTCUSDT,ETHUSDT,BNBUSDT
+    # Leave unset or empty to trade all USDT pairs from exchange
+    _ticker_env = (os.getenv("TICKER_LIST") or "").strip()
+    TICKER_LIST = [s.strip() for s in _ticker_env.split(",") if s.strip()] if _ticker_env else None
     TIME_INTERVAL = "15m"  # Strategy interval
     # Check interval: How often to check for signals and risk management
     # - For 15m candles: 15-30 seconds is good (catches new candles quickly)
