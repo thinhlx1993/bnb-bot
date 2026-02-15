@@ -53,7 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TICKER = "BNBUSDT"
+TICKER = "LTCUSDT"
 RESULTS_DIR = Path("results")
 XAUUSDT_RESULTS_DIR = RESULTS_DIR / "XAUUSDT_RL"
 XAUUSDT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,7 +61,7 @@ MODEL_LOAD_DIR = Path("models/rl_agent")
 DEFAULT_MODEL_NAME = "best_model"
 
 # Date range for backtesting
-START_DATE = "2026-01-01"
+START_DATE = "2024-01-01"
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 TIME_INTERVAL = "15m"  # 15 minutes
 
@@ -78,6 +78,8 @@ def fetch_binance_futures_data(
 ) -> pd.DataFrame:
     """
     Fetch historical klines data from Binance Futures.
+    Paginates by startTime only (no endTime in request) so full date ranges work;
+    Binance can return only the most recent candles when both startTime and endTime are sent.
     
     Args:
         symbol: Trading pair (e.g., 'XAUUSDT')
@@ -93,16 +95,18 @@ def fetch_binance_futures_data(
     logger.info(f"  Interval: {interval}")
     logger.info(f"  Date range: {start_date} to {end_date}")
     
-    # Convert dates to timestamps
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
+    # Convert dates to UTC timestamps (Binance uses UTC)
+    start_dt = pd.to_datetime(start_date, utc=True)
+    end_dt = pd.to_datetime(end_date, utc=True)
+    # End of day for end_date so we include that day's candles
+    end_dt = end_dt + timedelta(days=1)
     start_ts = int(start_dt.timestamp() * 1000)
     end_ts = int(end_dt.timestamp() * 1000)
     
     all_klines = []
     current_start = start_ts
     
-    # Fetch data in chunks (Binance limit is 1500 per request)
+    # Paginate using startTime only (no endTime); stop when we reach or pass end_ts
     while current_start < end_ts:
         try:
             url = f"{BINANCE_FUTURES_API}/fapi/v1/klines"
@@ -110,7 +114,6 @@ def fetch_binance_futures_data(
                 'symbol': symbol,
                 'interval': interval,
                 'startTime': current_start,
-                'endTime': end_ts,
                 'limit': limit
             }
             
@@ -121,17 +124,16 @@ def fetch_binance_futures_data(
             if not klines:
                 break
             
-            all_klines.extend(klines)
-            
-            # Update start time for next request
             last_timestamp = klines[-1][0]
-            if last_timestamp >= current_start:
-                current_start = last_timestamp + 1
-            else:
-                break
-                
-            # If we got fewer than limit, we've reached the end
-            if len(klines) < limit:
+            # Only include candles before end_ts
+            for k in klines:
+                if k[0] < end_ts:
+                    all_klines.append(k)
+                else:
+                    break
+            
+            current_start = last_timestamp + 1
+            if last_timestamp >= end_ts or len(klines) < limit:
                 break
                 
         except Exception as e:
@@ -142,7 +144,7 @@ def fetch_binance_futures_data(
         raise ValueError(f"No data fetched for {symbol}")
     
     # Convert to DataFrame
-    df = pd.DataFrame(klines, columns=[
+    df = pd.DataFrame(all_klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_volume', 'trades', 'taker_buy_base',
         'taker_buy_quote', 'ignore'
@@ -254,10 +256,11 @@ def evaluate_rl_agent(
         logger.error("Cannot proceed without RL model")
         raise
     
-    # Apply RL risk management
+    # Apply RL risk management (pass OHLCV so env can compute volume-based indicators: OBV, MFI, AD, PVT)
     logger.info("Applying RL risk management...")
     balance = pd.Series(INITIAL_BALANCE, index=price.index)
-    exits_rl = manager.apply_rl_risk_management(entries, exits.copy(), price, balance)
+    ohlcv_df = ticker_df[['open', 'high', 'low', 'close', 'volume']].copy() if all(c in ticker_df.columns for c in ['open', 'high', 'low', 'close', 'volume']) else None
+    exits_rl = manager.apply_rl_risk_management(entries, exits.copy(), price, balance, ohlcv_df=ohlcv_df)
     
     logger.info(f"  Original exits: {exits.sum()}")
     logger.info(f"  RL-managed exits: {exits_rl.sum()}")

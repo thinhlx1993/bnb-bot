@@ -143,7 +143,7 @@ def train_ppo_agent(
     if total_timesteps is None:
         total_timesteps = int(TOTAL_TIMESTEPS)
     if val_tickers_data is None:
-        val_tickers_data = all_tickers_data
+        raise ValueError("val_tickers_data is required")
 
     if n_envs is None:
         n_envs = N_ENVS if N_ENVS is not None else max(1, (os.cpu_count() or 4) - 1)

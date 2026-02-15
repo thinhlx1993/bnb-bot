@@ -531,10 +531,7 @@ class RiskManagementEnv(gym.Env):
             pvt_max = np.abs(pvt).max()
             pvt_norm = (pvt / (pvt_max + 1e-8)).astype(np.float32)
         else:
-            obv_norm = np.zeros(n, dtype=np.float32)
-            mfi_norm = np.full(n, 0.5, dtype=np.float32)
-            ad_norm = np.zeros(n, dtype=np.float32)
-            pvt_norm = np.zeros(n, dtype=np.float32)
+            raise ValueError("OHLCV data required for volume-based indicators (OBV, MFI, AD, PVT)")
 
         return {
             'macd': macd_normalized.astype(np.float32),
