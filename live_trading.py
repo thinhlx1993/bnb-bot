@@ -52,6 +52,14 @@ from entry_signal_generator import get_strategy_signals
 from rl_risk_management import RLRiskManager
 from rl_risk_env import RiskManagementEnv, ENV_DEFAULT_CONFIG
 
+from live_trading_db import (
+    init_db,
+    insert_signal,
+    insert_position,
+    close_position,
+    get_open_positions,
+)
+
 # Configure logging - add FileHandler explicitly because basicConfig is a no-op
 # when backtest/rl_risk_management (imported above) already configured the root logger
 Path("logs").mkdir(parents=True, exist_ok=True)
@@ -966,6 +974,7 @@ def run_live_trading(
     ticker_list: list = None,
     time_interval: str = "15m",
     check_interval_seconds: int = 15,
+    signal_lookback_candles: int = 6,
     use_rl_agent: bool = True,
     rl_model_path: Optional[Path] = None,
     rl_model_name: str = "best_model"
@@ -983,6 +992,9 @@ def run_live_trading(
             - Recommended: 15-30 seconds for 15m candles
             - Too frequent (< 10s): More API calls, potential rate limiting
             - Too slow (> 60s): Might miss signals or risk management triggers
+        signal_lookback_candles: Number of most recent candles to consider for entry/exit.
+            - 6 (default): Act if signal appeared in last 6 candles so 24/7 bot doesn't miss due to timing.
+            - Use 1 for strict "only current candle" behavior.
         use_rl_agent: Whether to use RL agent for hold/close decisions (default: True)
         rl_model_path: Path to RL model directory (default: models/rl_agent)
         rl_model_name: RL model filename without .zip extension (default: best_model)
@@ -1039,15 +1051,34 @@ def run_live_trading(
             use_rl_agent = False
             rl_manager = None
     
+    # Initialize DB and restore state from previous runs
+    init_db()
+    for row in get_open_positions():
+        ticker = row["ticker"]
+        try:
+            opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            opened_at = datetime.now(timezone.utc)
+        trader.positions[ticker] = {
+            "entry_price": row["entry_price"],
+            "entry_time": opened_at,
+            "quantity": row["quantity"],
+            "usdt_value": row["usdt_value"],
+        }
+        logger.info(f"Restored open position from DB: {ticker}")
+    
     # Display initial balance
     balances = trader.get_account_balance()
-    # logger.info(f"Initial Balance: {balances}")
     
     # Display initial positions (if any)
     trader.print_positions()
     
-    # Track last signal state to avoid duplicate trades
+    # Track last signal state to avoid duplicate trades (entry=True for restored positions)
     last_signals = {ticker: {'entry': False, 'exit': False} for ticker in ticker_list}
+    for ticker in trader.positions:
+        last_signals[ticker]["entry"] = True
     
     try:
         while True:
@@ -1089,7 +1120,9 @@ def run_live_trading(
                                 )
                                 if should_close:
                                     logger.info(f"🤖 RL Agent decision: CLOSE position for {ticker}")
-                                    trader.sell(ticker)
+                                    if trader.sell(ticker):
+                                        close_position(ticker, 'rl')
+                                        insert_signal(ticker, 'sell', 'rl', None)
                                     last_signals[ticker]['exit'] = True
                                     continue
                                 else:
@@ -1103,7 +1136,9 @@ def run_live_trading(
                         risk_exit = trader.check_risk_management(ticker)
                         if risk_exit:
                             logger.warning(f"Risk management exit triggered: {risk_exit}")
-                            trader.sell(ticker)
+                            if trader.sell(ticker):
+                                close_position(ticker, 'risk_management')
+                                insert_signal(ticker, 'sell', 'risk_management', None)
                             last_signals[ticker]['exit'] = True
                             continue
                 
@@ -1114,9 +1149,11 @@ def run_live_trading(
                     logger.warning(f"No signals generated for {ticker}")
                     continue
                 
-                # Check latest signal (most recent)
-                latest_entry = entries.iloc[-1] if len(entries) > 0 else False
-                latest_exit = exits.iloc[-1] if len(exits) > 0 else False
+                # Check latest signal: True if signal appears in the last N candles (see signal_lookback_candles)
+                n_entry = min(signal_lookback_candles, len(entries))
+                n_exit = min(signal_lookback_candles, len(exits))
+                latest_entry = entries.iloc[-n_entry:].any() if n_entry > 0 else False
+                latest_exit = exits.iloc[-n_exit:].any() if n_exit > 0 else False
                 
                 # Debug: Show signal status with timestamps
                 total_buy_signals = entries.sum()
@@ -1164,12 +1201,17 @@ def run_live_trading(
                 logger.info(f"  Latest Entry Signal (most recent candle): {latest_entry}")
                 logger.info(f"  Last signal processed flag: entry={last_signals[ticker]['entry']}, exit={last_signals[ticker]['exit']}")
                 
-                # Execute buy signal
+                candle_time_iso = pd.Timestamp(latest_candle_time).isoformat() if latest_candle_time is not None else None
+                
+                # Execute buy signal: BUY active and no SELL from RL (we're not in position) → open
                 if latest_entry and not last_signals[ticker]['entry']:
                     if ticker not in trader.positions:
                         logger.info(f"✅ BUY signal detected for {ticker} - Opening position...")
                         success = trader.buy(ticker)
                         if success:
+                            pos = trader.positions[ticker]
+                            insert_position(ticker, pos['entry_price'], pos['quantity'], pos['usdt_value'])
+                            insert_signal(ticker, 'buy', 'strategy', candle_time_iso)
                             last_signals[ticker]['entry'] = True
                             logger.info(f"✅ Position opened successfully for {ticker}")
                         else:
@@ -1181,12 +1223,14 @@ def run_live_trading(
                 elif not latest_entry:
                     logger.info(f"ℹ️  No active BUY signal for {ticker}")
                 
-                # Execute sell signal
+                # Execute sell signal (strategy)
                 if latest_exit and not last_signals[ticker]['exit']:
                     if ticker in trader.positions:
                         logger.info(f"✅ SELL signal detected for {ticker} - Closing position...")
                         success = trader.sell(ticker)
                         if success:
+                            close_position(ticker, 'strategy')
+                            insert_signal(ticker, 'sell', 'strategy', candle_time_iso)
                             last_signals[ticker]['exit'] = True
                             logger.info(f"✅ Position closed successfully for {ticker}")
                         else:
@@ -1268,7 +1312,10 @@ if __name__ == "__main__":
     # - Too frequent (< 10s): More API calls, potential rate limiting
     # - Too slow (> 60s): Might miss signals or risk management triggers
     CHECK_INTERVAL_SECONDS = 60  # Check for signals every 60 seconds
-    
+    # Consider entry/exit active if it occurred in the last N candles. With 24/7 running we still
+    # can miss the exact candle (exchange delay, check timing). Use 4–6 so we don't miss signals.
+    SIGNAL_LOOKBACK_CANDLES = 6  # e.g. 6 x 15m = 1.5h window to catch recent BUY/SELL
+
     # RL Agent configuration
     USE_RL_AGENT = True  # Enable RL agent for hold/close decisions
     RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory (parent of best_model folder)
@@ -1318,6 +1365,7 @@ if __name__ == "__main__":
         ticker_list=TICKER_LIST,
         time_interval=TIME_INTERVAL,
         check_interval_seconds=CHECK_INTERVAL_SECONDS,
+        signal_lookback_candles=SIGNAL_LOOKBACK_CANDLES,
         use_rl_agent=USE_RL_AGENT,
         rl_model_path=RL_MODEL_PATH,
         rl_model_name=RL_MODEL_NAME
