@@ -215,7 +215,7 @@ class RiskManagementEnv(gym.Env):
                                           # (dividing return by periods_held meant same return = smaller reward)
             'holding_base': 0.0,          # Base reward for holding
             'holding_penalty': 0.01,       # Small penalty per hold step (encourages closing instead of holding to end)
-            'closeness_to_min_penalty': 1.0,  # Penalty for holding near min price
+            'closeness_to_min_penalty': 2.0,  # Penalty for holding near min price
             'momentum_reward': 0.5,       # Reward for holding when price is trending up
             'unrealized_profit_reward': 0.3,  # Reward for holding profitable positions (encourages letting winners run)
             'closeness_to_max_reward': 1.0,  # Reward for holding when close to max price (potential for more)
@@ -666,114 +666,6 @@ class RiskManagementEnv(gym.Env):
         observation = np.append(market_row, self._get_account_features())
         return observation
     
-    def _calculate_reward_total_return_only(self, action: int, done: bool) -> float:
-        """
-        Calculate reward focused on encouraging closing when price is close to max price in episode.
-        
-        Episode has max_steps (default 100) bars from entry. Goal: close at episode max price.
-        Terminal-only reward: hold steps get 0; all reward on close step.
-        
-        Action space: 0 = Hold, 1 = Close
-        
-        Reward strategy:
-        - Holding (action 0): reward = 0
-        - Closing (action 1): Reward based on how close current price is to episode max price
-        """
-        current_price = float(self.price_window.iloc[self.current_idx])
-        periods_held = self.current_idx + 1
-        # Calculate price range for normalization
-        if self.episode_max_price is None:
-            self.episode_max_price = self.entry_price
-        if self.episode_min_price is None:
-            self.episode_min_price = self.entry_price
-
-        price_change_pct = (current_price - self.entry_price) / self.entry_price
-        position_return = price_change_pct - 2 * self.fee_rate  # Account for entry + exit fees
-        price_distance_from_max = abs(self.episode_max_price - current_price)
-        # Calculate price range in episode (max - min) for normalization
-        price_range = self.episode_max_price - self.episode_min_price
-        
-        # Track statistics for evaluation only (NOT used in reward calculation)
-        if action == 1 or done:  # Closing
-            if position_return > 0:
-                self.wins += 1
-            self.total_trades += 1
-            self.returns_history.append(position_return)
-        
-        # Reset reward components tracking
-        self._reward_components = {}
-        
-        # ========== HOLDING ACTIONS (action 0) ==========
-        # Terminal-only reward: no per-step reward for hold. All reward on close step.
-        if action == 0 and not done:
-            self._reward_components['holding_base'] = 0.0
-            return 0.0
-        
-        # ========== CLOSING ACTIONS (action 1 or done=True) ==========
-        # Calculate how close current price is to episode max price
-        # Calculate closeness to max price (0.0 = far from max, 1.0 = at max)
-        if price_range > 1e-10:  # Avoid division by zero
-            # Normalized distance: 0 = at max, 1 = at min
-            normalized_distance = price_distance_from_max / price_range
-            # Closeness: 1.0 = at max, 0.0 = at min
-            closeness_to_max = 1.0 - normalized_distance
-        else:
-            # No price movement in episode (max == min)
-            # If current price equals max (or very close), reward closing
-            if price_distance_from_max < 1e-10:
-                closeness_to_max = 1.0
-            else:
-                closeness_to_max = 0.0
-        
-        # ========== REWARD BASED ON CLOSENESS TO MAX PRICE ==========
-        # Primary reward: proportional to closeness to max price
-        # Scale: 0.0 (far from max) to 1.0 (at max)
-        # For PPO stability: keep rewards in reasonable range [0, 10]
-        
-        if closeness_to_max >= 0.9:
-            # Excellent: Closing very close to max (within 10% of range)
-            reward = 10.0 * closeness_to_max  # 9.0 to 10.0
-        elif closeness_to_max >= 0.7:
-            # Very good: Closing near max (within 30% of range)
-            reward = 7.0 * closeness_to_max  # ~4.9 to 6.3
-        elif closeness_to_max >= 0.5:
-            # Good: Closing above midpoint
-            reward = 5.0 * closeness_to_max  # ~2.5 to 3.5
-        elif closeness_to_max >= 0.3:
-            # Fair: Closing below midpoint but not at bottom
-            reward = 2.0 * closeness_to_max  # ~0.6 to 1.0
-        elif closeness_to_max >= 0.1:
-            # Poor: Closing far from max
-            reward = 0.5 * closeness_to_max  # ~0.05 to 0.5
-        else:
-            # Very poor: Closing at or near minimum price
-            reward = -1.0  # Penalty for closing at worst price
-        
-        self._reward_components['closeness_to_max'] = reward
-        
-        # ========== BONUS FOR PROFITABLE CLOSES ==========
-        # Small bonus if closing with profit (encourages profitable exits)
-        # Note: position_return already calculated above, reuse it
-        if action == 1 or done:
-            if position_return > 0:
-                # Small bonus for profitable close (scaled by profit)
-                profit_bonus = min(position_return * 2.0, 2.0)  # Max bonus of 2.0
-                reward += profit_bonus
-                self._reward_components['profit_bonus'] = profit_bonus
-            elif position_return < -0.05:  # Large loss (>5%)
-                # Small penalty for large losses
-                loss_penalty = -0.5
-                reward += loss_penalty
-                self._reward_components['loss_penalty'] = loss_penalty
-        
-        # ========== FINAL REWARD CLIPPING ==========
-        # Clip reward to prevent extreme values
-        # For PPO with VecNormalize: raw rewards in reasonable range [-2, 10]
-        # VecNormalize will normalize and clip normalized rewards to [-5, 5]
-        reward = np.clip(reward, -2.0, 10.0)
-        
-        return float(reward)
-    
     def _calculate_reward_long_term(self, action: int, done: bool) -> float:
         """
         Improved reward function for long-term performance optimization.
@@ -916,9 +808,7 @@ class RiskManagementEnv(gym.Env):
         - return self._calculate_reward_total_return_only(action, done)  # Original
         - return self._calculate_reward_long_term(action, done)  # Improved for long-term
         """
-        # Switch between reward functions here
         return self._calculate_reward_long_term(action, done)  # Using improved long-term reward
-        # return self._calculate_reward_total_return_only(action, done)  # Original reward
     
     def reset(
         self, 

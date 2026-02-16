@@ -24,6 +24,7 @@ from rl_agent.config import (
     ENABLE_EARLY_STOPPING,
     ENT_COEF,
     EVAL_FREQ,
+    VF_COEF,
     GAE_LAMBDA,
     GAMMA,
     INITIAL_BALANCE,
