@@ -33,3 +33,4 @@ venv/
 *.csv
 *.pkl
 ElegantRL/
+logs/live_trading.db

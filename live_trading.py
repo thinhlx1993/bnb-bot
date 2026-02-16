@@ -8,7 +8,9 @@ IMPORTANT: This is for TESTNET only. Never use real API keys in production witho
 import sys
 import os
 import time
+import argparse
 from pathlib import Path
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 import logging
@@ -253,26 +255,31 @@ class BinanceTrader:
             raise ValueError(f"Unknown authentication method: {self.auth_method}")
         
     def _make_api_request(self, method: str, endpoint: str, params: dict = None) -> Optional[Dict]:
-        """Make an authenticated API request."""
+        """Make an authenticated API request.
+        Uses explicit query string / body so the signed string exactly matches what we send.
+        POST body is urlencoded to safely handle base64 signature (+, /).
+        """
         if params is None:
             params = {}
         
-        # Add timestamp
+        params = dict(params)
         params['timestamp'] = int(time.time() * 1000)
-        
-        # Sign request
         signature = self._sign_request(params)
         params['signature'] = signature
         
-        # Make request
         url = f"{self.base_url}{endpoint}"
         headers = {'X-MBX-APIKEY': self.api_key}
         
         try:
             if method.upper() == 'GET':
-                response = requests.get(url, headers=headers, params=params, timeout=10)
+                query_string = urlencode(sorted(params.items()))
+                full_url = f"{url}?{query_string}"
+                response = requests.get(full_url, headers=headers, timeout=10)
             elif method.upper() == 'POST':
-                response = requests.post(url, headers=headers, params=params, timeout=10)
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                # urlencode handles + / in base64 signature
+                body = urlencode(sorted(params.items()))
+                response = requests.post(url, headers=headers, data=body, timeout=10)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -967,6 +974,89 @@ def generate_signals(df: pd.DataFrame, ticker: str, strategy: str = "Combined") 
     return get_strategy_signals(ticker_df, price, strategy=strategy)
 
 
+def test_positions(
+    api_key: str,
+    api_secret: Optional[str] = None,
+    private_key_path: Optional[str] = None,
+    symbol: str = "BNBUSDT",
+    usdt_amount: float = None,
+):
+    """
+    Test open and close position by executing a buy-sell roundtrip on Binance testnet.
+    Uses MIN_TRADE_AMOUNT (10 USDT) if usdt_amount not specified.
+    """
+    amount = usdt_amount if usdt_amount is not None and usdt_amount >= MIN_TRADE_AMOUNT else MIN_TRADE_AMOUNT
+    
+    logger.info("="*60)
+    logger.info("POSITION TEST MODE - Buy then Sell roundtrip")
+    logger.info("="*60)
+    logger.info(f"Symbol: {symbol}")
+    logger.info(f"Amount: {amount} USDT")
+    logger.info(f"Trading Enabled: {TRADING_ENABLED}")
+    logger.info("")
+    
+    trader = BinanceTrader(
+        api_key=api_key,
+        api_secret=api_secret,
+        private_key_path=private_key_path,
+        testnet=TESTNET
+    )
+    
+    init_db()
+    
+    # Show initial balance
+    balances = trader.get_account_balance()
+    usdt_before = balances.get('USDT', {}).get('total', 0.0)
+    logger.info(f"USDT before: ${usdt_before:.2f}")
+    
+    # Step 1: Open position (BUY)
+    logger.info("")
+    logger.info("Step 1: Opening position (BUY)...")
+    success_buy = trader.buy(symbol, usdt_amount=amount)
+    
+    if not success_buy:
+        logger.error("FAILED: Buy order failed")
+        return False
+    
+    pos = trader.positions.get(symbol)
+    if not pos:
+        logger.error("FAILED: Position not tracked after buy")
+        return False
+    
+    logger.info(f"Position opened: {pos['quantity']} {symbol} @ ${pos['entry_price']:.4f}")
+    
+    # Persist to DB (same as live loop)
+    insert_position(symbol, pos['entry_price'], pos['quantity'], pos['usdt_value'])
+    
+    # Brief pause
+    time.sleep(2)
+    
+    # Step 2: Close position (SELL)
+    logger.info("")
+    logger.info("Step 2: Closing position (SELL)...")
+    success_sell = trader.sell(symbol)
+    
+    if not success_sell:
+        logger.error("FAILED: Sell order failed")
+        return False
+    
+    if symbol in trader.positions:
+        logger.error("FAILED: Position still tracked after sell")
+        return False
+    
+    close_position(symbol, 'test')
+    
+    # Show final balance
+    balances = trader.get_account_balance()
+    usdt_after = balances.get('USDT', {}).get('total', 0.0)
+    logger.info("")
+    logger.info(f"USDT after:  ${usdt_after:.2f}")
+    logger.info("="*60)
+    logger.info("PASSED: Open and close position test completed successfully")
+    logger.info("="*60)
+    return True
+
+
 def run_live_trading(
     api_key: str,
     api_secret: Optional[str] = None,
@@ -1296,6 +1386,15 @@ def run_live_trading(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Live Trading on Binance Testnet")
+    parser.add_argument("--test-positions", action="store_true",
+                        help="Test open/close position: run buy-sell roundtrip then exit")
+    parser.add_argument("--test-symbol", type=str, default="BNBUSDT",
+                        help="Symbol for --test-positions (default: BNBUSDT)")
+    parser.add_argument("--test-amount", type=float, default=None,
+                        help="USDT amount for --test-positions (default: MIN_TRADE_AMOUNT=10)")
+    args, _ = parser.parse_known_args()
+    
     # Configuration - SET YOUR API KEYS HERE
     # Get testnet API keys from: https://testnet.binance.vision/
     # 
@@ -1310,6 +1409,26 @@ if __name__ == "__main__":
     API_KEY = os.getenv("BINANCE_API_KEY", "your_testnet_api_key_here")
     API_SECRET = os.getenv("BINANCE_API_SECRET", None)  # Only needed for HMAC auth
     PRIVATE_KEY_PATH = os.getenv("BINANCE_PRIVATE_KEY_PATH", "test-prv-key.pem")  # Only needed for RSA auth
+    
+    # Run position test mode and exit
+    if args.test_positions:
+        if API_KEY == "your_testnet_api_key_here":
+            logger.error("Please set BINANCE_API_KEY to run position test")
+            sys.exit(1)
+        if not API_SECRET and not PRIVATE_KEY_PATH:
+            logger.error("Provide API_SECRET or BINANCE_PRIVATE_KEY_PATH")
+            sys.exit(1)
+        if PRIVATE_KEY_PATH and not Path(PRIVATE_KEY_PATH).exists():
+            logger.error(f"Private key not found: {PRIVATE_KEY_PATH}")
+            sys.exit(1)
+        ok = test_positions(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            private_key_path=PRIVATE_KEY_PATH,
+            symbol=args.test_symbol,
+            usdt_amount=args.test_amount,
+        )
+        sys.exit(0 if ok else 1)
     
     # Trading configuration
     # TICKER_LIST in .env: comma-separated symbols, e.g. TICKER_LIST=BTCUSDT,ETHUSDT,BNBUSDT
