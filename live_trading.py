@@ -977,7 +977,10 @@ def run_live_trading(
     signal_lookback_candles: int = 6,
     use_rl_agent: bool = True,
     rl_model_path: Optional[Path] = None,
-    rl_model_name: str = "best_model"
+    rl_model_name: str = "best_model",
+    close_on_strategy_sell: bool = True,
+    close_on_rl_agent: bool = True,
+    close_on_risk_management: bool = True,
 ):
     """
     Run live trading loop.
@@ -998,6 +1001,9 @@ def run_live_trading(
         use_rl_agent: Whether to use RL agent for hold/close decisions (default: True)
         rl_model_path: Path to RL model directory (default: models/rl_agent)
         rl_model_name: RL model filename without .zip extension (default: best_model)
+        close_on_strategy_sell: If True, close position when strategy generates SELL signal (default: True)
+        close_on_rl_agent: If True, close position when RL agent says close (default: True)
+        close_on_risk_management: If True, close on stop loss / take profit / max holding (default: True)
     """
     # Initialize trader first (needed to fetch exchange info when using all tickers)
     trader = BinanceTrader(
@@ -1024,6 +1030,7 @@ def run_live_trading(
     logger.info(f"Trading Enabled: {TRADING_ENABLED}")
     logger.info(f"Testnet: {TESTNET}")
     logger.info(f"RL Agent: {'Enabled' if use_rl_agent else 'Disabled (using rule-based)'}")
+    logger.info(f"Close triggers: strategy_sell={close_on_strategy_sell}, rl_agent={close_on_rl_agent}, risk_management={close_on_risk_management}")
     logger.info("")
     logger.info(f"Note: Checking every {check_interval_seconds}s allows quick detection of:")
     logger.info(f"  - New candle signals (candles update every {time_interval})")
@@ -1111,8 +1118,8 @@ def run_live_trading(
                         current_balance = trader.get_account_balance().get('USDT', {}).get('total', INITIAL_BALANCE)
                         balance_history = pd.Series(current_balance, index=price_history.index)
                         
-                        # Check RL agent decision if enabled
-                        if use_rl_agent and rl_manager is not None:
+                        # Check RL agent decision if enabled and close_on_rl_agent
+                        if use_rl_agent and close_on_rl_agent and rl_manager is not None:
                             try:
                                 should_close = trader.check_rl_agent_decision(
                                     ticker, price_history, balance_history, rl_manager,
@@ -1132,15 +1139,16 @@ def run_live_trading(
                                 logger.warning("Falling back to rule-based risk management")
                                 # Fall through to rule-based check
                         
-                        # Fallback to rule-based risk management
-                        risk_exit = trader.check_risk_management(ticker)
-                        if risk_exit:
-                            logger.warning(f"Risk management exit triggered: {risk_exit}")
-                            if trader.sell(ticker):
-                                close_position(ticker, 'risk_management')
-                                insert_signal(ticker, 'sell', 'risk_management', None)
-                            last_signals[ticker]['exit'] = True
-                            continue
+                        # Rule-based risk management (stop loss / take profit / max holding)
+                        if close_on_risk_management:
+                            risk_exit = trader.check_risk_management(ticker)
+                            if risk_exit:
+                                logger.warning(f"Risk management exit triggered: {risk_exit}")
+                                if trader.sell(ticker):
+                                    close_position(ticker, 'risk_management')
+                                    insert_signal(ticker, 'sell', 'risk_management', None)
+                                last_signals[ticker]['exit'] = True
+                                continue
                 
                 # Generate signals
                 entries, exits = generate_signals(df, ticker)
@@ -1223,8 +1231,8 @@ def run_live_trading(
                 elif not latest_entry:
                     logger.info(f"ℹ️  No active BUY signal for {ticker}")
                 
-                # Execute sell signal (strategy)
-                if latest_exit and not last_signals[ticker]['exit']:
+                # Execute sell signal (strategy) — only if close_on_strategy_sell
+                if close_on_strategy_sell and latest_exit and not last_signals[ticker]['exit']:
                     if ticker in trader.positions:
                         logger.info(f"✅ SELL signal detected for {ticker} - Closing position...")
                         success = trader.sell(ticker)
@@ -1237,8 +1245,10 @@ def run_live_trading(
                             logger.error(f"❌ Failed to close position for {ticker}")
                     else:
                         logger.info(f"⚠️  SELL signal but no position for {ticker}")
-                elif latest_exit and last_signals[ticker]['exit']:
+                elif close_on_strategy_sell and latest_exit and last_signals[ticker]['exit']:
                     logger.info(f"ℹ️  SELL signal still active for {ticker} (already processed)")
+                elif not close_on_strategy_sell and latest_exit:
+                    logger.info(f"ℹ️  SELL signal for {ticker} (close on strategy disabled)")
                 elif not latest_exit:
                     logger.info(f"ℹ️  No active SELL signal for {ticker}")
                 
@@ -1320,6 +1330,16 @@ if __name__ == "__main__":
     USE_RL_AGENT = True  # Enable RL agent for hold/close decisions
     RL_MODEL_PATH = Path("models/rl_agent")  # Path to RL model directory (parent of best_model folder)
     RL_MODEL_NAME = "best_model"  # Model filename without .zip extension
+
+    # Close triggers: enable/disable each way to close a position (env: CLOSE_ON_STRATEGY_SELL, CLOSE_ON_RL_AGENT, CLOSE_ON_RISK_MANAGEMENT; 1/true=on, 0/false=off)
+    def _env_bool(name: str, default: bool) -> bool:
+        v = os.getenv(name)
+        if v is None:
+            return default
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    CLOSE_ON_STRATEGY_SELL = _env_bool("CLOSE_ON_STRATEGY_SELL", True)
+    CLOSE_ON_RL_AGENT = _env_bool("CLOSE_ON_RL_AGENT", True)
+    CLOSE_ON_RISK_MANAGEMENT = _env_bool("CLOSE_ON_RISK_MANAGEMENT", True)
     
     # Validate API key
     if API_KEY == "your_testnet_api_key_here":
@@ -1368,5 +1388,8 @@ if __name__ == "__main__":
         signal_lookback_candles=SIGNAL_LOOKBACK_CANDLES,
         use_rl_agent=USE_RL_AGENT,
         rl_model_path=RL_MODEL_PATH,
-        rl_model_name=RL_MODEL_NAME
+        rl_model_name=RL_MODEL_NAME,
+        close_on_strategy_sell=CLOSE_ON_STRATEGY_SELL,
+        close_on_rl_agent=CLOSE_ON_RL_AGENT,
+        close_on_risk_management=CLOSE_ON_RISK_MANAGEMENT,
     )
