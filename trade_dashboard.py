@@ -138,8 +138,16 @@ def main():
     closed_positions = get_closed_positions()
     signals = get_signals_history(200)
 
+    # Total realized PnL and trade details (when API available)
+    total_pnl = None
+    trades_with_pnl = []
+    if trader and closed_positions:
+        trades_with_pnl = compute_trades_with_pnl(trader, closed_positions)
+        pnls = [t.get("pnl_usdt") for t in trades_with_pnl if t.get("pnl_usdt") is not None]
+        total_pnl = sum(pnls) if pnls else None
+
     # --- Account summary ---
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         if trader:
             balances = trader.get_account_balance()
@@ -153,6 +161,11 @@ def main():
         st.metric("Closed Trades", len(closed_positions))
     with col4:
         st.metric("Signals (recent)", len(signals))
+    with col5:
+        if total_pnl is not None:
+            st.metric("Total PnL", f"${total_pnl:,.2f}")
+        else:
+            st.metric("Total PnL", "N/A (API + trades)")
 
     # --- Open positions ---
     st.subheader("Open Positions")
@@ -183,7 +196,6 @@ def main():
     st.subheader("Closed Trades")
     if closed_positions:
         if trader:
-            trades_with_pnl = compute_trades_with_pnl(trader, closed_positions)
             rows = []
             total_pnl = 0
             wins = 0
