@@ -13,7 +13,7 @@ import logging
 import warnings
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 warnings.filterwarnings('ignore')
 
 # Add FinRL-Meta to sys.path
@@ -27,18 +27,15 @@ from backtest import (
     analyze_results,
     save_account_balance,
     save_trade_history,
-    calculate_macd,
-    identify_trend_reversals,
-    calculate_rsi,
-    identify_rsi_trend_reversals,
     INITIAL_BALANCE,
     TIME_INTERVAL,
-    ENABLE_MACD_TREND_REVERSAL,
-    ENABLE_RSI_TREND_REVERSAL,
 )
 
+# Shared entry/exit signal generator (same as evaluate_rl_agent.py and train_rl_agent.py)
+from entry_signal_generator import get_strategy_signals
+
 # Import RL risk management
-from rl_risk_management import apply_rl_risk_management, RLRiskManager
+from rl_risk_management import RLRiskManager
 
 # Configure logging
 Path("logs").mkdir(parents=True, exist_ok=True)
@@ -53,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TICKER = "XRPUSDT"
+TICKER = "BTCUSDT"
 RESULTS_DIR = Path("results")
 XAUUSDT_RESULTS_DIR = RESULTS_DIR / "XAUUSDT_RL"
 XAUUSDT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,8 +58,8 @@ MODEL_LOAD_DIR = Path("models/rl_agent")
 DEFAULT_MODEL_NAME = "best_model"
 
 # Date range for backtesting
-START_DATE = "2025-12-06"
-END_DATE = datetime.now().strftime("%Y-%m-%d")
+START_DATE = "2026-01-01"
+END_DATE ="2026-02-20"
 TIME_INTERVAL = "15m"  # 15 minutes
 
 # Binance Futures API endpoint
@@ -171,49 +168,6 @@ def fetch_binance_futures_data(
     logger.info(f"  Date range: {df['time'].min()} to {df['time'].max()}")
     
     return df
-
-
-def get_strategy_signals(ticker_df: pd.DataFrame, price: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """
-    Get entry and exit signals for the combined strategy.
-    
-    Args:
-        ticker_df: DataFrame with OHLCV data
-        price: Price series
-    
-    Returns:
-        entries, exits (boolean series)
-    """
-    logger.info("Generating strategy signals...")
-    
-    # Initialize signals
-    entries = pd.Series(False, index=price.index)
-    exits = pd.Series(False, index=price.index)
-    
-    # MACD Trend Reversal signals
-    if ENABLE_MACD_TREND_REVERSAL:
-        logger.info("  Calculating MACD signals...")
-        macd, signal, histogram = calculate_macd(ticker_df)
-        macd_signals = identify_trend_reversals(price, macd, signal, histogram)
-        entries = entries | macd_signals.get('strong_bullish', pd.Series(False, index=price.index))
-        exits = exits | macd_signals.get('strong_bearish', pd.Series(False, index=price.index))
-        logger.info(f"    MACD entries: {entries.sum()}, exits: {exits.sum()}")
-    
-    # RSI Trend Reversal signals
-    if ENABLE_RSI_TREND_REVERSAL:
-        logger.info("  Calculating RSI signals...")
-        rsi = calculate_rsi(price)
-        rsi_signals = identify_rsi_trend_reversals(price, rsi)
-        entries = entries | rsi_signals.get('bullish_reversal', pd.Series(False, index=price.index))
-        exits = exits | rsi_signals.get('bearish_reversal', pd.Series(False, index=price.index))
-        logger.info(f"    RSI entries: {entries.sum()}, exits: {exits.sum()}")
-    
-    entries = entries.fillna(False)
-    exits = exits.fillna(False)
-    
-    logger.info(f"  Total entries: {entries.sum()}, Total exits: {exits.sum()}")
-    
-    return entries, exits
 
 
 def evaluate_rl_agent(
@@ -378,9 +332,9 @@ def main():
         logger.info(f"  Date range: {ticker_df.index.min()} to {ticker_df.index.max()}")
         logger.info(f"  Price range: ${price.min():.2f} - ${price.max():.2f}")
         
-        # Generate strategy signals
+        # Generate strategy signals (same as evaluate_rl_agent.py and train_rl_agent.py)
         logger.info(f"\nGenerating strategy signals...")
-        entries, exits = get_strategy_signals(ticker_df, price)
+        entries, exits = get_strategy_signals(ticker_df, price, strategy="Combined")
         
         if entries.sum() == 0:
             logger.warning("No entry signals generated. Exiting.")

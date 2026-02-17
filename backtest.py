@@ -990,18 +990,27 @@ def plot_account_balance(portfolio, ticker_name):
 
 
 def save_trade_history(portfolio, ticker, strategy_dir):
-    """Save trade history to CSV file in strategy-specific folder."""
+    """Save trade history to CSV file in strategy-specific folder. Timestamps in GMT+7."""
     try:
-        trades = portfolio.trades.records_readable
+        trades = portfolio.trades.records_readable.copy()
         
         if len(trades) == 0:
             logger.info(f"  No trades to save for {ticker}")
             return None
         
+        # Convert timestamp columns to GMT+7 (Asia/Bangkok) for display
+        gmt7 = "Asia/Bangkok"
+        for col in ("Entry Timestamp", "Exit Timestamp"):
+            if col in trades.columns:
+                ts = pd.to_datetime(trades[col])
+                if ts.dt.tz is None:
+                    ts = ts.dt.tz_localize("UTC", ambiguous="infer")
+                trades[col] = ts.dt.tz_convert(gmt7).dt.tz_localize(None)
+        
         # Save to CSV in strategy folder
         csv_path = strategy_dir / f"{ticker}_trade_history.csv"
         trades.to_csv(csv_path, index=False)
-        logger.info(f"  Trade history saved: {csv_path} ({len(trades)} trades)")
+        logger.info(f"  Trade history saved: {csv_path} ({len(trades)} trades, timestamps GMT+7)")
         
         return csv_path
     except Exception as e:
