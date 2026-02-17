@@ -1247,15 +1247,11 @@ def run_live_trading(
                     logger.warning(f"No signals generated for {ticker}")
                     continue
                 
-                # Check latest signal: True if signal appears in the last N candles (see signal_lookback_candles)
-                n_entry = min(signal_lookback_candles, len(entries))
-                n_exit = min(signal_lookback_candles, len(exits))
-                latest_entry = entries.iloc[-n_entry:].any() if n_entry > 0 else False
-                latest_exit = exits.iloc[-n_exit:].any() if n_exit > 0 else False
-                
                 # Debug: Show signal status with timestamps
                 total_buy_signals = entries.sum()
                 total_sell_signals = exits.sum()
+                last_buy_time = None
+                last_sell_time = None
                 
                 # Find the most recent buy/sell signal timestamps (convert to UTC+7)
                 if total_buy_signals > 0:
@@ -1272,7 +1268,7 @@ def run_live_trading(
                         logger.info(f"  📈 Last BUY signal at: {last_buy_time_utc7.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
                 if total_sell_signals > 0:
                     last_sell_time = exits[exits == True].index[-1] if exits.sum() > 0 else None
-                    if last_sell_time is not None:
+                if total_sell_signals > 0 and last_sell_time is not None:
                         # Convert pandas Timestamp to UTC+7
                         if isinstance(last_sell_time, pd.Timestamp):
                             if last_sell_time.tz is None:
@@ -1295,8 +1291,11 @@ def run_live_trading(
                     else:
                         latest_candle_time_utc7 = pd.to_datetime(latest_candle_time).tz_localize('UTC').tz_convert('Asia/Bangkok')
                     logger.info(f"  📊 Latest candle: {latest_candle_time_utc7.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
+                # Active signal = most recent signal by time (BUY stays active until a SELL appears)
+                latest_entry = (last_buy_time is not None) and (last_sell_time is None or last_buy_time > last_sell_time)
+                latest_exit = (last_sell_time is not None) and (last_buy_time is None or last_sell_time > last_buy_time)
                 logger.info(f"  Signal Status: {total_buy_signals} buy signals, {total_sell_signals} sell signals in history")
-                logger.info(f"  Latest Entry Signal (most recent candle): {latest_entry}")
+                logger.info(f"  Latest Entry Signal (most recent signal is BUY): {latest_entry}")
                 logger.info(f"  Last signal processed flag: entry={last_signals[ticker]['entry']}, exit={last_signals[ticker]['exit']}")
                 
                 candle_time_iso = pd.Timestamp(latest_candle_time).isoformat() if latest_candle_time is not None else None
