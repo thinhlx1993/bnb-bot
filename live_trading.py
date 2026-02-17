@@ -176,12 +176,13 @@ class BinanceTrader:
             entry_price = pos['entry_price']
             quantity = pos['quantity']
             entry_time = pos['entry_time']
-            entry_usdt_value = pos.get('usdt_value', entry_price * quantity)
-            
-            # Calculate PnL
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100
-            pnl_usdt = (current_price - entry_price) * quantity
+            # Use actual value at entry (quantity * entry_price) so Entry Value and Current Value are comparable
+            entry_value_actual = entry_price * quantity
             current_value = current_price * quantity
+            
+            # Calculate PnL from value change so it matches Entry Value vs Current Value
+            pnl_pct = ((current_value - entry_value_actual) / entry_value_actual) * 100 if entry_value_actual else 0.0
+            pnl_usdt = current_value - entry_value_actual
             
             # Calculate holding time
             holding_time = datetime.now() - entry_time
@@ -200,7 +201,7 @@ class BinanceTrader:
             logger.info(f"  Quantity:     {quantity:.8f}")
             logger.info(f"  Entry Price:  ${entry_price:.2f}")
             logger.info(f"  Current Price: ${current_price:.2f}")
-            logger.info(f"  Entry Value:  ${entry_usdt_value:.2f}")
+            logger.info(f"  Entry Value:  ${entry_value_actual:.2f}")
             logger.info(f"  Current Value: ${current_value:.2f}")
             logger.info(f"  PnL:          {pnl_indicator} {pnl_sign}{pnl_pct:.2f}% (${pnl_sign}{pnl_usdt:.2f})")
             logger.info(f"  Holding Time: {int(hours)}h {int(minutes)}m")
