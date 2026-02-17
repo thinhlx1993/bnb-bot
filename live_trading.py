@@ -18,8 +18,8 @@ import logging
 from dotenv import load_dotenv
 load_dotenv()
 
-# Timezone configuration - UTC+7 (local time)
-LOCAL_TIMEZONE = timezone(timedelta(hours=7))
+# Timezone: all logic uses UTC. LOCAL_TIMEZONE is only for log output.
+LOCAL_TIMEZONE = timezone(timedelta(hours=7))  # Logs only: show timestamps in your timezone
 
 # Add FinRL-Meta to sys.path (configurable via FINRL_META_PATH in .env)
 finrl_meta_path = Path(os.getenv("FINRL_META_PATH", "/mnt/data/FinRL-Tutorials/3-Practical/FinRL-Meta"))
@@ -59,7 +59,6 @@ from live_trading_db import (
     insert_signal,
     insert_position,
     close_position,
-    get_open_positions,
 )
 
 # Configure logging - add FileHandler explicitly because basicConfig is a no-op
@@ -82,6 +81,9 @@ MAX_POSITION_SIZE = 100.0  # Maximum position size in USDT
 # Binance Testnet Configuration
 BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
 BINANCE_TESTNET_API_URL = "https://testnet.binance.vision/api"
+
+# RL agent: ensure this many bars before entry so technical indicators have enough history
+ENTRY_LOOKBACK_STEPS = 100
 
 
 class BinanceTrader:
@@ -184,9 +186,10 @@ class BinanceTrader:
             pnl_pct = ((current_value - entry_value_actual) / entry_value_actual) * 100 if entry_value_actual else 0.0
             pnl_usdt = current_value - entry_value_actual
             
-            # Calculate holding time (match entry_time tz so naive/aware don't mix)
-            now = datetime.now(entry_time.tzinfo) if getattr(entry_time, 'tzinfo', None) else datetime.now()
-            holding_time = now - entry_time
+            # All times in UTC (server/DB). Normalize naive entry_time as UTC for comparison.
+            entry_utc = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            holding_time = now_utc - entry_utc
             hours = holding_time.total_seconds() / 3600
             minutes = (holding_time.total_seconds() % 3600) / 60
             
@@ -206,13 +209,11 @@ class BinanceTrader:
             logger.info(f"  Current Value: ${current_value:.2f}")
             logger.info(f"  PnL:          {pnl_indicator} {pnl_sign}{pnl_pct:.2f}% (${pnl_sign}{pnl_usdt:.2f})")
             logger.info(f"  Holding Time: {int(hours)}h {int(minutes)}m")
-            # Convert entry_time to UTC+7 for display
+            # Logs: show entry time in local timezone
             if isinstance(entry_time, datetime):
-                if entry_time.tzinfo is None:
-                    entry_time_utc7 = entry_time.replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
-                else:
-                    entry_time_utc7 = entry_time.astimezone(LOCAL_TIMEZONE)
-                logger.info(f"  Entry Time:   {entry_time_utc7.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
+                entry_utc = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+                entry_local = entry_utc.astimezone(LOCAL_TIMEZONE)
+                logger.info(f"  Entry Time:   {entry_local.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
             else:
                 logger.info(f"  Entry Time:   {entry_time}")
         
@@ -320,6 +321,68 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"Error getting account balance: {e}")
             return {}
+    
+    def get_my_trades(self, symbol: str, limit: int = 100) -> list:
+        """Get trade history for a symbol (signed). Returns list of dicts with price, qty, time, isBuyer."""
+        try:
+            if self.client:
+                trades = self.client.get_my_trades(symbol=symbol, limit=limit)
+            else:
+                data = self._make_api_request('GET', '/api/v3/myTrades', {'symbol': symbol, 'limit': limit})
+                trades = data if data else []
+            return trades
+        except Exception as e:
+            logger.debug(f"get_my_trades {symbol}: {e}")
+            return []
+    
+    def sync_positions_from_exchange(self, ticker_list: list) -> None:
+        """
+        Set self.positions from exchange balances (source of truth).
+        Only considers symbols in ticker_list. Entry price/time from recent buy trades (myTrades).
+        DB is not read; use this instead of restoring from DB.
+        """
+        self.positions.clear()
+        balances = self.get_account_balance()
+        if not balances:
+            return
+        for symbol in ticker_list:
+            base = symbol.replace('USDT', '')
+            if base == symbol:
+                continue
+            total = balances.get(base, {}).get('total', 0) or 0
+            if total <= 0:
+                continue
+            quantity = float(total)
+            current_price = self.get_current_price(symbol)
+            usdt_value = quantity * current_price if current_price else 0.0
+            entry_price = current_price
+            entry_time = datetime.now(timezone.utc)
+            trades = self.get_my_trades(symbol, limit=200)
+            buys = [t for t in trades if t.get('isBuyer') is True]
+            if buys:
+                buys_sorted = sorted(buys, key=lambda t: t['time'], reverse=True)
+                cum_qty = 0.0
+                cost_sum = 0.0
+                earliest_time = None
+                for t in buys_sorted:
+                    qty = float(t['qty'])
+                    price = float(t['price'])
+                    cost_sum += qty * price
+                    cum_qty += qty
+                    if earliest_time is None or t['time'] < earliest_time:
+                        earliest_time = t['time']
+                    if cum_qty >= quantity:
+                        break
+                if cum_qty > 0:
+                    entry_price = cost_sum / cum_qty
+                    entry_time = datetime.fromtimestamp(earliest_time / 1000.0, tz=timezone.utc)
+            self.positions[symbol] = {
+                'entry_price': entry_price,
+                'entry_time': entry_time,
+                'quantity': quantity,
+                'usdt_value': usdt_value,
+            }
+            logger.info(f"Synced position from exchange: {symbol} qty={quantity:.8f} entry≈{entry_price:.4f}")
     
     def get_all_usdt_pairs(self) -> list:
         """Fetch all USDT spot trading pairs from exchange (public endpoint)."""
@@ -538,14 +601,14 @@ class BinanceTrader:
                 entry_price = self.get_current_price(symbol)
                 self.positions[symbol] = {
                     'entry_price': entry_price,
-                    'entry_time': datetime.now(),
+                    'entry_time': datetime.now(timezone.utc),
                     'quantity': quantity,
                     'usdt_value': usdt_amount
                 }
                 
                 # Log trade
                 self.trade_history.append({
-                    'timestamp': datetime.now(),
+                    'timestamp': datetime.now(timezone.utc),
                     'symbol': symbol,
                     'side': 'BUY',
                     'quantity': quantity,
@@ -597,7 +660,7 @@ class BinanceTrader:
                 
                 # Log trade
                 self.trade_history.append({
-                    'timestamp': datetime.now(),
+                    'timestamp': datetime.now(timezone.utc),
                     'symbol': symbol,
                     'side': 'SELL',
                     'quantity': quantity,
@@ -653,9 +716,9 @@ class BinanceTrader:
         # Check max holding period
         if USE_MAX_HOLDING:
             # Convert MAX_HOLDING_PERIODS to actual time based on interval
-            # This is a simplified version - you may need to adjust based on your interval
-            now = datetime.now(entry_time.tzinfo) if getattr(entry_time, 'tzinfo', None) else datetime.now()
-            holding_time = now - entry_time
+            entry_utc = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            holding_time = now_utc - entry_utc
             # Assuming 15m intervals, adjust as needed
             max_holding_time = timedelta(minutes=MAX_HOLDING_PERIODS * 15)
             if holding_time >= max_holding_time:
@@ -696,10 +759,19 @@ class BinanceTrader:
         entry_price = position['entry_price']
         entry_time = position['entry_time']
 
+        # All times in UTC. Normalize entry_time and index timestamps to UTC-aware for comparison.
+        entry_utc = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+        def _to_utc_aware(ts):
+            if isinstance(ts, pd.Timestamp):
+                return ts.tz_localize(timezone.utc) if ts.tzinfo is None else ts.tz_convert(timezone.utc)
+            # datetime
+            return ts.replace(tzinfo=timezone.utc) if getattr(ts, 'tzinfo', None) is None else ts.astimezone(timezone.utc)
+
         entry_idx = None
         for idx, timestamp in enumerate(price_history.index):
             if isinstance(timestamp, pd.Timestamp):
-                time_diff = abs((timestamp - entry_time).total_seconds())
+                ts_utc = _to_utc_aware(timestamp)
+                time_diff = abs((ts_utc - entry_utc).total_seconds())
                 if time_diff < 900:
                     entry_idx = idx
                     break
@@ -711,11 +783,13 @@ class BinanceTrader:
         history_length = rl_manager.history_length
         current_idx = len(price_history) - 1
 
-        if current_idx - entry_idx < 1:
-            logger.warning(f"Not enough price history for {symbol} (need at least 1 period after entry)")
+        # Use effective entry = entry - ENTRY_LOOKBACK_STEPS so we have enough bars before entry for indicators
+        effective_entry_idx = max(0, entry_idx - ENTRY_LOOKBACK_STEPS)
+        if current_idx - effective_entry_idx < 1:
+            logger.warning(f"Not enough price history for {symbol} (need at least 1 period after effective entry)")
             return self.check_risk_management(symbol) is not None
 
-        window_start = max(0, entry_idx - history_length)
+        window_start = max(0, effective_entry_idx - history_length)
         price_window = price_history.iloc[window_start:current_idx + 1].copy()
         balance_window = balance_history.iloc[window_start:current_idx + 1].copy()
 
@@ -759,7 +833,7 @@ class BinanceTrader:
         env.balance_data = balance_window
         env.exit_signals = exit_signals
         env.entry_price = entry_price
-        env.entry_idx = entry_idx - window_start
+        env.entry_idx = effective_entry_idx - window_start
         env.exit_signal_idx = None
         env.exit_idx = len(price_window) - 1
 
@@ -787,8 +861,9 @@ class BinanceTrader:
         env.total_trades = 0
         env.entry_balance = rl_manager.initial_balance
 
-        entry_idx_in_window = env.entry_idx
-        prices_since_entry = price_window.iloc[entry_idx_in_window:env.current_idx + 1].values
+        # Episode min/max use real entry (actual holding period), not effective entry
+        real_entry_idx_in_window = entry_idx - window_start
+        prices_since_entry = price_window.iloc[real_entry_idx_in_window:env.current_idx + 1].values
         if len(prices_since_entry) > 0:
             env.episode_max_price = float(np.max(prices_since_entry))
             env.episode_min_price = float(np.min(prices_since_entry))
@@ -1151,23 +1226,9 @@ def run_live_trading(
             use_rl_agent = False
             rl_manager = None
     
-    # Initialize DB and restore state from previous runs
+    # DB: history only (open/close events). Positions are synced from exchange, not restored from DB.
     init_db()
-    for row in get_open_positions():
-        ticker = row["ticker"]
-        try:
-            opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
-            if opened_at.tzinfo is None:
-                opened_at = opened_at.replace(tzinfo=timezone.utc)
-        except Exception:
-            opened_at = datetime.now(timezone.utc)
-        trader.positions[ticker] = {
-            "entry_price": row["entry_price"],
-            "entry_time": opened_at,
-            "quantity": row["quantity"],
-            "usdt_value": row["usdt_value"],
-        }
-        logger.info(f"Restored open position from DB: {ticker}")
+    trader.sync_positions_from_exchange(ticker_list)
     
     # Display initial balance
     balances = trader.get_account_balance()

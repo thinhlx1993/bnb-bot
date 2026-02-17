@@ -1,6 +1,7 @@
 """
-SQLite persistence for live trading: signals (buy/sell) and positions.
-Used to restore state after restart and for audit/history.
+SQLite persistence for live trading: signals and position history only.
+Trading logic uses the exchange (Binance) as source of truth for open positions.
+insert_position/close_position record history; positions are not restored from DB for trading.
 """
 
 import sqlite3
@@ -40,7 +41,7 @@ def init_db() -> None:
                 entry_price REAL NOT NULL,
                 quantity REAL NOT NULL,
                 usdt_value REAL NOT NULL,
-                opened_at TEXT NOT NULL,
+                opened_at TEXT NOT NULL,  -- UTC, ISO 8601 with Z
                 closed_at TEXT,
                 exit_reason TEXT
             );
