@@ -26,3 +26,4 @@ tf_keras>=2.12.0  # Required for SBX
 sb3_contrib>=2.7.0  # Required for RecurrentPPO
 stockstats
 TA-lib
+streamlit>=1.28.0

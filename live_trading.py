@@ -59,6 +59,7 @@ from live_trading_db import (
     insert_signal,
     insert_position,
     close_position,
+    reset_db,
 )
 
 # Configure logging - add FileHandler explicitly because basicConfig is a no-op
@@ -1135,6 +1136,47 @@ def test_positions(
     return True
 
 
+def reset_testnet_account(
+    api_key: str,
+    api_secret: Optional[str] = None,
+    private_key_path: Optional[str] = None,
+    clear_local_db: bool = True,
+) -> bool:
+    """
+    Reset testnet account: sell all open positions (convert to USDT) and optionally clear local DB.
+    Note: Binance testnet does not provide an API to reset balance to a fixed amount; this only
+    closes all positions so your balance is 100% USDT.
+    """
+    trader = BinanceTrader(
+        api_key=api_key,
+        api_secret=api_secret,
+        private_key_path=private_key_path,
+        testnet=TESTNET,
+    )
+    ticker_list = trader.get_all_usdt_pairs()
+    if not ticker_list:
+        logger.warning("Could not fetch USDT pairs, using default list")
+        ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
+    trader.sync_positions_from_exchange(ticker_list)
+    if not trader.positions:
+        logger.info("No open positions on exchange.")
+    else:
+        logger.info(f"Closing {len(trader.positions)} position(s)...")
+        for symbol in list(trader.positions.keys()):
+            if trader.sell(symbol):
+                close_position(symbol, "reset_account")
+                logger.info(f"  Closed {symbol}")
+            else:
+                logger.warning(f"  Failed to close {symbol}")
+    balances = trader.get_account_balance()
+    usdt = balances.get("USDT", {}).get("total", 0.0)
+    logger.info(f"USDT balance after reset: ${usdt:.2f}")
+    if clear_local_db:
+        reset_db()
+        logger.info("Local DB cleared (signals and positions history).")
+    return True
+
+
 def run_live_trading(
     api_key: str,
     api_secret: Optional[str] = None,
@@ -1456,6 +1498,8 @@ if __name__ == "__main__":
                         help="Symbol for --test-positions (default: BNBUSDT)")
     parser.add_argument("--test-amount", type=float, default=None,
                         help="USDT amount for --test-positions (default: MIN_TRADE_AMOUNT=10)")
+    parser.add_argument("--reset-account", action="store_true",
+                        help="Reset testnet account: sell all positions (to USDT) and clear local DB")
     args, _ = parser.parse_known_args()
     
     # Configuration - SET YOUR API KEYS HERE
@@ -1492,6 +1536,26 @@ if __name__ == "__main__":
             usdt_amount=args.test_amount,
         )
         sys.exit(0 if ok else 1)
+    
+    # Reset testnet account: sell all positions and clear local DB
+    if args.reset_account:
+        if API_KEY == "your_testnet_api_key_here":
+            logger.error("Please set BINANCE_API_KEY to reset account")
+            sys.exit(1)
+        if not API_SECRET and not PRIVATE_KEY_PATH:
+            logger.error("Provide API_SECRET or BINANCE_PRIVATE_KEY_PATH")
+            sys.exit(1)
+        if PRIVATE_KEY_PATH and not Path(PRIVATE_KEY_PATH).exists():
+            logger.error(f"Private key not found: {PRIVATE_KEY_PATH}")
+            sys.exit(1)
+        reset_testnet_account(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            private_key_path=PRIVATE_KEY_PATH if (PRIVATE_KEY_PATH and Path(PRIVATE_KEY_PATH).exists()) else None,
+            clear_local_db=True,
+        )
+        logger.info("Test account reset complete.")
+        sys.exit(0)
     
     # Trading configuration
     # TICKER_LIST in .env: comma-separated symbols, e.g. TICKER_LIST=BTCUSDT,ETHUSDT,BNBUSDT

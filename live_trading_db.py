@@ -108,6 +108,17 @@ def get_open_positions() -> List[Dict[str, Any]]:
         conn.close()
 
 
+def reset_db() -> None:
+    """Clear all positions and signals (local state only). Does not affect the exchange."""
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM positions")
+        conn.execute("DELETE FROM signals")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_last_signal_per_ticker() -> Dict[str, Dict[str, Any]]:
     """For each ticker, return the latest signal row (signal_type, source, created_at, candle_time)."""
     conn = get_conn()
