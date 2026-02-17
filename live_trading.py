@@ -184,8 +184,9 @@ class BinanceTrader:
             pnl_pct = ((current_value - entry_value_actual) / entry_value_actual) * 100 if entry_value_actual else 0.0
             pnl_usdt = current_value - entry_value_actual
             
-            # Calculate holding time
-            holding_time = datetime.now() - entry_time
+            # Calculate holding time (match entry_time tz so naive/aware don't mix)
+            now = datetime.now(entry_time.tzinfo) if getattr(entry_time, 'tzinfo', None) else datetime.now()
+            holding_time = now - entry_time
             hours = holding_time.total_seconds() / 3600
             minutes = (holding_time.total_seconds() % 3600) / 60
             
@@ -653,7 +654,8 @@ class BinanceTrader:
         if USE_MAX_HOLDING:
             # Convert MAX_HOLDING_PERIODS to actual time based on interval
             # This is a simplified version - you may need to adjust based on your interval
-            holding_time = datetime.now() - entry_time
+            now = datetime.now(entry_time.tzinfo) if getattr(entry_time, 'tzinfo', None) else datetime.now()
+            holding_time = now - entry_time
             # Assuming 15m intervals, adjust as needed
             max_holding_time = timedelta(minutes=MAX_HOLDING_PERIODS * 15)
             if holding_time >= max_holding_time:
