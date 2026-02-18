@@ -76,18 +76,24 @@ logger = logging.getLogger(__name__)
 # Trading Configuration
 TESTNET = True  # Set to False for production (NOT RECOMMENDED without thorough testing)
 TRADING_ENABLED = True  # Set to False to run in paper trading mode (no actual orders)
-MIN_TRADE_AMOUNT = 10.0  # Minimum trade amount in USDT
+MIN_TRADE_AMOUNT = 100.0  # Minimum trade amount in USDT
 TRADE_PERCENTAGE = 0.95  # Percentage of available balance to use per trade (95% to leave some buffer)
 MAX_POSITION_SIZE = 100.0  # Maximum position size in USDT
-MIN_TICKER_PRICE = 0.01  # Skip tickers with price below this (avoids very low-priced / dust pairs)
+MIN_TICKER_PRICE = 0.1  # Skip tickers with price below this (avoids very low-priced / dust pairs)
 INVALID_POSITION_QUANTITY = 18446.0  # Force close positions with this quantity (invalid/bug positions)
+
+# Tickers to exclude from trading (no new positions; existing positions still force-closed if invalid)
+TICKER_BLACKLIST = frozenset({
+    "ACAUSDT", "BTTCUSDT", "CHESSUSDT", "DATAUSDT",
+    "GHSTUSDT", "NKNUSDT", "PEPEUSDT", "SHIBUSDT",
+})
 
 # Binance Testnet Configuration
 BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
 BINANCE_TESTNET_API_URL = "https://testnet.binance.vision/api"
 
 # RL agent: ensure this many bars before entry so technical indicators have enough history
-ENTRY_LOOKBACK_STEPS = 100
+ENTRY_LOOKBACK_STEPS = 500
 
 
 class BinanceTrader:
@@ -438,8 +444,10 @@ class BinanceTrader:
             }
             logger.info(f"Synced position from exchange: {symbol} qty={quantity:.8f} entry≈{entry_price:.4f}")
     
-    def get_all_usdt_pairs(self) -> list:
-        """Fetch all USDT spot trading pairs from exchange (public endpoint)."""
+    def get_all_usdt_pairs(self, include_blacklist: bool = False) -> list:
+        """Fetch all USDT spot trading pairs from exchange (public endpoint).
+        include_blacklist: If True, include blacklisted symbols (e.g. for close-all-position scripts).
+        """
         try:
             if self.client:
                 exchange_info = self.client.get_exchange_info()
@@ -453,6 +461,7 @@ class BinanceTrader:
                 s['symbol'] for s in exchange_info['symbols']
                 if s.get('quoteAsset') == 'USDT'
                 and s.get('status') == 'TRADING'
+                and (include_blacklist or s['symbol'] not in TICKER_BLACKLIST)
             ]
             return sorted(pairs)
         except Exception as e:
@@ -970,7 +979,7 @@ class BinanceTrader:
             return self.check_risk_management(symbol) is not None
 
 
-def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str, lookback_periods: int = 100) -> pd.DataFrame:
+def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str, lookback_periods: int = 500) -> pd.DataFrame:
     """
     Fetch live data directly from Binance API (real-time).
     
@@ -1228,7 +1237,7 @@ def reset_testnet_account(
         private_key_path=private_key_path,
         testnet=TESTNET,
     )
-    ticker_list = trader.get_all_usdt_pairs()
+    ticker_list = trader.get_all_usdt_pairs(include_blacklist=True)
     if not ticker_list:
         logger.warning("Could not fetch USDT pairs, using default list")
         ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
@@ -1305,6 +1314,10 @@ def run_live_trading(
             ticker_list = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
         else:
             logger.info(f"Using all {len(ticker_list)} USDT pairs from exchange")
+    ticker_list = [t for t in ticker_list if t not in TICKER_BLACKLIST]
+    if not ticker_list:
+        logger.error("No tickers left after blacklist filter")
+        sys.exit(1)
     
     logger.info("="*60)
     logger.info("Starting Live Trading Bot")
