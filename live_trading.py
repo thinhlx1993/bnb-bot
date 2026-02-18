@@ -79,7 +79,7 @@ TRADING_ENABLED = True  # Set to False to run in paper trading mode (no actual o
 MIN_TRADE_AMOUNT = 10.0  # Minimum trade amount in USDT
 TRADE_PERCENTAGE = 0.95  # Percentage of available balance to use per trade (95% to leave some buffer)
 MAX_POSITION_SIZE = 100.0  # Maximum position size in USDT
-MIN_TICKER_PRICE = 0.1  # Skip tickers with price below this (avoids very low-priced / dust pairs)
+MIN_TICKER_PRICE = 0.01  # Skip tickers with price below this (avoids very low-priced / dust pairs)
 
 # Binance Testnet Configuration
 BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"

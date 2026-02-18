@@ -8,7 +8,7 @@ Run: streamlit run trade_dashboard.py
 import os
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +25,31 @@ from live_trading import BinanceTrader, INITIAL_BALANCE, TESTNET
 
 Path("logs").mkdir(parents=True, exist_ok=True)
 init_db()
+
+
+def format_duration(opened_at_str: str) -> str:
+    """Return human-readable duration from opened_at to now (e.g. '2h 15m', '3d 5h')."""
+    try:
+        opened = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - opened
+        if delta < timedelta(0):
+            return "0m"
+        total_seconds = int(delta.total_seconds())
+        days, r = divmod(total_seconds, 86400)
+        hours, r = divmod(r, 3600)
+        minutes, _ = divmod(r, 60)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+        return " ".join(parts)
+    except Exception:
+        return "-"
 
 
 def get_closed_positions():
@@ -170,9 +195,7 @@ def main():
         else:
             st.metric("USDT Balance", "N/A (API required)")
     with col2:
-        st.metric("Open Positions (bot)", len(open_positions))
-        if positions_on_exchange is not None:
-            st.caption(f"On exchange: {positions_on_exchange}")
+        st.metric("Open Positions", len(open_positions))
     with col3:
         st.metric("Closed Trades", len(closed_positions))
     with col4:
@@ -185,11 +208,6 @@ def main():
 
     # --- Open positions ---
     st.subheader("Open Positions")
-    if positions_on_exchange is not None and positions_on_exchange != len(open_positions):
-        st.caption(
-            "**Open (bot)** = positions this bot opened and has not closed. "
-            "**On exchange** = all assets with a balance (includes manual/dust/other)."
-        )
     if open_positions:
         rows = []
         for pos in open_positions:
@@ -207,6 +225,7 @@ def main():
                 "Current Value (USDT)": round(current_value, 2) if current_value else "-",
                 "Unrealized PnL (USDT)": round(pnl_usdt, 2) if pnl_usdt is not None else "-",
                 "Unrealized PnL (%)": f"{pnl_pct:.2f}%" if pnl_pct is not None else "-",
+                "Duration": format_duration(pos["opened_at"]),
                 "Opened At": pos["opened_at"],
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
