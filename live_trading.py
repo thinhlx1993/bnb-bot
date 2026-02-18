@@ -80,6 +80,7 @@ MIN_TRADE_AMOUNT = 10.0  # Minimum trade amount in USDT
 TRADE_PERCENTAGE = 0.95  # Percentage of available balance to use per trade (95% to leave some buffer)
 MAX_POSITION_SIZE = 100.0  # Maximum position size in USDT
 MIN_TICKER_PRICE = 0.01  # Skip tickers with price below this (avoids very low-priced / dust pairs)
+INVALID_POSITION_QUANTITY = 18446.0  # Force close positions with this quantity (invalid/bug positions)
 
 # Binance Testnet Configuration
 BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
@@ -1376,6 +1377,19 @@ def run_live_trading(
                 logger.warning("No data fetched, skipping this cycle")
                 time.sleep(check_interval_seconds)
                 continue
+            
+            # Force close invalid positions (quantity exactly INVALID_POSITION_QUANTITY)
+            invalid_symbols = [
+                s for s, pos in trader.positions.items()
+                if abs(pos['quantity'] - INVALID_POSITION_QUANTITY) < 0.01
+            ]
+            for symbol in invalid_symbols:
+                logger.warning(f"⚠️ Force closing invalid position: {symbol} (quantity={INVALID_POSITION_QUANTITY})")
+                if trader.sell(symbol):
+                    close_position(symbol, 'invalid_position')
+                    logger.info(f"✅ Invalid position closed: {symbol}")
+                else:
+                    logger.error(f"❌ Failed to force close invalid position: {symbol}")
             
             # Process each ticker
             for ticker in ticker_list:
