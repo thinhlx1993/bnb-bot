@@ -138,6 +138,20 @@ def main():
     closed_positions = get_closed_positions()
     signals = get_signals_history(200)
 
+    # When API available, count positions on exchange (any asset with balance) to match live_trading log
+    positions_on_exchange = None
+    if trader:
+        try:
+            ticker_list = trader.get_all_usdt_pairs()
+            balances = trader.get_account_balance()
+            if ticker_list and balances:
+                positions_on_exchange = sum(
+                    1 for s in ticker_list
+                    if s.endswith("USDT") and (balances.get(s.replace("USDT", ""), {}).get("total", 0) or 0) > 0
+                )
+        except Exception:
+            positions_on_exchange = None
+
     # Total realized PnL and trade details (when API available)
     total_pnl = None
     trades_with_pnl = []
@@ -156,7 +170,9 @@ def main():
         else:
             st.metric("USDT Balance", "N/A (API required)")
     with col2:
-        st.metric("Open Positions", len(open_positions))
+        st.metric("Open Positions (bot)", len(open_positions))
+        if positions_on_exchange is not None:
+            st.caption(f"On exchange: {positions_on_exchange}")
     with col3:
         st.metric("Closed Trades", len(closed_positions))
     with col4:
@@ -169,6 +185,11 @@ def main():
 
     # --- Open positions ---
     st.subheader("Open Positions")
+    if positions_on_exchange is not None and positions_on_exchange != len(open_positions):
+        st.caption(
+            "**Open (bot)** = positions this bot opened and has not closed. "
+            "**On exchange** = all assets with a balance (includes manual/dust/other)."
+        )
     if open_positions:
         rows = []
         for pos in open_positions:

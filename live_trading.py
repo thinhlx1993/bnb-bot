@@ -59,6 +59,7 @@ from live_trading_db import (
     insert_signal,
     insert_position,
     close_position,
+    get_open_positions,
     reset_db,
 )
 
@@ -78,6 +79,7 @@ TRADING_ENABLED = True  # Set to False to run in paper trading mode (no actual o
 MIN_TRADE_AMOUNT = 10.0  # Minimum trade amount in USDT
 TRADE_PERCENTAGE = 0.95  # Percentage of available balance to use per trade (95% to leave some buffer)
 MAX_POSITION_SIZE = 100.0  # Maximum position size in USDT
+MIN_TICKER_PRICE = 0.1  # Skip tickers with price below this (avoids very low-priced / dust pairs)
 
 # Binance Testnet Configuration
 BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
@@ -158,7 +160,59 @@ class BinanceTrader:
         # Track positions
         self.positions = {}  # {symbol: {'entry_price': float, 'entry_time': datetime, 'quantity': float, 'usdt_value': float}}
         self.trade_history = []
-    
+        # Cache exchange info to avoid rate limits (NOTIONAL check, etc.)
+        self._exchange_info_cache: Optional[Dict] = None
+        self._exchange_info_ts: float = 0.0
+        self._exchange_info_ttl_sec: float = 300.0
+
+    def _get_exchange_info(self) -> Optional[Dict]:
+        """Fetch exchange info (cached for _exchange_info_ttl_sec)."""
+        now = time.time()
+        if self._exchange_info_cache is not None and (now - self._exchange_info_ts) < self._exchange_info_ttl_sec:
+            return self._exchange_info_cache
+        try:
+            if self.client:
+                self._exchange_info_cache = self.client.get_exchange_info()
+            else:
+                url = f"{self.base_url}/api/v3/exchangeInfo"
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                self._exchange_info_cache = response.json()
+            self._exchange_info_ts = now
+            return self._exchange_info_cache
+        except Exception as e:
+            logger.debug(f"Failed to fetch exchange info: {e}")
+            return self._exchange_info_cache  # use stale if any
+
+    def _get_min_notional(self, symbol: str) -> float:
+        """
+        Minimum notional (quote asset, e.g. USDT) required for a market order.
+        Returns 0.0 if not found (no check).
+        """
+        info = self._get_exchange_info()
+        if not info:
+            return 0.0
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return 0.0
+        min_for_market = 0.0
+        min_any = 0.0
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') not in ('NOTIONAL', 'MIN_NOTIONAL'):
+                continue
+            try:
+                val = float(f.get('minNotional', 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if val <= 0:
+                continue
+            if f.get('applyToMarket', False):
+                min_for_market = val
+                break
+            if min_any == 0:
+                min_any = val
+        return min_for_market or min_any
+
     def print_positions(self):
         """Print current positions with detailed information."""
         if not self.positions:
@@ -218,62 +272,61 @@ class BinanceTrader:
             else:
                 logger.info(f"  Entry Time:   {entry_time}")
         
-        # Print summary
+        # Print summary (positions = on exchange, any balance; bot-tracked open count is in DB only)
         total_pnl_sign = "+" if total_pnl_usdt >= 0 else ""
         total_pnl_indicator = "🟢" if total_pnl_usdt >= 0 else "🔴"
         logger.info("" + "-"*60)
         logger.info("SUMMARY:")
-        logger.info(f"  Total Positions: {len(self.positions)}")
+        logger.info(f"  Total Positions (on exchange): {len(self.positions)}")
         logger.info(f"  Total Value:     ${total_value_usdt:.2f}")
         logger.info(f"  Total PnL:       {total_pnl_indicator} {total_pnl_sign}{total_pnl_usdt:.2f} USDT")
         logger.info("="*60)
     
-    def _sign_request_hmac(self, params: dict) -> str:
-        """Sign request using HMAC-SHA256."""
-        query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+    def _sign_query_string_hmac(self, query_string: str) -> str:
+        """Sign a query string using HMAC-SHA256 (string must match exactly what is sent)."""
         signature = hmac.new(
             self.api_secret.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
         return signature
-    
-    def _sign_request_rsa(self, params: dict) -> str:
-        """Sign request using RSA private key."""
-        query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+
+    def _sign_query_string_rsa(self, query_string: str) -> str:
+        """Sign a query string using RSA (string must match exactly what is sent)."""
         signature_bytes = self.private_key.sign(
             query_string.encode('utf-8'),
             padding.PKCS1v15(),
             hashes.SHA256()
         )
-        signature = base64.b64encode(signature_bytes).decode('utf-8')
-        return signature
-    
-    def _sign_request(self, params: dict) -> str:
-        """Sign request using the configured authentication method."""
+        return base64.b64encode(signature_bytes).decode('utf-8')
+
+    def _sign_query_string(self, query_string: str) -> str:
+        """Sign a raw query string using the configured authentication method."""
         if self.auth_method == 'RSA':
-            return self._sign_request_rsa(params)
+            return self._sign_query_string_rsa(query_string)
         elif self.auth_method == 'HMAC':
-            return self._sign_request_hmac(params)
+            return self._sign_query_string_hmac(query_string)
         else:
             raise ValueError(f"Unknown authentication method: {self.auth_method}")
-        
+
     def _make_api_request(self, method: str, endpoint: str, params: dict = None) -> Optional[Dict]:
         """Make an authenticated API request.
-        Uses explicit query string / body so the signed string exactly matches what we send.
+        Uses URL-encoded query string for signing so it matches the request (fixes symbols with non-ASCII chars).
         POST body is urlencoded to safely handle base64 signature (+, /).
         """
         if params is None:
             params = {}
-        
-        params = dict(params)
-        params['timestamp'] = int(time.time() * 1000)
-        signature = self._sign_request(params)
+        # Ensure all param values are strings for consistent encoding (urlencode converts int to str)
+        params = {k: v if isinstance(v, str) else str(v) for k, v in dict(params).items()}
+        params['timestamp'] = str(int(time.time() * 1000))
+        # Sign the exact query string we will send (URL-encoded), so non-ASCII symbols work
+        query_string_to_sign = urlencode(sorted(params.items()))
+        signature = self._sign_query_string(query_string_to_sign)
         params['signature'] = signature
-        
+
         url = f"{self.base_url}{endpoint}"
         headers = {'X-MBX-APIKEY': self.api_key}
-        
+
         try:
             if method.upper() == 'GET':
                 query_string = urlencode(sorted(params.items()))
@@ -281,7 +334,6 @@ class BinanceTrader:
                 response = requests.get(full_url, headers=headers, timeout=10)
             elif method.upper() == 'POST':
                 headers['Content-Type'] = 'application/x-www-form-urlencoded'
-                # urlencode handles + / in base64 signature
                 body = urlencode(sorted(params.items()))
                 response = requests.post(url, headers=headers, data=body, timeout=10)
             else:
@@ -475,7 +527,18 @@ class BinanceTrader:
         if not TRADING_ENABLED:
             logger.info(f"[PAPER TRADING] Would {side} {quantity} {symbol}")
             return {'status': 'PAPER_TRADE', 'side': side, 'quantity': quantity, 'symbol': symbol}
-        
+
+        # Enforce NOTIONAL filter: order value must be >= min notional (avoids -1013)
+        price = self.get_current_price(symbol)
+        if price and price > 0:
+            notional = quantity * price
+            min_notional = self._get_min_notional(symbol)
+            if min_notional > 0 and notional < min_notional:
+                logger.info(
+                    f"Order skipped (NOTIONAL): {symbol} {side} {notional:.2f} USDT < min {min_notional:.2f} USDT"
+                )
+                return None
+
         try:
             if self.client:
                 # Use client if available (HMAC)
@@ -493,9 +556,10 @@ class BinanceTrader:
                 }
                 order = self._make_api_request('POST', '/api/v3/order', params)
             
-            if order:
-                price = order.get('fills', [{}])[0].get('price', 'N/A') if isinstance(order, dict) else 'N/A'
-                logger.info(f"Order placed: {side} {quantity} {symbol} at {price}")
+            if order and isinstance(order, dict):
+                fills = order.get('fills') or []
+                fill_price = fills[0].get('price', 'N/A') if fills else 'N/A'
+                logger.info(f"Order placed: {side} {quantity} {symbol} at {fill_price}")
             return order
         except BinanceAPIException as e:
             logger.error(f"Binance API error: {e}")
@@ -678,6 +742,16 @@ class BinanceTrader:
                 del self.positions[symbol]
                 
                 return True
+
+            # Order was skipped or failed (e.g. NOTIONAL filter). If below min notional, drop from tracking.
+            price = self.get_current_price(symbol)
+            min_notional = self._get_min_notional(symbol)
+            if price and min_notional > 0 and (quantity * price) < min_notional:
+                logger.info(
+                    f"Dust removed from tracking: {symbol} ({(quantity * price):.2f} USDT < min {min_notional:.2f})"
+                )
+                del self.positions[symbol]
+                return True  # so caller can close_position() and stop retrying
             
             return False
         except Exception as e:
@@ -1268,10 +1342,16 @@ def run_live_trading(
             use_rl_agent = False
             rl_manager = None
     
-    # DB: history only (open/close events). Positions are synced from exchange, not restored from DB.
+    # DB: positions synced from exchange; ensure every exchange position has an open row in DB (bot-only).
     init_db()
     trader.sync_positions_from_exchange(ticker_list)
-    
+    open_in_db = {p["ticker"] for p in get_open_positions()}
+    for symbol, pos in trader.positions.items():
+        if symbol not in open_in_db:
+            insert_position(symbol, pos["entry_price"], pos["quantity"], pos["usdt_value"])
+            open_in_db.add(symbol)
+            logger.info(f"Synced position to DB: {symbol} qty={pos['quantity']:.8f} entry≈{pos['entry_price']:.4f}")
+
     # Display initial balance
     balances = trader.get_account_balance()
     
@@ -1299,6 +1379,16 @@ def run_live_trading(
             
             # Process each ticker
             for ticker in ticker_list:
+                # Skip tickers with price < MIN_TICKER_PRICE (use latest close from data when available)
+                ticker_df = df[df['tic'] == ticker]
+                if not ticker_df.empty:
+                    price = float(ticker_df['close'].iloc[-1])
+                else:
+                    price = trader.get_current_price(ticker)
+                if price < MIN_TICKER_PRICE:
+                    logger.debug(f"Skipping {ticker} (price {price:.4f} < {MIN_TICKER_PRICE})")
+                    continue
+
                 logger.info(f"Processing {ticker}...")
                 
                 # Check if position exists
