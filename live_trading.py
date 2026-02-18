@@ -969,7 +969,7 @@ class BinanceTrader:
             return self.check_risk_management(symbol) is not None
 
 
-def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str, lookback_periods: int = 500) -> pd.DataFrame:
+def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str, lookback_periods: int = 100) -> pd.DataFrame:
     """
     Fetch live data directly from Binance API (real-time).
     
