@@ -113,8 +113,8 @@ ROC_PERIOD = 12
 INITIAL_BALANCE = 100.0  # Starting balance in USD ($)
 
 # Risk Management Parameters
-ENABLE_RISK_MANAGEMENT = True  # Master switch: Enable/disable all risk management features
-USE_STOP_LOSS = True           # Enable stop-loss orders (requires ENABLE_RISK_MANAGEMENT = True)
+ENABLE_RISK_MANAGEMENT = False  # Master switch: Enable/disable all risk management features
+USE_STOP_LOSS = False           # Enable stop-loss orders (requires ENABLE_RISK_MANAGEMENT = True)
 STOP_LOSS_PCT = -0.1          # Stop loss at -10% (exit if loss reaches 10%)
 USE_TAKE_PROFIT = False         # Enable take-profit orders (requires ENABLE_RISK_MANAGEMENT = True)
 TAKE_PROFIT_PCT = 0.3         # Take profit at +30% (exit if gain reaches 30%)
