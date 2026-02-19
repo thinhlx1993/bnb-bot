@@ -15,10 +15,11 @@ from rl_agent.config import (
     VAL_END_DATE,
     VAL_START_DATE,
 )
-from rl_agent.data import load_all_tickers_data
+from rl_agent.data import get_tickers_with_cache, load_all_tickers_data
 from rl_agent.training import evaluate_on_test_data, train_ppo_agent
 
 __all__ = [
+    "get_tickers_with_cache",
     "EVAL_END_DATE",
     "EVAL_START_DATE",
     "MODEL_SAVE_DIR",

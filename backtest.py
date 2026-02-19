@@ -50,18 +50,18 @@ TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
 def get_all_usdt_pairs() -> list:
     """Fetch all USDT spot trading pairs from Binance (public API). Same logic as live_trading.BinanceTrader.get_all_usdt_pairs."""
     default = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
-    try:
-        url = "https://api.binance.com/api/v3/exchangeInfo"
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            exchange_info = json.loads(resp.read().decode())
-        pairs = [
-            s["symbol"] for s in exchange_info["symbols"]
-            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
-        ]
-        return sorted(pairs) if pairs else default
-    except Exception as e:
-        logger.warning(f"Could not fetch USDT pairs from exchange: {e}. Using default list.")
-        return default
+    # try:
+    #     url = "https://api.binance.com/api/v3/exchangeInfo"
+    #     with urllib.request.urlopen(url, timeout=10) as resp:
+    #         exchange_info = json.loads(resp.read().decode())
+    #     pairs = [
+    #         s["symbol"] for s in exchange_info["symbols"]
+    #         if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+    #     ]
+    #     return sorted(pairs) if pairs else default
+    # except Exception as e:
+    #     logger.warning(f"Could not fetch USDT pairs from exchange: {e}. Using default list.")
+    return default
 
 
 TICKER_LIST = get_all_usdt_pairs()
@@ -123,20 +123,37 @@ MAX_HOLDING_PERIODS = 720         # Maximum periods to hold (e.g., 720 periods =
 
 
 def fetch_binance_data(ticker_list, start_date, end_date, time_interval):
-    """Fetch data from Binance using FinRL-Meta datasource."""
-    logger.info(f"Fetching data from Binance for {ticker_list}...")
-    
+    """Fetch data from Binance using FinRL-Meta datasource. On error for a ticker, skip it.
+    Reuses one Binance connection. Saves each ticker to ./data/{ticker}.csv."""
+    data_dir = "./data"
+    os.makedirs(data_dir, exist_ok=True)
+    logger.info(f"Fetching data from Binance for {len(ticker_list)} tickers: {ticker_list}")
+
     dp = DataProcessor(
         data_source=DataSource.binance,
         start_date=start_date,
         end_date=end_date,
-        time_interval=time_interval
+        time_interval=time_interval,
     )
-    
-    dp.download_data(ticker_list=ticker_list)
-    dp.clean_data()
-    
-    return dp.dataframe
+    all_dfs = []
+    for i, tic in enumerate(ticker_list, 1):
+        try:
+            logger.info(f"  [{i}/{len(ticker_list)}] Processing ticker: {tic} ...")
+            dp.download_data(ticker_list=[tic])
+            dp.clean_data()
+            if dp.dataframe is not None and not dp.dataframe.empty:
+                ticker_path = os.path.join(data_dir, f"{tic}.csv")
+                dp.dataframe.to_csv(ticker_path, index=False)
+                all_dfs.append(dp.dataframe.copy())
+                logger.info(f"  Done. Rows: {len(dp.dataframe)} -> {ticker_path}")
+            else:
+                logger.warning(f"  No data for {tic}, skipping.")
+        except Exception as e:
+            logger.warning(f"  Error for {tic}: {e}. Skipping.")
+            continue
+    if not all_dfs:
+        raise ValueError("No data could be downloaded for any ticker.")
+    return pd.concat(all_dfs, axis=0, ignore_index=True)
 
 
 def calculate_macd(df, fast=12, slow=26, signal=9):
