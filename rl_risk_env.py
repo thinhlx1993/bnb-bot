@@ -1,12 +1,14 @@
 """
 Custom Gymnasium Environment for RL Risk Management
 This environment manages existing trading positions by deciding when to hold or close them.
+Technical indicators are computed via TA-Lib where available; TSI and PVT remain custom.
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+import talib
 from typing import Optional, Tuple, Dict, Any
 import logging
 
@@ -223,81 +225,7 @@ class RiskManagementEnv(gym.Env):
         
         # Track reward components for debugging (optional)
         self._reward_components = {}
-    
-    def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
-        """Calculate RSI (Relative Strength Index)."""
-        if len(prices) < period + 1:
-            return 50.0  # Neutral RSI if not enough data
-        
-        deltas = np.diff(prices[-period-1:])
-        gains = np.where(deltas > 0, deltas, 0.0)
-        losses = np.where(deltas < 0, -deltas, 0.0)
-        
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 1e-10  # Avoid division by zero
-        
-        if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return float(rsi) / 100.0  # Normalize to [0, 1]
-    
-    def _calculate_macd(self, prices: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
-        """Calculate MACD, Signal, and Histogram."""
-        if len(prices) < slow + signal:
-            return 0.0, 0.0, 0.0
-        
-        # Convert to pandas Series for easier calculation
-        price_series = pd.Series(prices)
-        
-        # Calculate EMAs
-        exp1 = price_series.ewm(span=fast, adjust=False).mean()
-        exp2 = price_series.ewm(span=slow, adjust=False).mean()
-        macd_line = exp1.iloc[-1] - exp2.iloc[-1]
-        
-        # Calculate signal line (EMA of MACD)
-        macd_series = exp1 - exp2
-        signal_line = macd_series.ewm(span=signal, adjust=False).mean().iloc[-1]
-        histogram = macd_line - signal_line
-        
-        # Normalize by entry price for stability
-        entry_price = float(self.entry_price)
-        macd_normalized = macd_line / entry_price if entry_price > 0 else 0.0
-        signal_normalized = signal_line / entry_price if entry_price > 0 else 0.0
-        histogram_normalized = histogram / entry_price if entry_price > 0 else 0.0
-        
-        return float(macd_normalized), float(signal_normalized), float(histogram_normalized)
-    
-    def _calculate_ema(self, prices: np.ndarray, period: int) -> float:
-        """Calculate Exponential Moving Average (EMA)."""
-        if len(prices) < period:
-            # Not enough data, use simple average of available data
-            return float(np.mean(prices)) if len(prices) > 0 else float(prices[-1]) if len(prices) > 0 else 0.0
-        
-        # Convert to pandas Series for easier EMA calculation
-        price_series = pd.Series(prices)
-        ema = price_series.ewm(span=period, adjust=False).mean().iloc[-1]
-        return float(ema)
-    
-    def _calculate_moving_averages(self, prices: np.ndarray, short_period: int = 5, long_period: int = 20) -> Tuple[float, float, float]:
-        """Calculate short and long moving averages."""
-        if len(prices) < long_period:
-            # Use available data
-            short_ma = np.mean(prices[-min(len(prices), short_period):]) if len(prices) >= short_period else float(prices[-1])
-            long_ma = np.mean(prices) if len(prices) > 0 else float(prices[-1])
-        else:
-            short_ma = np.mean(prices[-short_period:])
-            long_ma = np.mean(prices[-long_period:])
-        
-        # Normalize by entry price
-        entry_price = float(self.entry_price)
-        short_ma_norm = (short_ma - entry_price) / entry_price if entry_price > 0 else 0.0
-        long_ma_norm = (long_ma - entry_price) / entry_price if entry_price > 0 else 0.0
-        ma_diff = short_ma_norm - long_ma_norm
-        
-        return float(short_ma_norm), float(long_ma_norm), float(ma_diff)
-    
+
     def _calculate_price_position_in_range(self, prices: np.ndarray, lookback: int = 20) -> float:
         """Calculate price position in recent range (0 = low, 1 = high)."""
         if len(prices) < 2:
@@ -406,148 +334,111 @@ class RiskManagementEnv(gym.Env):
         
     def _precompute_indicators(self):
         """
-        Pre-compute all technical indicators for the current price window.
-        This is called once per episode (in reset()) to avoid recalculating
-        indicators on every step, which is a major performance bottleneck.
+        Pre-compute all technical indicators for the current price window using TA-Lib
+        where available. TSI and PVT have no TA-Lib equivalent and are computed manually.
+        Called once per episode (in reset()) for performance.
         """
-        if self.price_window is None or len(self.price_window) == 0:
-            return None
-        
-        prices = self.price_window.values
+        prices = np.asarray(self.price_window.values, dtype=np.float64)
         entry_price = float(self.entry_price)
-        n = len(prices)
-        
-        # Convert to pandas Series for efficient calculations
         price_series = pd.Series(prices)
-        
-        # Pre-compute MACD for all timesteps
-        exp1 = price_series.ewm(span=12, adjust=False).mean()
-        exp2 = price_series.ewm(span=26, adjust=False).mean()
-        macd_line = exp1 - exp2
-        macd_series = macd_line
-        signal_line = macd_series.ewm(span=9, adjust=False).mean()
-        histogram = macd_line - signal_line
-        
-        # Normalize MACD by entry price
-        macd_normalized = (macd_line / entry_price).values if entry_price > 0 else np.zeros(n)
-        histogram_normalized = (histogram / entry_price).values if entry_price > 0 else np.zeros(n)
-        
-        # Pre-compute RSI for all timesteps
-        rsi_values = np.zeros(n)
-        for i in range(n):
-            if i < 14:
-                rsi_values[i] = 0.5  # Neutral RSI if not enough data
-            else:
-                # Use sliding window approach
-                window = prices[max(0, i-14):i+1]
-                if len(window) >= 2:
-                    deltas = np.diff(window)
-                    gains = np.where(deltas > 0, deltas, 0.0)
-                    losses = np.where(deltas < 0, -deltas, 0.0)
-                    avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-                    avg_loss = np.mean(losses) if len(losses) > 0 else 1e-10
-                    if avg_loss == 0:
-                        rsi_values[i] = 1.0
-                    else:
-                        rs = avg_gain / avg_loss
-                        rsi = 100 - (100 / (1 + rs))
-                        rsi_values[i] = rsi / 100.0  # Normalize to [0, 1]
-                else:
-                    rsi_values[i] = 0.5
-        
-        # Pre-compute EMAs
-        ema_25 = price_series.ewm(span=25, adjust=False).mean()
-        ema_99 = price_series.ewm(span=99, adjust=False).mean()
-        
-        # Normalize EMAs and prices by percent-change from entry price
-        if entry_price > 0:
-            ema_25_pct = ((ema_25 - entry_price) / entry_price).values
-            ema_99_pct = ((ema_99 - entry_price) / entry_price).values
-            close_pct = ((price_series - entry_price) / entry_price).values
-        else:
-            ema_25_pct = np.zeros(n)
-            ema_99_pct = np.zeros(n)
-            close_pct = np.zeros(n)
 
-        # CCI (period=20): use close as typical price when no OHLC
-        tp = price_series
-        sma20 = tp.rolling(20, min_periods=1).mean()
-        mad20 = tp.rolling(20, min_periods=1).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-        cci = (tp - sma20) / (0.015 * mad20.replace(0, np.nan))
-        cci_norm = np.clip(cci.fillna(0).values / 200.0, -1.0, 1.0).astype(np.float32)
+        # ---- TA-Lib: MACD ----
+        macd_line, signal_line, hist = talib.MACD(
+            prices, fastperiod=12, slowperiod=26, signalperiod=9
+        )
+        macd_normalized = np.where(
+            np.isfinite(macd_line),
+            macd_line / entry_price if entry_price > 0 else 0.0,
+            0.0,
+        ).astype(np.float32)
+        histogram_normalized = np.where(
+            np.isfinite(hist),
+            hist / entry_price if entry_price > 0 else 0.0,
+            0.0,
+        ).astype(np.float32)
 
-        # Williams %R (period=14): use rolling max/min of close when no high/low
-        high = price_series.rolling(14, min_periods=1).max()
-        low = price_series.rolling(14, min_periods=1).min()
-        wr = -100 * (high - price_series) / (high - low).replace(0, np.nan)
-        williams_norm = (wr.fillna(-50).values / 100.0).astype(np.float32)  # roughly [-1, 0]
+        # ---- TA-Lib: RSI (normalize to [0, 1]) ----
+        rsi_raw = talib.RSI(prices, timeperiod=14)
+        rsi_values = np.where(np.isfinite(rsi_raw), np.clip(rsi_raw / 100.0, 0.0, 1.0), 0.5)
+        rsi_values = rsi_values.astype(np.float32)
 
-        # TSI (fast=13, slow=25)
+        # ---- TA-Lib: EMA 25, 99; close pct ----
+        ema_25 = talib.EMA(prices, timeperiod=25)
+        ema_99 = talib.EMA(prices, timeperiod=99)
+
+        ema_25_pct = np.where(np.isfinite(ema_25), (ema_25 - entry_price) / entry_price, 0.0)
+        ema_99_pct = np.where(np.isfinite(ema_99), (ema_99 - entry_price) / entry_price, 0.0)
+        close_pct = (prices - entry_price) / entry_price
+
+        ema_25_pct = ema_25_pct.astype(np.float32)
+        ema_99_pct = ema_99_pct.astype(np.float32)
+        close_pct = close_pct.astype(np.float32)
+
+        # ---- TA-Lib: CCI (period=20). Use close for high/low when no OHLC ----
+        high_cci = price_series.rolling(20, min_periods=1).max().values.astype(np.float64)
+        low_cci = price_series.rolling(20, min_periods=1).min().values.astype(np.float64)
+        cci_raw = talib.CCI(high_cci, low_cci, prices, timeperiod=20)
+        cci_norm = np.clip(np.where(np.isfinite(cci_raw), cci_raw / 200.0, 0.0), -1.0, 1.0).astype(np.float32)
+
+        # ---- TA-Lib: Williams %R (period=14). Rolling H/L from close when no OHLC ----
+        high_wr = price_series.rolling(14, min_periods=1).max().values.astype(np.float64)
+        low_wr = price_series.rolling(14, min_periods=1).min().values.astype(np.float64)
+        wr = talib.WILLR(high_wr, low_wr, prices, timeperiod=14)
+        williams_norm = np.where(np.isfinite(wr), np.clip(wr / 100.0, -1.0, 0.0), -0.5).astype(np.float32)
+
+        # ---- TSI (no TA-Lib): fast=13, slow=25 ----
         pc = price_series.diff()
         pcds = pc.ewm(span=13, adjust=False).mean().ewm(span=25, adjust=False).mean()
         apcds = pc.abs().ewm(span=13, adjust=False).mean().ewm(span=25, adjust=False).mean()
         tsi = 100 * (pcds / apcds.replace(0, np.nan))
         tsi_norm = np.clip(tsi.fillna(0).values / 100.0, -1.0, 1.0).astype(np.float32)
 
-        # ROC (period=12)
-        roc = price_series.pct_change(12)
-        roc_norm = np.clip(roc.fillna(0).values, -1.0, 1.0).astype(np.float32)
+        # ---- TA-Lib: ROC (period=12) ----
+        roc_raw = talib.ROC(prices, timeperiod=12)
+        roc_norm = np.clip(np.where(np.isfinite(roc_raw), roc_raw, 0.0), -1.0, 1.0).astype(np.float32)
 
-        # Volume-based: OBV, MFI, AD, PVT (use ohlcv_window when available)
-        has_volume = (
-            self.ohlcv_window is not None
-            and isinstance(self.ohlcv_window, pd.DataFrame)
-            and 'volume' in self.ohlcv_window.columns
-        )
-        if has_volume:
-            df = self.ohlcv_window
-            # OBV
-            direction = np.sign(df['close'].diff().fillna(0))
-            obv = (direction * df['volume']).cumsum().values
-            obv_max = np.abs(obv).max()
-            obv_norm = (obv / (obv_max + 1e-8)).astype(np.float32)
-            # MFI (period=14)
-            tp_df = (df['high'] + df['low'] + df['close']) / 3 if all(c in df.columns for c in ['high', 'low']) else df['close']
-            if 'high' in df.columns and 'low' in df.columns:
-                mf = tp_df * df['volume']
-                delta = tp_df.diff()
-                pos = mf.where(delta > 0, 0).rolling(14, min_periods=1).sum()
-                neg = mf.where(delta < 0, 0).rolling(14, min_periods=1).sum()
-                mfi = 100 - (100 / (1 + pos / neg.replace(0, np.nan)))
-                mfi_norm = (mfi.fillna(50).values / 100.0).astype(np.float32)
-            else:
-                mfi_norm = np.full(n, 0.5, dtype=np.float32)
-            # AD
-            if all(c in df.columns for c in ['high', 'low']):
-                cl = (df['close'] - df['low']) - (df['high'] - df['close'])
-                cl = cl / (df['high'] - df['low']).replace(0, np.nan)
-                ad = (cl * df['volume']).fillna(0).cumsum().values
-                ad_max = np.abs(ad).max()
-                ad_norm = (ad / (ad_max + 1e-8)).astype(np.float32)
-            else:
-                ad_norm = np.zeros(n, dtype=np.float32)
-            # PVT
-            pvt = (df['close'].pct_change().fillna(0) * df['volume']).cumsum().values
-            pvt_max = np.abs(pvt).max()
-            pvt_norm = (pvt / (pvt_max + 1e-8)).astype(np.float32)
-        else:
-            raise ValueError("OHLCV data required for volume-based indicators (OBV, MFI, AD, PVT)")
+        df = self.ohlcv_window
+        high = np.asarray(df["high"].values, dtype=np.float64)
+        low = np.asarray(df["low"].values, dtype=np.float64)
+        close_vol = np.asarray(df["close"].values, dtype=np.float64)
+        volume = np.asarray(df["volume"].values, dtype=np.float64)
+
+        # TA-Lib OBV
+        obv = talib.OBV(close_vol, volume)
+        obv = np.where(np.isfinite(obv), obv, 0.0)
+        obv_max = np.abs(obv).max()
+        obv_norm = (obv / (obv_max + 1e-8)).astype(np.float32)
+
+        # TA-Lib MFI (period=14)
+        mfi_raw = talib.MFI(high, low, close_vol, volume, timeperiod=14)
+        mfi_norm = np.where(np.isfinite(mfi_raw), np.clip(mfi_raw / 100.0, 0.0, 1.0), 0.5).astype(np.float32)
+
+        # TA-Lib AD (Chaikin A/D)
+        ad = talib.AD(high, low, close_vol, volume)
+        ad = np.where(np.isfinite(ad), ad, 0.0)
+        ad_max = np.abs(ad).max()
+        ad_norm = (ad / (ad_max + 1e-8)).astype(np.float32)
+
+        # PVT (no TA-Lib)
+        pvt = (df["close"].pct_change().fillna(0) * df["volume"]).cumsum().values
+        pvt_max = np.abs(pvt).max()
+        pvt_norm = (pvt / (pvt_max + 1e-8)).astype(np.float32)
 
         return {
-            'macd': macd_normalized.astype(np.float32),
-            'histogram': histogram_normalized.astype(np.float32),
-            'rsi': rsi_values.astype(np.float32),
-            'ema_25': ema_25_pct.astype(np.float32),
-            'ema_99': ema_99_pct.astype(np.float32),
-            'close': close_pct.astype(np.float32),
-            'cci': cci_norm,
-            'mfi': mfi_norm,
-            'obv': obv_norm,
-            'williams': williams_norm,
-            'tsi': tsi_norm,
-            'roc': roc_norm,
-            'ad': ad_norm,
-            'pvt': pvt_norm,
+            "macd": macd_normalized,
+            "histogram": histogram_normalized,
+            "rsi": rsi_values,
+            "ema_25": ema_25_pct,
+            "ema_99": ema_99_pct,
+            "close": close_pct,
+            "cci": cci_norm,
+            "mfi": mfi_norm,
+            "obv": obv_norm,
+            "williams": williams_norm,
+            "tsi": tsi_norm,
+            "roc": roc_norm,
+            "ad": ad_norm,
+            "pvt": pvt_norm,
         }
     
     def _get_account_features(self) -> np.ndarray:
@@ -612,57 +503,27 @@ class RiskManagementEnv(gym.Env):
             self.current_idx = len(self.price_window) - 1
         
         idx = self.current_idx
-        
-        if self._precomputed_indicators is not None:
-            # Current bar only: one row of 14 market features
-            market_row = np.array([
-                self._precomputed_indicators['macd'][idx],
-                self._precomputed_indicators['histogram'][idx],
-                self._precomputed_indicators['rsi'][idx],
-                self._precomputed_indicators['ema_25'][idx],
-                self._precomputed_indicators['ema_99'][idx],
-                self._precomputed_indicators['close'][idx],
-                self._precomputed_indicators['cci'][idx],
-                self._precomputed_indicators['mfi'][idx],
-                self._precomputed_indicators['obv'][idx],
-                self._precomputed_indicators['williams'][idx],
-                self._precomputed_indicators['tsi'][idx],
-                self._precomputed_indicators['roc'][idx],
-                self._precomputed_indicators['ad'][idx],
-                self._precomputed_indicators['pvt'][idx],
-            ], dtype=np.float32)
-            observation = np.append(market_row, self._get_account_features())
-            return observation
-        
-        # Fallback: compute one bar of indicators for current_idx
-        logger.warning("Pre-computed indicators not available, using slow fallback method")
-        entry_price = float(self.entry_price)
-        price_history = []
-        history_start = max(0, idx - 99)
-        for j in range(history_start, idx + 1):
-            if j < len(self.price_window):
-                price_history.append(float(self.price_window.iloc[j]))
-        if len(price_history) == 0:
-            price_history = [float(self.price_window.iloc[min(idx, len(self.price_window) - 1)])]
-        price_array = np.array(price_history)
-        current_price = float(price_array[-1])
-        
-        macd_line, _, macd_histogram = self._calculate_macd(price_array, fast=12, slow=26, signal=9)
-        rsi_raw = self._calculate_rsi(price_array, period=14)
-        ema_25 = self._calculate_ema(price_array, period=25)
-        ema_99 = self._calculate_ema(price_array, period=99)
-        if entry_price > 0:
-            ema_25_pct = (ema_25 - entry_price) / entry_price
-            ema_99_pct = (ema_99 - entry_price) / entry_price
-            close_pct = (current_price - entry_price) / entry_price
-        else:
-            ema_25_pct = ema_99_pct = close_pct = 0.0
-        
+
+        if self._precomputed_indicators is None:
+            raise RuntimeError("Pre-computed indicators are None. Call reset() first so _precompute_indicators runs.")
+
+        # Current bar only: one row of 14 market features
         market_row = np.array([
-            float(macd_line), float(macd_histogram), float(rsi_raw),
-            float(ema_25_pct), float(ema_99_pct), float(close_pct),
+            self._precomputed_indicators['macd'][idx],
+            self._precomputed_indicators['histogram'][idx],
+            self._precomputed_indicators['rsi'][idx],
+            self._precomputed_indicators['ema_25'][idx],
+            self._precomputed_indicators['ema_99'][idx],
+            self._precomputed_indicators['close'][idx],
+            self._precomputed_indicators['cci'][idx],
+            self._precomputed_indicators['mfi'][idx],
+            self._precomputed_indicators['obv'][idx],
+            self._precomputed_indicators['williams'][idx],
+            self._precomputed_indicators['tsi'][idx],
+            self._precomputed_indicators['roc'][idx],
+            self._precomputed_indicators['ad'][idx],
+            self._precomputed_indicators['pvt'][idx],
         ], dtype=np.float32)
-        market_row = np.append(market_row, np.zeros(8, dtype=np.float32))  # CCI/MFI/OBV/Williams/TSI/ROC/AD/PVT placeholder
         observation = np.append(market_row, self._get_account_features())
         return observation
     
