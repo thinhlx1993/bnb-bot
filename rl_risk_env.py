@@ -18,8 +18,7 @@ logger = logging.getLogger(__name__)
 # Both train_rl_agent and rl_risk_management use this so observation space and normalization stay in sync.
 ENV_DEFAULT_CONFIG = {
     "history_length": 50,
-    "max_steps": 100,
-    "obs_periods_norm_steps": 100,
+    "max_steps": 500,
     "fee_rate": 0.001,
 }
 
@@ -50,7 +49,6 @@ class RiskManagementEnv(gym.Env):
         initial_balance: float = 100.0,
         history_length: int = 60,
         max_steps: int = 100,
-        obs_periods_norm_steps: Optional[int] = None,
         fee_rate: float = 0.001,
         render_mode: Optional[str] = None,
     ):
@@ -67,16 +65,11 @@ class RiskManagementEnv(gym.Env):
             initial_balance: Initial account balance
             history_length: Number of historical periods to include in observations
             max_steps: From entry bar, allow the bot to play this many steps (bars). Episode ends at
-                min(entry_idx + max_steps - 1, end of data). Default 100.
-            obs_periods_norm_steps: If set, normalize periods_held in observation by this value (for eval/train
-                consistency when max_steps differs). If None, use max_steps.
+                min(entry_idx + max_steps - 1, end of data). Also used to normalize periods_held in the observation.
             fee_rate: Trading fee rate (e.g., 0.001 for 0.1%)
             render_mode: Rendering mode
         """
         super().__init__()
-
-        # Normalization scale for periods_held in observation (must match training, e.g. 100)
-        self.obs_periods_norm_steps = obs_periods_norm_steps if obs_periods_norm_steps is not None else max_steps
 
         # New approach: store all tickers' data
         if all_tickers_data is not None:
@@ -474,8 +467,8 @@ class RiskManagementEnv(gym.Env):
             dd_from_entry = (entry_price - current_price) / entry_price
             self.max_drawdown_from_entry = max(self.max_drawdown_from_entry, dd_from_entry)
         max_drawdown_from_entry_so_far = float(np.clip(self.max_drawdown_from_entry, 0.0, 1.0))
-        # Time in position (0 = just entered, 1 = at norm steps). Use obs_periods_norm_steps so eval matches training.
-        effective_max = max(self.obs_periods_norm_steps, 1)
+        # Time in position (0 = just entered, 1 = at max_steps). Normalized by max_steps for consistent scale.
+        effective_max = max(self.max_steps, 1)
         periods_held_norm = float(self.current_idx) / effective_max if effective_max > 0 else 0.0
         periods_held_norm = float(np.clip(periods_held_norm, 0.0, 1.0))
         return np.array([

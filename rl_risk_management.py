@@ -71,7 +71,7 @@ class RLRiskManager:
         """
         self.initial_balance = initial_balance
         self.history_length = history_length if history_length is not None else ENV_DEFAULT_CONFIG["history_length"]
-        self.max_steps = max_steps if max_steps is not None else 5000  # Eval can use longer episodes
+        self.max_steps = max_steps if max_steps is not None else 500  # Eval can use longer episodes
         self.fee_rate = fee_rate if fee_rate is not None else ENV_DEFAULT_CONFIG["fee_rate"]
         self.deterministic = deterministic
         
@@ -321,7 +321,6 @@ class RLRiskManager:
                 initial_balance=self.initial_balance,
                 history_length=self.history_length,
                 max_steps=self.max_steps,
-                obs_periods_norm_steps=ENV_DEFAULT_CONFIG["obs_periods_norm_steps"],
                 fee_rate=self.fee_rate
             )
             

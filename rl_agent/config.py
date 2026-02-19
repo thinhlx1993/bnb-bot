@@ -36,7 +36,7 @@ USE_GPU = True
 
 # Parallel training
 USE_PARALLEL_ENVS = True
-N_ENVS = None
+N_ENVS = 32
 MULTIPROCESSING_START_METHOD = "forkserver" if os.name != "nt" else "spawn"
 
 # Model architecture (RecurrentPPO)

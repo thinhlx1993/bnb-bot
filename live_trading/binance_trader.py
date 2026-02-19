@@ -38,7 +38,7 @@ from live_trading.config import (
     INITIAL_BALANCE,
 )
 from rl_risk_management import RLRiskManager
-from rl_risk_env import RiskManagementEnv, ENV_DEFAULT_CONFIG
+from rl_risk_env import RiskManagementEnv
 
 logger = logging.getLogger(__name__)
 
@@ -606,7 +606,6 @@ class BinanceTrader:
             initial_balance=rl_manager.initial_balance,
             history_length=history_length,
             max_steps=rl_manager.max_steps,
-            obs_periods_norm_steps=ENV_DEFAULT_CONFIG["obs_periods_norm_steps"],
             fee_rate=rl_manager.fee_rate,
         )
         env.current_ticker = "single_ticker"

@@ -50,18 +50,20 @@ TIME_INTERVAL = "15m" # 1m, 5m, 15m, 30m, 1h, 1d, etc.
 def get_all_usdt_pairs() -> list:
     """Fetch all USDT spot trading pairs from Binance (public API). Same logic as live_trading.BinanceTrader.get_all_usdt_pairs."""
     default = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"]
-    # try:
-    #     url = "https://api.binance.com/api/v3/exchangeInfo"
-    #     with urllib.request.urlopen(url, timeout=10) as resp:
-    #         exchange_info = json.loads(resp.read().decode())
-    #     pairs = [
-    #         s["symbol"] for s in exchange_info["symbols"]
-    #         if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
-    #     ]
-    #     return sorted(pairs) if pairs else default
-    # except Exception as e:
-    #     logger.warning(f"Could not fetch USDT pairs from exchange: {e}. Using default list.")
-    return default
+    try:
+        url = "https://api.binance.com/api/v3/exchangeInfo"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            exchange_info = json.loads(resp.read().decode())
+        pairs = [
+            s["symbol"] for s in exchange_info["symbols"]
+            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+        ]
+        pairs = pairs[:50] # limit to 50 pairs for testing
+        default = list(dict.fromkeys(default + pairs))
+        return sorted(pairs) if pairs else default
+    except Exception as e:
+        logger.warning(f"Could not fetch USDT pairs from exchange: {e}. Using default list.")
+        return default
 
 
 TICKER_LIST = get_all_usdt_pairs()
