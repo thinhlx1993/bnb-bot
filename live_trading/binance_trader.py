@@ -572,14 +572,10 @@ class BinanceTrader:
             if time_diff < 900:
                 entry_idx = idx
                 break
-        if entry_idx is None:
-            logger.warning(f"Could not find entry point in price history for {symbol}, using rule-based fallback")
-            return self.check_risk_management(symbol) is not None
+        assert entry_idx is not None, "entry bar must be present in price_history"
+
         history_length = rl_manager.history_length
         current_idx = len(price_history) - 1
-        if current_idx < entry_idx:
-            logger.warning(f"Not enough price history for {symbol} (current_idx={current_idx}, entry_idx={entry_idx})")
-            return self.check_risk_management(symbol) is not None
         window_start = max(0, entry_idx - history_length)
         price_window = price_history.iloc[window_start : current_idx + 1].copy()
         balance_window = balance_history.iloc[window_start : current_idx + 1].copy()
@@ -602,10 +598,9 @@ class BinanceTrader:
                 "exit_signals": exit_signals,
             }
         }
-        if ohlcv_df is not None and len(ohlcv_df) >= current_idx + 1:
-            ohlcv_full_window = ohlcv_df.iloc[window_start : current_idx + 1].copy()
-        else:
-            raise ValueError(f"Not enough OHLCV data for {symbol}")
+
+        ohlcv_full_window = ohlcv_df.iloc[window_start : current_idx + 1].copy()
+
         env = RiskManagementEnv(
             all_tickers_data=all_tickers_data,
             initial_balance=rl_manager.initial_balance,
@@ -628,10 +623,7 @@ class BinanceTrader:
         env.data_start_idx = max(0, env.entry_idx - env.history_length)
         env.price_window = price_window.iloc[env.data_start_idx : env.exit_idx + 1].copy()
         env.balance_window = balance_window.iloc[env.data_start_idx : env.exit_idx + 1].copy()
-        if ohlcv_full_window is not None and len(ohlcv_full_window) > env.exit_idx:
-            env.ohlcv_window = ohlcv_full_window.iloc[env.data_start_idx : env.exit_idx + 1].copy()
-        else:
-            env.ohlcv_window = None
+        env.ohlcv_window = ohlcv_full_window.iloc[env.data_start_idx : env.exit_idx + 1].copy()
         env.current_step = 0
         env.current_idx = 0
         env.position_open = True
@@ -649,21 +641,14 @@ class BinanceTrader:
         last_step_in_window = env.exit_idx - env.data_start_idx
         lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
-        try:
-            obs = env._get_observation()
-            if rl_manager.vec_normalize is not None:
-                obs = rl_manager.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
-            while True:
-                action, lstm_states = rl_manager.model.predict(
-                    obs, state=lstm_states, episode_start=episode_starts, deterministic=rl_manager.deterministic
-                )
-                if env.current_idx >= last_step_in_window:
-                    return action == 1
-                obs, _reward, terminated, truncated, _info = env.step(action)
-                if rl_manager.vec_normalize is not None:
-                    obs = rl_manager.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
-                episode_starts = np.array([terminated or truncated], dtype=bool)
-        except Exception as e:
-            logger.error(f"Error getting RL agent decision for {symbol}: {e}")
-            logger.warning("Falling back to rule-based risk management")
-            return self.check_risk_management(symbol) is not None
+        obs = env._get_observation()
+        obs = rl_manager.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
+        while True:
+            action, lstm_states = rl_manager.model.predict(
+                obs, state=lstm_states, episode_start=episode_starts, deterministic=rl_manager.deterministic
+            )
+            if env.current_idx >= last_step_in_window:
+                return action == 1
+            obs, _reward, terminated, truncated, _info = env.step(action)
+            obs = rl_manager.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
+            episode_starts = np.array([terminated or truncated], dtype=bool)
