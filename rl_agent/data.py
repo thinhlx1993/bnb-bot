@@ -84,18 +84,63 @@ def _save_signals_cache(
         logger.warning("Cache write failed %s: %s", cache_path, e)
 
 
+def get_tickers_with_cache(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    strategy: str = "Combined",
+    use_backtest: bool = True,
+) -> List[str]:
+    """
+    Return list of tickers that have a signals cache file for the given date range and options.
+    Use this to preload the available cache list before loading (faster when cache_only=True).
+    """
+    if not SIGNALS_CACHE_DIR.is_dir():
+        return []
+    safe_strategy = (strategy or "Combined").replace("/", "_").replace("\\", "_")
+    suffix = f"_{start_date or 'none'}_{end_date or 'none'}_{safe_strategy}_{use_backtest}.parquet"
+    tickers = []
+    for path in SIGNALS_CACHE_DIR.glob("*.parquet"):
+        stem = path.name
+        if stem.endswith(suffix):
+            ticker = stem[: -len(suffix)]
+            if ticker:
+                tickers.append(ticker)
+    return sorted(tickers)
+
+
 def load_all_tickers_data(
     tickers_list: List[str],
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     results_dir: Path = Path("results"),
     strategy: str = "Combined",
+    cache_only: bool = False,
 ) -> Dict[str, Dict]:
     """
     Load price, balance, entry and exit signals for all tickers.
     Uses signals cache under data/signals_cache when available.
     Returns dict of {ticker: {'price', 'balance', 'entry_signals', 'exit_signals', 'ohlcv'}}.
+
+    When cache_only=True, tickers without an existing cache are skipped (no signal computation),
+    making the loader faster when cache was pre-built (e.g. via build_signals_cache_parallel.py).
     """
+    use_backtest = USE_BACKTEST_SIGNALS
+    if cache_only:
+        cached_tickers = get_tickers_with_cache(
+            start_date=start_date,
+            end_date=end_date,
+            strategy=strategy,
+            use_backtest=use_backtest,
+        )
+        tickers_list = [t for t in tickers_list if t in cached_tickers]
+        logger.info(
+            "Preloaded cache list: %d tickers have cache for this range (loading only these)",
+            len(tickers_list),
+        )
+        if not tickers_list:
+            logger.warning("No tickers with cache for this date range; run build_signals_cache_parallel.py")
+            return {}
+
     date_range_str = f" ({start_date or 'start'} to {end_date or 'end'})" if (start_date or end_date) else ""
     logger.info("Loading data for %d tickers%s...", len(tickers_list), date_range_str)
 
@@ -147,6 +192,9 @@ def load_all_tickers_data(
                         ticker, len(price_series), entry_signals.sum(), exit_signals.sum(),
                     )
                 else:
+                    if cache_only:
+                        logger.debug("Skipping %s (no cache, cache_only=True)", ticker)
+                        continue
                     if USE_BACKTEST_SIGNALS:
                         try:
                             from entry_signal_generator import get_strategy_signals

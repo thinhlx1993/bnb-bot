@@ -50,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TICKER = "BTCUSDT"
+TICKER = "COMPUSDT"
 RESULTS_DIR = Path("results")
 XAUUSDT_RESULTS_DIR = RESULTS_DIR / "XAUUSDT_RL"
 XAUUSDT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,7 +59,7 @@ DEFAULT_MODEL_NAME = "best_model"
 
 # Date range for backtesting
 START_DATE = "2026-01-01"
-END_DATE ="2026-02-20"
+END_DATE = "2026-02-20"
 TIME_INTERVAL = "15m"  # 15 minutes
 
 # Binance Futures API endpoint

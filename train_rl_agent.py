@@ -6,13 +6,12 @@ All configuration and logic live in the rl_agent package.
 
 import logging
 from pathlib import Path
-
+from backtest import get_all_usdt_pairs
 from rl_agent import (
     EVAL_END_DATE,
     EVAL_START_DATE,
     MODEL_SAVE_DIR,
     TENSORBOARD_LOG_DIR,
-    TICKER_LIST,
     TOTAL_TIMESTEPS,
     TRAIN_END_DATE,
     TRAIN_START_DATE,
@@ -44,11 +43,16 @@ def main():
         EVAL_START_DATE or "start", EVAL_END_DATE or "end",
     )
 
+    TICKER_LIST = get_all_usdt_pairs()
+
     train_tickers_data = load_all_tickers_data(
-        TICKER_LIST, start_date=TRAIN_START_DATE, end_date=TRAIN_END_DATE
+        TICKER_LIST, start_date=TRAIN_START_DATE, end_date=TRAIN_END_DATE, cache_only=True
     )
     if len(train_tickers_data) == 0:
-        logger.error("No training data loaded. Ensure data/dataset.csv exists.")
+        logger.error(
+            "No training data loaded (cache_only=True). Ensure data/dataset.csv exists and run: "
+            "python build_signals_cache_parallel.py --all-ranges"
+        )
         return
 
     for ticker, data in train_tickers_data.items():
@@ -56,14 +60,14 @@ def main():
         logger.info("  %s: %d points, %d signals", ticker, len(data["price"]), n_sigs)
 
     val_tickers_data = load_all_tickers_data(
-        TICKER_LIST, start_date=VAL_START_DATE, end_date=VAL_END_DATE
+        TICKER_LIST, start_date=VAL_START_DATE, end_date=VAL_END_DATE, cache_only=True
     )
     if len(val_tickers_data) == 0:
         logger.warning("No validation data; using training data for evaluation.")
         val_tickers_data = train_tickers_data
 
     test_tickers_data = load_all_tickers_data(
-        TICKER_LIST, start_date=EVAL_START_DATE, end_date=EVAL_END_DATE
+        TICKER_LIST, start_date=EVAL_START_DATE, end_date=EVAL_END_DATE, cache_only=True
     )
     if test_tickers_data:
         for ticker, data in test_tickers_data.items():

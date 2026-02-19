@@ -1001,7 +1001,9 @@ def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str
                 response = requests.get(url, params=params, timeout=10)
                 response.raise_for_status()
                 klines = response.json()
-            
+            if not klines:
+                logger.debug("No data for %s, skipping", ticker)
+                continue
             # Convert to DataFrame
             df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -1021,7 +1023,9 @@ def fetch_live_data(trader: BinanceTrader, ticker_list: list, time_interval: str
             
             # Select columns in FinRL format
             df = df[['time', 'tic', 'open', 'high', 'low', 'close', 'volume']]
-            
+            if len(df) == 0:
+                logger.debug("No rows for %s, skipping", ticker)
+                continue
             all_data.append(df)
         
         if not all_data:
@@ -1376,9 +1380,13 @@ def run_live_trading(
                 logger.warning("No data fetched, skipping this cycle")
                 time.sleep(check_interval_seconds)
                 continue
-            
-            # Process each ticker
+            tickers_with_data = df["tic"].unique().tolist()
+
+            # Process each ticker (skip tickers that have no data this cycle)
             for ticker in ticker_list:
+                if ticker not in tickers_with_data:
+                    logger.debug("Skipping %s (no data this cycle)", ticker)
+                    continue
                 # Skip tickers with price < MIN_TICKER_PRICE (use latest close from data when available)
                 ticker_df = df[df['tic'] == ticker]
                 if not ticker_df.empty:
