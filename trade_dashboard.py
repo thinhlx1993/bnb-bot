@@ -185,8 +185,20 @@ def main():
         pnls = [t.get("pnl_usdt") for t in trades_with_pnl if t.get("pnl_usdt") is not None]
         total_pnl = sum(pnls) if pnls else None
 
+    # Total unrealized PnL from open positions (when API available)
+    total_unrealized_pnl = None
+    if trader and open_positions:
+        unrealized_sum = 0.0
+        for pos in open_positions:
+            current_price = trader.get_current_price(pos["ticker"])
+            if current_price is not None:
+                entry_value = pos["usdt_value"]
+                current_value = pos["quantity"] * current_price
+                unrealized_sum += current_value - entry_value
+        total_unrealized_pnl = unrealized_sum
+
     # --- Account summary ---
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         if trader:
             balances = trader.get_account_balance()
@@ -205,6 +217,11 @@ def main():
             st.metric("Total PnL", f"${total_pnl:,.2f}")
         else:
             st.metric("Total PnL", "N/A (API + trades)")
+    with col6:
+        if total_unrealized_pnl is not None:
+            st.metric("Unrealized PnL", f"${total_unrealized_pnl:,.2f}")
+        else:
+            st.metric("Unrealized PnL", "N/A (API + open positions)")
 
     # --- Open positions ---
     st.subheader("Open Positions")
