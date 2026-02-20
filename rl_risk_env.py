@@ -201,19 +201,11 @@ class RiskManagementEnv(gym.Env):
             'closeness_to_max': 1.0,      # Base reward for closing near max price
             'profit_bonus': 1.0,          # Bonus for profitable closes
             'loss_penalty': 1.0,          # Penalty for large losses
-            'drawdown_penalty': 1.0,      # Penalty for holding during drawdowns
             'max_drawdown_penalty': 1.0,  # Penalty for trades with large max drawdown
-            'time_efficiency': 0.0,       # Disabled - was encouraging close at fixed duration (~12h45)
-            'early_exit_bonus': 0.0,      # DISABLED - was encouraging early exits around ~12h
-                                          # (the larger early_exit_factor at small periods_held encouraged closing too soon)
-            'profit_efficiency': 0.0,      # DISABLED - was unfairly penalizing longer episodes
-                                          # (dividing return by periods_held meant same return = smaller reward)
-            'holding_base': 0.0,          # Base reward for holding
-            'holding_penalty': 0.01,       # Small penalty per hold step (encourages closing instead of holding to end)
-            'closeness_to_min_penalty': 2.0,  # Penalty for holding near min price
-            'momentum_reward': 0.5,       # Reward for holding when price is trending up
-            'unrealized_profit_reward': 0.3,  # Reward for holding profitable positions (encourages letting winners run)
-            'closeness_to_max_reward': 1.0,  # Reward for holding when close to max price (potential for more)
+            'early_exit_bonus': 0.0,      # Bonus for closing at good price before 70% of episode (set > 0 to enable)
+            'holding_penalty': 0.01,      # Small penalty per hold step when in loss
+            'holding_loss_magnitude_scale': 2.0,  # Scale penalty by loss size (encourages close soon to avoid more loss)
+            'unrealized_profit_reward': 0.15,  # Small reward per step when holding a profitable position
         }
         
         # Track reward components for debugging (optional)
@@ -571,20 +563,27 @@ class RiskManagementEnv(gym.Env):
         self._reward_components = {}
         
         # ========== HOLDING ACTIONS (action 0) ==========
-        # Small per-step penalty for holding (encourages closing when appropriate instead of holding to end).
+        # Profit: small reward for holding a winner (encourages letting winners run).
+        # Loss: penalty that scales with loss size and time (encourages closing soon to avoid more loss).
         if action == 0 and not done:
-            # Penalty only when holding a loss position (current price below entry)
-            position_return = (current_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
-            if position_return >= 0:
-                self._reward_components['holding_penalty'] = 0.0
-                return 0.0
-            holding_penalty = self.reward_weights.get('holding_penalty', 0.02)
-            # Slightly higher penalty later in episode so holding a loss near max_steps costs more
+            position_return_hold = (current_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
+            if position_return_hold > 0:
+                # Small reward when holding a profitable position (capped so terminal close reward stays dominant)
+                w = self.reward_weights.get('unrealized_profit_reward', 0.15)
+                hold_profit_reward = min(position_return_hold * 2.0, 0.5) * w
+                self._reward_components['unrealized_profit_reward'] = hold_profit_reward
+                return float(hold_profit_reward)
+            # Holding a loss: base penalty + penalty scaled by loss size (deeper loss = more penalty → close soon)
+            holding_penalty = self.reward_weights.get('holding_penalty', 0.01)
+            loss_scale = self.reward_weights.get('holding_loss_magnitude_scale', 2.0)
             if self.episode_length and self.episode_length > 0:
                 progress = periods_held / self.episode_length
                 step_penalty = holding_penalty * (0.5 + 0.5 * progress)
             else:
                 step_penalty = holding_penalty
+            # Extra penalty proportional to current loss (e.g. -5% adds more than -1%, so bot prefers to close early)
+            loss_magnitude_penalty = abs(position_return_hold) * loss_scale
+            step_penalty = step_penalty + min(loss_magnitude_penalty, 0.5)  # cap so one step stays bounded
             self._reward_components['holding_penalty'] = -step_penalty
             return -float(step_penalty)
         
@@ -657,10 +656,6 @@ class RiskManagementEnv(gym.Env):
         Calculate reward based on configured reward function.
         
         This is the main entry point that routes to the appropriate reward function.
-        
-        To switch reward functions, change the return statement:
-        - return self._calculate_reward_total_return_only(action, done)  # Original
-        - return self._calculate_reward_long_term(action, done)  # Improved for long-term
         """
         return self._calculate_reward_long_term(action, done)  # Using improved long-term reward
     
