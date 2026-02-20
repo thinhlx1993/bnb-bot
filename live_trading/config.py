@@ -48,10 +48,7 @@ BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
 BINANCE_TESTNET_API_URL = "https://testnet.binance.vision/api"
 
 # RL agent: ensure this many bars before entry so technical indicators have enough history
-ENTRY_LOOKBACK_STEPS = 500
-
-# Only open a position if the entry signal is within this many candles of the latest candle
-ENTRY_NEAR_CURRENT_CANDLES = 2
+ENTRY_LOOKBACK_STEPS = 200
 
 
 def setup_logging() -> logging.Logger:

@@ -16,7 +16,6 @@ from live_trading.config import (
     TRADING_ENABLED,
     TICKER_BLACKLIST,
     ENTRY_LOOKBACK_STEPS,
-    ENTRY_NEAR_CURRENT_CANDLES,
     INITIAL_BALANCE,
     LOCAL_TIMEZONE,
     MIN_TRADE_AMOUNT,
@@ -33,7 +32,6 @@ from live_trading_db import (
     reset_db,
 )
 from rl_risk_management import RLRiskManager
-from utils.time_utils import interval_to_timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -272,49 +270,21 @@ def run_live_trading(
                 if entries.empty or exits.empty:
                     logger.warning(f"No signals generated for {ticker}")
                     continue
+                latest_entry = bool(entries.iloc[-1])
+                latest_exit = bool(exits.iloc[-1])
                 total_buy_signals = entries.sum()
                 total_sell_signals = exits.sum()
-                last_buy_time = entries[entries == True].index[-1] if total_buy_signals > 0 else None
-                last_sell_time = exits[exits == True].index[-1] if total_sell_signals > 0 else None
-                if last_buy_time is not None:
-                    lb = last_buy_time.tz_localize("UTC").tz_convert("Asia/Bangkok") if getattr(last_buy_time, "tz", None) is None else last_buy_time.tz_convert("Asia/Bangkok")
-                    logger.info(f"  📈 Last BUY signal at: {lb.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
-                if last_sell_time is not None:
-                    ls = last_sell_time.tz_localize("UTC").tz_convert("Asia/Bangkok") if getattr(last_sell_time, "tz", None) is None else last_sell_time.tz_convert("Asia/Bangkok")
-                    logger.info(f"  📉 Last SELL signal at: {ls.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
-                latest_candle_time = entries.index[-1] if len(entries) > 0 else None
-                if latest_candle_time is not None:
-                    lc = latest_candle_time.tz_localize("UTC").tz_convert("Asia/Bangkok") if getattr(latest_candle_time, "tz", None) is None else latest_candle_time.tz_convert("Asia/Bangkok")
-                    logger.info(f"  📊 Latest candle: {lc.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)")
-                latest_entry = (last_buy_time is not None) and (last_sell_time is None or last_buy_time > last_sell_time)
-                latest_exit = (last_sell_time is not None) and (last_buy_time is None or last_sell_time > last_buy_time)
-                entry_near_current = False
-                if latest_entry and last_buy_time is not None and latest_candle_time is not None:
-                    latest_ts = pd.Timestamp(latest_candle_time)
-                    buy_ts = pd.Timestamp(last_buy_time)
-                    if latest_ts.tz is not None and buy_ts.tz is None:
-                        buy_ts = buy_ts.tz_localize("UTC")
-                    elif latest_ts.tz is None and buy_ts.tz is not None:
-                        latest_ts = latest_ts.tz_localize("UTC")
-                    interval_td = interval_to_timedelta(time_interval)
-                    diff_seconds = (latest_ts - buy_ts).total_seconds()
-                    max_age_seconds = (ENTRY_NEAR_CURRENT_CANDLES * interval_td).total_seconds()
-                    entry_near_current = 0 <= diff_seconds <= max_age_seconds
-                if latest_entry and not entry_near_current:
-                    logger.info(f"  ⏭️  BUY signal too old for {ticker} (entry not within last {ENTRY_NEAR_CURRENT_CANDLES} candles); skipping open")
                 logger.info(f"  Signal Status: {total_buy_signals} buy signals, {total_sell_signals} sell signals in history")
-                logger.info(f"  Latest Entry Signal (most recent signal is BUY): {latest_entry}")
-                logger.info(f"  Entry near current (within {ENTRY_NEAR_CURRENT_CANDLES} candles): {entry_near_current}")
+                logger.info(f"  Latest entry (last candle BUY): {latest_entry}, Latest exit (last candle SELL): {latest_exit}")
                 logger.info(f"  Last signal processed flag: entry={last_signals[ticker]['entry']}, exit={last_signals[ticker]['exit']}")
-                candle_time_iso = pd.Timestamp(latest_candle_time).isoformat() if latest_candle_time is not None else None
-                if latest_entry and entry_near_current and not last_signals[ticker]["entry"]:
+                if latest_entry and not last_signals[ticker]["entry"]:
                     if ticker not in trader.positions:
                         logger.info(f"✅ BUY signal detected for {ticker} - Opening position...")
                         success = trader.buy(ticker)
                         if success:
                             pos = trader.positions[ticker]
                             insert_position(ticker, pos["entry_price"], pos["quantity"], pos["usdt_value"])
-                            insert_signal(ticker, "buy", "strategy", candle_time_iso)
+                            insert_signal(ticker, "buy", "strategy", None)
                             last_signals[ticker]["entry"] = True
                             logger.info(f"✅ Position opened successfully for {ticker}")
                         else:
@@ -331,7 +301,7 @@ def run_live_trading(
                         success = trader.sell(ticker)
                         if success:
                             close_position(ticker, "strategy")
-                            insert_signal(ticker, "sell", "strategy", candle_time_iso)
+                            insert_signal(ticker, "sell", "strategy", None)
                             last_signals[ticker]["exit"] = True
                             logger.info(f"✅ Position closed successfully for {ticker}")
                         else:
