@@ -460,6 +460,10 @@ class RiskManagementEnv(gym.Env):
             self.max_drawdown_from_entry = max(self.max_drawdown_from_entry, dd_from_entry)
         max_drawdown_from_entry_so_far = float(np.clip(self.max_drawdown_from_entry, 0.0, 1.0))
         # Time in position (0 = just entered, 1 = at max_steps). Normalized by max_steps for consistent scale.
+        # WARNING: This gives the policy a direct "step count" signal. It can learn a shortcut like
+        # "close when periods_held_norm ≈ 0.1" (step 52 for max_steps=500), causing similar episode
+        # length every time regardless of price. To get price-conditioned close timing, remove this
+        # feature (and reduce account feature dim from 6 to 5) so the policy must use return/drawdown.
         effective_max = max(self.max_steps, 1)
         periods_held_norm = float(self.current_idx) / effective_max if effective_max > 0 else 0.0
         periods_held_norm = float(np.clip(periods_held_norm, 0.0, 1.0))

@@ -270,14 +270,25 @@ def run_live_trading(
                 if entries.empty or exits.empty:
                     logger.warning(f"No signals generated for {ticker}")
                     continue
-                latest_entry = bool(entries.iloc[-1])
-                latest_exit = bool(exits.iloc[-1])
+                # Use only closed candles for signals (last row is current forming candle; strategy rarely emits BUY there)
+                closed_entries = entries.iloc[:-1] if len(entries) > 1 else entries
+                closed_exits = exits.iloc[:-1] if len(exits) > 1 else exits
+                if closed_entries.empty or closed_exits.empty:
+                    logger.warning(f"Not enough closed candles for {ticker}")
+                    continue
+                lookback = min(signal_lookback_candles, len(closed_entries))
+                last_n_entries = closed_entries.iloc[-lookback:]
+                last_n_exits = closed_exits.iloc[-lookback:]
+                latest_entry = bool(closed_entries.iloc[-1])
+                latest_exit = bool(closed_exits.iloc[-1])
+                has_recent_entry = last_n_entries.any()
+                has_recent_exit = last_n_exits.any()
                 total_buy_signals = entries.sum()
                 total_sell_signals = exits.sum()
                 logger.info(f"  Signal Status: {total_buy_signals} buy signals, {total_sell_signals} sell signals in history")
-                logger.info(f"  Latest entry (last candle BUY): {latest_entry}, Latest exit (last candle SELL): {latest_exit}")
+                logger.info(f"  Last closed candle BUY: {latest_entry}, SELL: {latest_exit} | Recent (last {lookback} closed) BUY: {has_recent_entry}, SELL: {has_recent_exit}")
                 logger.info(f"  Last signal processed flag: entry={last_signals[ticker]['entry']}, exit={last_signals[ticker]['exit']}")
-                if latest_entry and not last_signals[ticker]["entry"]:
+                if has_recent_entry and not last_signals[ticker]["entry"]:
                     if ticker not in trader.positions:
                         logger.info(f"✅ BUY signal detected for {ticker} - Opening position...")
                         success = trader.buy(ticker)
@@ -291,11 +302,11 @@ def run_live_trading(
                             logger.error(f"❌ Failed to open position for {ticker}")
                     else:
                         logger.info(f"⚠️  BUY signal but position already exists for {ticker}")
-                elif latest_entry and last_signals[ticker]["entry"]:
+                elif has_recent_entry and last_signals[ticker]["entry"]:
                     logger.info(f"ℹ️  BUY signal still active for {ticker} (already processed)")
-                elif not latest_entry:
+                elif not has_recent_entry:
                     logger.info(f"ℹ️  No active BUY signal for {ticker}")
-                if close_on_strategy_sell and latest_exit and not last_signals[ticker]["exit"]:
+                if close_on_strategy_sell and has_recent_exit and not last_signals[ticker]["exit"]:
                     if ticker in trader.positions:
                         logger.info(f"✅ SELL signal detected for {ticker} - Closing position...")
                         success = trader.sell(ticker)
@@ -308,15 +319,15 @@ def run_live_trading(
                             logger.error(f"❌ Failed to close position for {ticker}")
                     else:
                         logger.info(f"⚠️  SELL signal but no position for {ticker}")
-                elif close_on_strategy_sell and latest_exit and last_signals[ticker]["exit"]:
+                elif close_on_strategy_sell and has_recent_exit and last_signals[ticker]["exit"]:
                     logger.info(f"ℹ️  SELL signal still active for {ticker} (already processed)")
-                elif not close_on_strategy_sell and latest_exit:
+                elif not close_on_strategy_sell and has_recent_exit:
                     logger.info(f"ℹ️  SELL signal for {ticker} (close on strategy disabled)")
-                elif not latest_exit:
+                elif not has_recent_exit:
                     logger.info(f"ℹ️  No active SELL signal for {ticker}")
-                if not latest_entry:
+                if not has_recent_entry:
                     last_signals[ticker]["entry"] = False
-                if not latest_exit:
+                if not has_recent_exit:
                     last_signals[ticker]["exit"] = False
             trader.print_positions()
             balances = trader.get_account_balance()
